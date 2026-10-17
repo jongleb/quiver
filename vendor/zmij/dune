@@ -1,0 +1,9 @@
+; zmij v1.2 (https://github.com/vitaut/zmij, commit
+; d1682cb47e67474319ed146d3ca2c0e1a70f9429), MIT; files copied unchanged.
+
+(foreign_library
+ (archive_name zmij)
+ (language c)
+ (names zmij)
+ (flags
+  (:standard -O3 -std=gnu11)))

@@ -1,0 +1,95 @@
+# Test databases only, one per release line quiver supports (see Server in
+# lib/provider/mysql). Credentials are for localhost and must never reach real hosts.
+x-mysql-healthcheck: &mysql-healthcheck
+  interval: 2s
+  timeout: 5s
+  retries: 60
+
+services:
+  mysql80:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: quiver
+      MYSQL_DATABASE: quiver_test
+    command:
+      - --server-id=1
+      - --log-bin=binlog
+      - --binlog-format=ROW
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+    ports:
+      - "127.0.0.1:33080:3306"
+    healthcheck:
+      <<: *mysql-healthcheck
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-pquiver"]
+
+  mysql84:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: quiver
+      MYSQL_DATABASE: quiver_test
+    command:
+      - --server-id=1
+      - --log-bin=binlog
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+    ports:
+      - "127.0.0.1:33084:3306"
+    healthcheck:
+      <<: *mysql-healthcheck
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-pquiver"]
+
+  mariadb1011:
+    image: mariadb:10.11
+    environment:
+      MARIADB_ROOT_PASSWORD: quiver
+      MARIADB_DATABASE: quiver_test
+    command:
+      - --server-id=1
+      - --log-bin=binlog
+      - --binlog-format=ROW
+    ports:
+      - "127.0.0.1:33101:3306"
+    healthcheck:
+      <<: *mysql-healthcheck
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+
+  mariadb114:
+    image: mariadb:11.4
+    environment:
+      MARIADB_ROOT_PASSWORD: quiver
+      MARIADB_DATABASE: quiver_test
+    command:
+      - --server-id=1
+      - --log-bin=binlog
+      - --binlog-format=ROW
+    ports:
+      - "127.0.0.1:33114:3306"
+    healthcheck:
+      <<: *mysql-healthcheck
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+
+  mariadb118:
+    image: mariadb:11.8
+    environment:
+      MARIADB_ROOT_PASSWORD: quiver
+      MARIADB_DATABASE: quiver_test
+    command:
+      - --server-id=1
+      - --log-bin=binlog
+      - --binlog-format=ROW
+    ports:
+      - "127.0.0.1:33118:3306"
+    healthcheck:
+      <<: *mysql-healthcheck
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+
+  # Network faults for the chaos tests: quiver connects through a proxy whose
+  # bandwidth, resets and silences the test sets over the HTTP API.
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.12.0
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "127.0.0.1:8474:8474"
+      - "127.0.0.1:33300:33300"

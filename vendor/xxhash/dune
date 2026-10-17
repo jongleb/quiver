@@ -1,0 +1,2 @@
+; xxHash v0.8.4 (https://github.com/Cyan4973/xxHash, tag v0.8.4), BSD-2-Clause;
+; xxhash.h copied unchanged. Header only: stubs include it with XXH_INLINE_ALL.

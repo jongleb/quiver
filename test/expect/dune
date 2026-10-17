@@ -1,0 +1,16 @@
+(library
+ (name quiver_expect)
+ (libraries
+  base
+  unboxed.int64_u
+  unboxed.float_u
+  stdio
+  angstrom
+  quiver.core
+  quiver.sink
+  quiver.mysql)
+ (inline_tests
+  (flags
+   (-source-tree-root .)))
+ (preprocess
+  (pps ppx_expect)))

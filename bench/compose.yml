@@ -1,0 +1,31 @@
+# Benchmark server only: fixed resources so runs are comparable. Credentials
+# are for localhost and must never reach real hosts.
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: quiver
+    command:
+      - --server-id=1
+      - --log-bin=binlog
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --innodb-buffer-pool-size=4G
+      - --innodb-log-buffer-size=256M
+      - --innodb-redo-log-capacity=4G
+      - --max-allowed-packet=1G
+      - --cte-max-recursion-depth=10000000
+    ports:
+      - "127.0.0.1:33200:3306"
+    cpus: 4
+    mem_limit: 6g
+    volumes:
+      - data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-pquiver"]
+      interval: 2s
+      timeout: 5s
+      retries: 90
+
+volumes:
+  data:

@@ -1,0 +1,32 @@
+(library
+ (name quiver_load)
+ (public_name quiver.load)
+ (libraries
+  stdlib_stable
+  base
+  stdio
+  angstrom
+  hex_encode
+  sexplib0
+  ppx_compare.runtime-lib
+  ppx_yojson_conv_lib
+  file_path
+  yojson
+  quiver.core
+  quiver.sink
+  quiver.mysql
+  await
+  portable
+  portable_lockfree_htbl)
+ (preprocess
+  (pps ppx_sexp_conv ppx_compare ppx_yojson_conv ppx_let))
+ (flags
+  (:standard
+   -open
+   Stdlib_stable
+   -open
+   Sexplib0.Sexp_conv
+   -open
+   Ppx_compare_lib.Builtin
+   -open
+   Ppx_yojson_conv_lib.Yojson_conv.Primitives)))

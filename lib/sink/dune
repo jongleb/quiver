@@ -1,0 +1,45 @@
+(library
+ (name quiver_sink)
+ (public_name quiver.sink)
+ (libraries
+  stdlib_stable
+  base
+  unboxed.int64_u
+  unboxed.float_u
+  stdio
+  angstrom
+  hex_encode
+  sexplib0
+  ppx_compare.runtime-lib
+  ppx_yojson_conv_lib
+  yojson
+  file_path
+  core_unix
+  portable
+  quiver.core)
+ (foreign_stubs
+  (language c)
+  (names float_stubs xxh3_stubs zstd_stubs)
+  (flags
+   (:standard -O3 (:include c_flags.sexp)))
+  (include_dirs ../../vendor/zmij ../../vendor/xxhash))
+ (c_library_flags
+  (:include c_library_flags.sexp))
+ (foreign_archives ../../vendor/zmij/zmij)
+ (preprocess
+  (pps ppx_sexp_conv ppx_compare ppx_yojson_conv ppx_let))
+ (flags
+  (:standard
+   -open
+   Stdlib_stable
+   -open
+   Sexplib0.Sexp_conv
+   -open
+   Ppx_compare_lib.Builtin
+   -open
+   Ppx_yojson_conv_lib.Yojson_conv.Primitives)))
+
+(rule
+ (targets c_flags.sexp c_library_flags.sexp)
+ (action
+  (run %{exe:../config/discover.exe} -package libzstd -fallback -lzstd -link %{env:QUIVER_LINK=shared})))

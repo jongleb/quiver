@@ -1,0 +1,92 @@
+type part : immutable_data = {
+  file : File_path.Part.t;  (** Inside the dump's directory. *)
+  rows : int;
+  bytes : int;  (** Uncompressed length. *)
+  stored_bytes : int;  (** Length on disk. *)
+  checksum : Checksum.t;  (** Of the bytes on disk. *)
+}
+[@@deriving sexp ~portable]
+(** What a sink produced for one chunk. *)
+
+val yojson_of_part : part -> Yojson.Safe.t
+val part_of_yojson : Yojson.Safe.t -> part
+
+type reading : immutable_data = {
+  reader : int;  (** Which of the dump's readers. *)
+  started : Core.Time_ns.Span.t;  (** Since the dump began. *)
+  duration : Core.Time_ns.Span.t;  (** From the query to the last row. *)
+  pool_wait : Core.Time_ns.Span.t;  (** Blocked on an empty batch pool. *)
+  batches : int;
+  allocated_words : int;  (** By the reading thread, for this chunk. *)
+}
+[@@deriving sexp_of ~portable]
+(** How one chunk was read. *)
+
+type writing : immutable_data = {
+  rendering : Core.Time_ns.Span.t;  (** Over all batches, on any thread. *)
+  appending : Core.Time_ns.Span.t;  (** Over all batches, under its lock. *)
+  reordering : Core.Time_ns.Span.t;
+      (** Over all batches, rendered and waiting for an earlier one. *)
+  committing : Core.Time_ns.Span.t;  (** From closing it to it being durable. *)
+}
+[@@deriving sexp_of ~portable]
+(** How one part was written. *)
+
+type state =
+  | Pending
+  | Done of { part : part; reading : reading; writing : writing }
+[@@deriving sexp_of ~portable]
+(** Stored with spans in nanoseconds, under names ending in [_ns]. *)
+
+val yojson_of_state : state -> Yojson.Safe.t
+
+type entry = {
+  table : Schema.Name.t;
+  key : Ident.t list;  (** Empty for a whole-table chunk. *)
+  range : Chunk.Range.t option;
+  state : state;
+}
+[@@deriving yojson_of]
+(** One planned chunk and how far it got. *)
+
+type t = private {
+  version : int;
+  level : Consistency.any;
+  format : Output_format.t;
+  position : Yojson.Safe.t;
+  schema : Schema.t;
+  chunks : entry list;
+}
+(** Everything needed to inspect or resume a dump. *)
+
+val yojson_of_t : t -> Yojson.Safe.t
+
+val make :
+  level:Consistency.any ->
+  format:Output_format.t ->
+  position:Yojson.Safe.t ->
+  schema:Schema.t ->
+  (Chunk.t * state) list ->
+  t
+
+(** Why a manifest cannot be read back. *)
+type error =
+  | Malformed of string  (** Not a quiver manifest: the decoder's reason. *)
+  | Unfinished of Schema.Name.t  (** A chunk of this table was never written. *)
+[@@deriving sexp_of ~portable]
+
+type contents = {
+  format : Output_format.t;
+  parts : (Schema.Name.t * part) list;  (** Every chunk's part, in plan order. *)
+}
+(** What loading needs from a manifest. *)
+
+val read : Yojson.Safe.t -> (contents, [> `Manifest of error ]) result
+
+val localize :
+  Yojson.Safe.t ->
+  format:Output_format.t ->
+  (Schema.Name.t -> int -> part option) ->
+  (Yojson.Safe.t, [> `Manifest of error ]) result
+(** The same manifest as written by another sink: its format, and as the part of
+    each table's [n]-th chunk that sink's part number [n]. *)

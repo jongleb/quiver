@@ -1,0 +1,24 @@
+# Maintainer: Gleb <10594395+jongleb@users.noreply.github.com>
+pkgname=quiver-bin
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc='Parallel consistent logical dumper for MySQL and MariaDB'
+arch=('x86_64' 'aarch64')
+url='https://github.com/jongleb/quiver'
+license=('AGPL-3.0-or-later')
+depends=('glibc')
+optdepends=('ca-certificates: verify servers by the system roots')
+provides=('quiver')
+conflicts=('quiver')
+options=('!strip' '!debug')
+source_x86_64=("https://github.com/jongleb/quiver/releases/download/v${pkgver}/quiver-${pkgver}-x86_64-unknown-linux-gnu.tar.gz")
+source_aarch64=("https://github.com/jongleb/quiver/releases/download/v${pkgver}/quiver-${pkgver}-aarch64-unknown-linux-gnu.tar.gz")
+sha256sums_x86_64=('@SHA256:x86_64-unknown-linux-gnu@')
+sha256sums_aarch64=('@SHA256:aarch64-unknown-linux-gnu@')
+
+package() {
+  cd "quiver-${pkgver}-${CARCH}-unknown-linux-gnu"
+  install -Dm755 quiver "${pkgdir}/usr/bin/quiver"
+  install -Dm644 README.md "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+  install -Dm644 LICENSE licenses/* -t "${pkgdir}/usr/share/licenses/${pkgname}/"
+}

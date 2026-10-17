@@ -1,0 +1,44 @@
+(executable
+ (name link_check)
+ (modules link_check)
+ (libraries unix quiver.mysql))
+
+(rule
+ (alias runtest)
+ (deps
+  (env_var QUIVER_IT)
+  (env_var QUIVER_IT_SERVERS)
+  (env_var QUIVER_PBT_COUNT)
+  (env_var QUIVER_PBT_SEED)
+  (glob_files ../tls/*)
+  (universe))
+ (action
+  (run
+   sh
+   %{dep:roundtrip.sh}
+   %{exe:../../bin/main.exe}
+   %{exe:link_check.exe}
+   %{exe:differential.exe}
+   %{dep:../../docker-compose.yml}
+   %{dep:fixture.sql}
+   %{dep:bank.sql}
+   %{dep:load_statement.sql}
+   %{dep:sakila/sakila-schema.sql}
+   %{dep:sakila/sakila-data.sql}
+   %{env:TMPDIR=/tmp}/quiver-it
+   %{dep:../tls/node.crt})))
+
+(executable
+ (name differential)
+ (modules differential)
+ (libraries
+  base
+  stdio
+  angstrom
+  ptime
+  yojson
+  bytesrw
+  bytesrw.zstd
+  qcheck-core
+  qcheck-core.runner
+  quiver.mysql))

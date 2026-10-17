@@ -1,0 +1,2 @@
+sent 250000 rows in 25 chunks to 127.0.0.1:33300 in 1.74s
+Global_read_lock held for 3.29ms

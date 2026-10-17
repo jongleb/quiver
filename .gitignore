@@ -1,0 +1,15 @@
+_build/
+_opam/
+*.install
+_build_release/
+_build_flambda/
+_build_flambda_o3/
+
+# Notes, plans and research stay local
+*.md
+!/README.md
+_build_ox/
+_build_ox_release/
+/dist/
+_build_dist/
+_build_ox_static/

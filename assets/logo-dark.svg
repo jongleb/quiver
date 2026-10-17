@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><defs><linearGradient id="ring" x1="0" y1="1" x2="1" y2="0"><stop offset="0" stop-color="#5B92D2"/><stop offset="1" stop-color="#A9CCF2"/></linearGradient><linearGradient id="fire" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#FFC15E"/><stop offset="1" stop-color="#EC6813"/></linearGradient><linearGradient id="trail" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#F7A23A" stop-opacity="0"/><stop offset="1" stop-color="#F7A23A" stop-opacity="0.9"/></linearGradient></defs>
+  <path d="M 339.2 244.9 A 136 136 0 1 1 267.1 172.8" fill="none" stroke="url(#ring)" stroke-width="58"/>
+  <polygon points="0,-16 16.0,7.2 -11.2,12.8" fill="url(#ring)" transform="translate(303.1 146.7) rotate(25)"/><polygon points="0,-13 13.0,5.8500000000000005 -9.1,10.4" fill="url(#ring)" transform="translate(376.6 191.9) rotate(-35)"/><polygon points="0,-10 10.0,4.5 -7.0,8.0" fill="url(#ring)" transform="translate(359.7 129.7) rotate(70)"/><polygon points="0,-7 7.0,3.15 -4.8999999999999995,5.6000000000000005" fill="url(#ring)" transform="translate(403.5 139.6) rotate(10)"/>
+  <g transform="translate(214 298) rotate(-45)">
+    <rect x="-150" y="-30" width="84" height="8" rx="4" fill="url(#trail)"/>
+    <rect x="-170" y="22" width="100" height="8" rx="4" fill="url(#trail)"/>
+    <rect x="-128" y="-4" width="60" height="8" rx="4" fill="url(#trail)"/>
+    <rect x="-34" y="-14" width="252" height="28" rx="14" fill="url(#fire)"/>
+    <polygon points="202,-46 272,0 202,46" fill="#EC6813"/>
+    <polygon points="-52,0 -78,-42 -30,-42 0,0" fill="#FFC15E"/>
+    <polygon points="-52,0 -78,42 -30,42 0,0" fill="#F7A23A"/>
+  </g>
+</svg>

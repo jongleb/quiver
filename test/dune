@@ -1,0 +1,40 @@
+(test
+ (name main)
+ (deps
+  (glob_files tls/*))
+ (flags
+  (:standard -open Stdlib_stable))
+ (libraries
+  parsexp
+  stdlib_stable
+  base
+  unboxed.int64_u
+  ptime
+  unboxed.float_u
+  base_bigstring
+  stdio
+  angstrom
+  hex_encode
+  quiver.core
+  quiver.sink
+  quiver.mysql
+  quiver.load
+  quiver.net
+  quiver.openssl
+  threads.posix
+  unix
+  file_path
+  portable
+  await
+  core
+  bytesrw
+  bytesrw.zstd
+  bytesrw.xxhash
+  alcotest
+  qcheck-core
+  qcheck-alcotest)
+ (foreign_stubs
+  (language c)
+  (names tcp_probe_stubs))
+ (preprocess
+  (pps ppx_let ppx_sexp_conv)))

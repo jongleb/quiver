@@ -1,0 +1,20 @@
+pkgbase = quiver-bin
+	pkgdesc = Parallel consistent logical dumper for MySQL and MariaDB
+	pkgver = @VERSION@
+	pkgrel = 1
+	url = https://github.com/jongleb/quiver
+	arch = x86_64
+	arch = aarch64
+	license = AGPL-3.0-or-later
+	depends = glibc
+	optdepends = ca-certificates: verify servers by the system roots
+	provides = quiver
+	conflicts = quiver
+	options = !strip
+	options = !debug
+	source_x86_64 = https://github.com/jongleb/quiver/releases/download/v@VERSION@/quiver-@VERSION@-x86_64-unknown-linux-gnu.tar.gz
+	sha256sums_x86_64 = @SHA256:x86_64-unknown-linux-gnu@
+	source_aarch64 = https://github.com/jongleb/quiver/releases/download/v@VERSION@/quiver-@VERSION@-aarch64-unknown-linux-gnu.tar.gz
+	sha256sums_aarch64 = @SHA256:aarch64-unknown-linux-gnu@
+
+pkgname = quiver-bin

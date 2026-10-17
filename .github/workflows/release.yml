@@ -1,0 +1,318 @@
+name: Release
+
+# A tag v<version> (the version in dune-project) builds the binaries and
+# publishes the GitHub release, the container image, the Homebrew formula and
+# the AUR package. Running it by hand only builds and keeps the artifacts.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  OXCAML_REPOSITORIES: |
+    ox: git+https://github.com/oxcaml/opam-repository.git
+    default: https://github.com/ocaml/opam-repository.git
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.read.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: read
+        run: |
+          version=$(sed -n 's/^(version \(.*\))$/\1/p' dune-project)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "tag $GITHUB_REF_NAME does not match version $version in dune-project" >&2
+            exit 1
+          fi
+
+  # Built on AlmaLinux 9, so the binary runs on glibc 2.34 and later.
+  linux:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            arch: amd64
+            opam: x86_64
+            opam_sha256: edfca2630c373b44b7ee1c2f81cd8dcf67468d0db57d6c02158de553ac63dbd4
+            nfpm: x86_64
+            nfpm_sha256: 9170d25ea056d7329def38134b2bcad98d02d221f8331610dcd619e84d28c565
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            arch: arm64
+            opam: arm64
+            opam_sha256: c4106ece84bcb60c68342573d2d6b4f0d6770ee088015c2216adc83d8854dcf9
+            nfpm: arm64
+            nfpm_sha256: 7871d72bb1035924eab56031f962ae3f004b1f7695151789ef018bdbc507a2fa
+    runs-on: ${{ matrix.runner }}
+    container: almalinux:9
+    env:
+      OPAMROOT: /opt/opam
+      OPAMYES: "1"
+      OPAMCONFIRMLEVEL: unsafe-yes
+    steps:
+      - run: |
+          dnf install -y --setopt=install_weak_deps=False autoconf automake binutils bzip2 \
+            diffutils findutils gcc gcc-c++ git m4 make patch perl pkgconf-pkg-config python3 \
+            rsync tar unzip which xz
+      # OxCaml needs autoconf 2.71 or later; AlmaLinux 9 ships 2.69.
+      - run: |
+          curl -fsSLo /tmp/autoconf.tar.gz https://ftpmirror.gnu.org/gnu/autoconf/autoconf-2.72.tar.gz
+          echo "afb181a76e1ee72832f6581c0eddf8df032b83e2e0239ef79ebedc4467d92d6e  /tmp/autoconf.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/autoconf.tar.gz -C /tmp
+          cd /tmp/autoconf-2.72 && ./configure --prefix=/usr/local && make -j"$(nproc)" install
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: /opt/deps
+          key: deps-${{ matrix.target }}-${{ hashFiles('packaging/deps.sh') }}
+      - run: packaging/deps.sh /opt/deps
+      - run: |
+          curl -fsSLo /usr/local/bin/opam \
+            https://github.com/ocaml/opam/releases/download/2.5.2/opam-2.5.2-${{ matrix.opam }}-linux
+          echo "${{ matrix.opam_sha256 }}  /usr/local/bin/opam" | sha256sum -c -
+          chmod 755 /usr/local/bin/opam
+      - id: opam
+        uses: actions/cache/restore@v4
+        with:
+          path: /opt/opam
+          key: opam-${{ matrix.target }}-${{ hashFiles('quiver.opam') }}
+          restore-keys: opam-${{ matrix.target }}-
+      - run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          if [ ! -x /opt/opam/ox/bin/ocamlopt ]; then
+            rm -rf /opt/opam
+            opam init --bare --disable-sandboxing --no-setup
+            opam switch create ox ocaml-variants.5.2.0+ox \
+              --repos ox=git+https://github.com/oxcaml/opam-repository.git,default
+          fi
+          opam update
+          PKG_CONFIG_PATH=/opt/deps/lib/pkgconfig opam install --switch=ox . --deps-only
+          opam switch set ox
+      # Saved even when a later step fails: building OxCaml takes half an hour.
+      - if: always() && steps.opam.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: /opt/opam
+          key: opam-${{ matrix.target }}-${{ hashFiles('quiver.opam') }}
+      - run: packaging/package.sh ${{ matrix.target }} /opt/deps
+      - run: |
+          curl -fsSLo /tmp/nfpm.tar.gz \
+            https://github.com/goreleaser/nfpm/releases/download/v2.46.3/nfpm_2.46.3_Linux_${{ matrix.nfpm }}.tar.gz
+          echo "${{ matrix.nfpm_sha256 }}  /tmp/nfpm.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/nfpm.tar.gz -C /usr/local/bin nfpm
+          export VERSION=${{ needs.version.outputs.version }} ARCH=${{ matrix.arch }}
+          cp -R "dist/quiver-$VERSION-${{ matrix.target }}" dist/package
+          nfpm package --config packaging/nfpm.yaml --packager deb --target dist/
+          nfpm package --config packaging/nfpm.yaml --packager rpm --target dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.deb
+            dist/*.rpm
+
+  macos:
+    needs: version
+    runs-on: macos-15
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install autoconf automake pkgconf
+      - uses: actions/cache@v4
+        with:
+          path: ~/deps
+          key: deps-aarch64-apple-darwin-${{ hashFiles('packaging/deps.sh') }}
+      - run: packaging/deps.sh ~/deps
+      - uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: "ocaml-variants.5.2.0+ox"
+          opam-repositories: ${{ env.OXCAML_REPOSITORIES }}
+      - run: PKG_CONFIG_PATH=~/deps/lib/pkgconfig opam install . --deps-only
+      - run: packaging/package.sh aarch64-apple-darwin ~/deps
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aarch64-apple-darwin
+          path: dist/*.tar.gz
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: [version, linux, macos]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: "*-{unknown-linux-gnu,apple-darwin}"
+          merge-multiple: true
+      - run: cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "quiver ${{ needs.version.outputs.version }}" --generate-notes
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SHA256SUMS
+          path: dist/SHA256SUMS
+
+  image:
+    needs: [version, release]
+    runs-on: ubuntu-24.04
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: "*-linux-gnu"
+          merge-multiple: true
+      - run: |
+          version=${{ needs.version.outputs.version }}
+          for pair in amd64:x86_64 arm64:aarch64; do
+            mkdir -p "image/linux-${pair%%:*}"
+            tar -xzf "dist/quiver-$version-${pair##*:}-unknown-linux-gnu.tar.gz" \
+              -C "image/linux-${pair%%:*}" --strip-components 1
+          done
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: image
+          file: packaging/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.licenses=AGPL-3.0-or-later
+            org.opencontainers.image.version=${{ needs.version.outputs.version }}
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ needs.version.outputs.version }}
+            ghcr.io/${{ github.repository }}:latest
+
+  # The apt and dnf repositories on GitHub Pages, signed with the key in
+  # PACKAGES_SIGNING_KEY (armored, no passphrase). Without a tag or a key the
+  # repositories are only built, with a throwaway key.
+  repository:
+    needs: [version, linux]
+    runs-on: ubuntu-24.04
+    outputs:
+      publish: ${{ steps.key.outputs.publish }}
+    env:
+      KEY: ${{ secrets.PACKAGES_SIGNING_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: "*-linux-gnu"
+          merge-multiple: true
+      - run: sudo apt-get update && sudo apt-get install -y apt-utils createrepo-c rpm
+      - id: key
+        run: |
+          if [ -n "$KEY" ]; then
+            echo "$KEY" | gpg --batch --import
+            echo "publish=$GITHUB_REF_TYPE" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::PACKAGES_SIGNING_KEY is not set; the repositories are not published"
+            gpg --batch --passphrase '' --quick-gen-key "quiver test" ed25519 sign never
+          fi
+          echo "id=$(gpg --list-secret-keys --with-colons | awk -F: '$1 == "fpr" { print $10; exit }')" >> "$GITHUB_OUTPUT"
+      - run: packaging/repository.sh dist site ${{ steps.key.outputs.id }}
+      - if: steps.key.outputs.publish == 'tag'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  pages:
+    needs: [release, repository]
+    if: needs.repository.outputs.publish == 'tag'
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4
+
+  # Needs a token with write access to jongleb/homebrew-tap in HOMEBREW_TAP_TOKEN.
+  homebrew:
+    needs: [version, release]
+    runs-on: ubuntu-24.04
+    env:
+      TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+    steps:
+      - if: env.TOKEN == ''
+        run: echo "::warning::HOMEBREW_TAP_TOKEN is not set; the formula is not published"
+      - if: env.TOKEN != ''
+        uses: actions/checkout@v4
+      - if: env.TOKEN != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: SHA256SUMS
+      - if: env.TOKEN != ''
+        run: |
+          version=${{ needs.version.outputs.version }}
+          git clone "https://x-access-token:$TOKEN@github.com/jongleb/homebrew-tap.git" tap
+          mkdir -p tap/Formula
+          packaging/render.sh packaging/homebrew/quiver.rb "$version" SHA256SUMS > tap/Formula/quiver.rb
+          cd tap
+          git config user.name "${{ github.actor }}"
+          git config user.email "${{ github.actor }}@users.noreply.github.com"
+          git add Formula/quiver.rb
+          git commit -m "quiver $version"
+          git push origin HEAD:main
+
+  # Needs the private key of an AUR account that owns quiver-bin in AUR_SSH_KEY.
+  aur:
+    needs: [version, release]
+    runs-on: ubuntu-24.04
+    env:
+      KEY: ${{ secrets.AUR_SSH_KEY }}
+    steps:
+      - if: env.KEY == ''
+        run: echo "::warning::AUR_SSH_KEY is not set; the AUR package is not published"
+      - if: env.KEY != ''
+        uses: actions/checkout@v4
+      - if: env.KEY != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: SHA256SUMS
+      - if: env.KEY != ''
+        run: |
+          version=${{ needs.version.outputs.version }}
+          mkdir -p ~/.ssh
+          echo "$KEY" > ~/.ssh/aur && chmod 600 ~/.ssh/aur
+          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/aur"
+          git clone ssh://aur@aur.archlinux.org/quiver-bin.git aur
+          packaging/render.sh packaging/aur/PKGBUILD "$version" SHA256SUMS > aur/PKGBUILD
+          packaging/render.sh packaging/aur/.SRCINFO "$version" SHA256SUMS > aur/.SRCINFO
+          cd aur
+          git config user.name "${{ github.actor }}"
+          git config user.email "${{ github.actor }}@users.noreply.github.com"
+          git add PKGBUILD .SRCINFO
+          git commit -m "quiver $version"
+          git push origin HEAD:master

@@ -1,0 +1,24 @@
+(executable
+ (name main)
+ (public_name quiver)
+ (libraries
+  cmdliner
+  base
+  stdio
+  angstrom
+  hex_encode
+  quiver.core
+  quiver.sink
+  quiver.mysql
+  quiver.load
+  quiver.net
+  file_path)
+ (preprocess
+  (pps ppx_let)))
+
+(rule
+ (target version.ml)
+ (action
+  (with-stdout-to
+   %{target}
+   (echo "let number = \"%{version:quiver}\"\n"))))

@@ -1,0 +1,76 @@
+(** Loads a quiver dump into MySQL or MariaDB: databases, then each table and,
+    as soon as it exists, its data files in parallel sessions, each file
+    streamed statement by statement in one transaction and checked against the
+    manifest's checksum; views, triggers and routines last. *)
+
+type cause : value mod contended portable =
+  [ `Link of Quiver_mysql.Link.error
+  | `Wire of Quiver_mysql.Wire.error
+  | `Transport of Quiver_mysql.Transport.error ]
+[@@deriving sexp_of ~portable]
+(** A connection's failure, as the protocol client reports it. *)
+
+type error =
+  | Unreadable of { file : File_path.Part.t; message : string }
+      (** The file could not be read or decompressed. *)
+  | Corrupt of File_path.Part.t
+      (** Its bytes differ from the manifest's checksum. *)
+  | Missing of File_path.Part.t  (** A file the dump needs is not there. *)
+  | Rejected of { file : File_path.Part.t; statement : string; cause : cause }
+      (** The server failed a statement; [statement] is cut short. *)
+  | Several_databases of Quiver_core.Ident.t list
+      (** [Into] asks for one target, the dump holds these. *)
+  | Non_positive_threads of int
+  | Unreadable_columns of Quiver_core.Schema.Name.t
+      (** The server's description of a loaded table's columns. *)
+[@@deriving sexp_of ~portable]
+
+(** Where the dumped databases go. *)
+type target =
+  | Same_names
+  | Into of Quiver_core.Ident.t  (** The dump's only database, renamed. *)
+
+(** When secondary and foreign keys are built: [After_data] adds a table's back
+    on the session that commits its last data file, while the others keep
+    loading, so InnoDB builds each index by sorting; [With_table] keeps the
+    table definition whole. *)
+type keys = After_data | With_table
+
+(** Whether the load is written to the server's binlog; [Skip_binlog] needs the
+    right to set [sql_log_bin], and replicas then miss the data. *)
+type binlog = Write_binlog | Skip_binlog
+
+val session :
+  Quiver_mysql.Provider.conn_config ->
+  binlog ->
+  (Quiver_mysql.Link.t, [> cause ]) result @@ portable
+(** A connection set up for loading: no foreign key or unique checks, UTC, the
+    [sql_mode] dumps are written for, local data allowed. *)
+
+val renamed : target -> Quiver_core.Ident.t -> Quiver_core.Ident.t @@ portable
+
+val create_database : target -> Quiver_core.Ident.t -> string -> string @@ portable
+(** A [CREATE DATABASE] statement for the database's new name. *)
+
+type summary = {
+  files : int;
+  rows : int;
+  bytes : int;
+  skipped : int;  (** Files an interrupted earlier load had committed. *)
+}
+(** Data files loaded now, their rows and uncompressed bytes. *)
+
+val run :
+  Quiver_mysql.Provider.conn_config ->
+  dir:File_path.t ->
+  target ->
+  keys:keys ->
+  binlog:binlog ->
+  threads:int ->
+  ( summary,
+    [> `Load of error
+    | `Manifest of Quiver_core.Manifest.error
+    | `Statements of Statements.error
+    | `Ident of Quiver_core.Ident.error
+    | cause ] )
+  result

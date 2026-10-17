@@ -1,0 +1,11 @@
+(executable
+ (name main)
+ (libraries
+  await
+  base
+  stdio
+  angstrom
+  file_path
+  quiver.core
+  quiver.sink
+  quiver.mysql))

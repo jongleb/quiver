@@ -1,0 +1,25 @@
+# deb and rpm from the release directory copied to dist/package; VERSION and
+# ARCH (amd64 or arm64) come from the environment.
+name: quiver
+version: ${VERSION}
+arch: ${ARCH}
+platform: linux
+maintainer: Gleb <10594395+jongleb@users.noreply.github.com>
+description: Parallel consistent logical dumper for MySQL and MariaDB
+homepage: https://github.com/jongleb/quiver
+license: AGPL-3.0-or-later
+section: database
+recommends:
+  - ca-certificates
+contents:
+  - src: dist/package/quiver
+    dst: /usr/bin/quiver
+    file_info:
+      mode: 0755
+  - src: dist/package/README.md
+    dst: /usr/share/doc/quiver/README.md
+  - src: dist/package/LICENSE
+    dst: /usr/share/licenses/quiver/LICENSE
+  - src: dist/package/licenses/
+    dst: /usr/share/licenses/quiver/
+    type: tree

@@ -1,0 +1,43 @@
+(library
+ (name quiver_core)
+ (public_name quiver.core)
+ (libraries
+  stdlib_stable
+  base
+  unboxed.int64_u
+  unboxed.float_u
+  base_bigstring
+  core
+  core_unix
+  time_now
+  stdio
+  angstrom
+  hex_encode
+  sexplib0
+  ppx_compare.runtime-lib
+  ppx_hash.runtime-lib
+  ppx_yojson_conv_lib
+  yojson
+  file_path
+  unique
+  await
+  portable
+  threads.posix)
+ (preprocess
+  (pps ppx_sexp_conv ppx_compare ppx_hash ppx_yojson_conv ppx_let))
+ (flags
+  (:standard
+   -open
+   Stdlib_stable
+   -open
+   Sexplib0.Sexp_conv
+   -open
+   Ppx_compare_lib.Builtin
+   -open
+   Ppx_hash_lib.Std.Hash.Builtin
+   -open
+   Ppx_yojson_conv_lib.Yojson_conv.Primitives))
+ (foreign_stubs
+  (language c)
+  (names poll_stubs tcp_stubs))
+ (modules_without_implementation provider_intf sink_intf))

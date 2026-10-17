@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# quiver builds on OxCaml, Jane Street's OCaml, with its own opam repository.
+env:
+  OXCAML_REPOSITORIES: |
+    ox: git+https://github.com/oxcaml/opam-repository.git
+    default: https://github.com/ocaml/opam-repository.git
+
+jobs:
+  build:
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y autoconf automake libzstd-dev libxxhash-dev libssl-dev
+      - if: runner.os == 'macOS'
+        run: |
+          brew install autoconf automake zstd xxhash openssl
+          echo "PKG_CONFIG_PATH=$(brew --prefix zstd)/lib/pkgconfig:$(brew --prefix xxhash)/lib/pkgconfig:$(brew --prefix openssl)/lib/pkgconfig" >> "$GITHUB_ENV"
+      - uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: "ocaml-variants.5.2.0+ox"
+          opam-repositories: ${{ env.OXCAML_REPOSITORIES }}
+      - run: opam install . --deps-only --with-test
+      - run: opam exec -- dune build
+      - run: opam exec -- dune test
+
+  integration:
+    timeout-minutes: 45
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y autoconf automake libzstd-dev libxxhash-dev libssl-dev zstd
+      - uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: "ocaml-variants.5.2.0+ox"
+          opam-repositories: ${{ env.OXCAML_REPOSITORIES }}
+      - run: opam install . --deps-only --with-test
+      - run: docker compose -p quiver up -d --wait
+      - run: QUIVER_IT=1 opam exec -- dune test

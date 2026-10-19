@@ -7,16 +7,24 @@
 
 # quiver
 
-**Move MySQL and MariaDB data faster than the tools you use today, and keep it consistent.**
-
-Dump · Load · Copy server to server · Stream across networks through relays and chains of targets.
-One snapshot, every core, its own wire protocol.
+A MySQL and MariaDB dumper and data mover with its own protocol client and its own network
+transport. Dump, load, copy between servers and stream across networks from one consistent
+snapshot.
 
 [![CI](https://github.com/jongleb/quiver/actions/workflows/ci.yml/badge.svg)](https://github.com/jongleb/quiver/actions/workflows/ci.yml)
 ![OxCaml](https://img.shields.io/badge/OxCaml-5.2%2Box-ec6813?logo=ocaml&logoColor=white)
 ![MySQL 8.0 · 8.4](https://img.shields.io/badge/MySQL-8.0%20%C2%B7%208.4-4479a1?logo=mysql&logoColor=white)
 ![MariaDB 10.11 · 11.4 · 11.8](https://img.shields.io/badge/MariaDB-10.11%20%C2%B7%2011.4%20%C2%B7%2011.8-003545?logo=mariadb&logoColor=white)
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-8a2be2)](LICENSE)
+
+<table>
+<tr>
+<td align="center" width="25%"><h2>1.36×</h2>faster than mydumper<br><sub>SQL dump, wall time</sub></td>
+<td align="center" width="25%"><h2>1.57×</h2>less client CPU<br><sub>SQL + zstd dump</sub></td>
+<td align="center" width="25%"><h2>2.8×</h2>faster on a thin link<br><sub>streams and compression tuned online</sub></td>
+<td align="center" width="25%"><h2>0</h2>allocations per cell<br><sub>socket to columns to file</sub></td>
+</tr>
+</table>
 
 </div>
 
@@ -28,42 +36,61 @@ dumped 48211907 rows in 312 chunks into ./shop
 Global_read_lock held for 41ms
 ```
 
-## What quiver is
+## What is new
 
-quiver is a logical dumper and data mover for MySQL and MariaDB, written from scratch in OCaml 5:
-an embeddable library with a thin command-line tool.
-
-It doesn't wrap `mysqldump` or link `libmysqlclient`. quiver speaks the MySQL client/server
-protocol itself. It decodes binary rows straight from the socket buffer into columnar batches,
-with no allocation per cell. Every core works in parallel, and every session reads one
-consistent snapshot.
-
-The goal is plain: be the fastest and most trustworthy way to get data out of one MySQL and into
-another, whether the other one is a directory, a server next door or a server on another continent.
+1. No client library. quiver implements the MySQL protocol itself and decodes binary rows from
+   the network buffer straight into Arrow-layout column buffers. A whole dump allocates 0.05
+   words per row.
+2. A transport for database data. The agent next to the source sends columnar batches over many
+   TCP streams, compressed once. Relays forward bytes. Collectors write files or load a server
+   and can forward everything to the next collector, so one read of the source reaches a chain
+   of targets. A chunk counts once every target has committed it.
+3. The transport tunes itself. Each second the agent measures delivered bytes. It adds streams
+   while the network is the bottleneck and keeps them only if throughput grows, and it moves
+   zstd between none, fast, 1 and 3. On a 1 MB/s per flow link this took a table from 35.7 s to
+   12.6 s.
+4. Broken connections do not end the dump. Every frame is acknowledged. A broken data connection
+   hands its unacknowledged frames to the other streams and is replaced. A broken control
+   connection is replaced while the agent holds its snapshot, and each side resends only what
+   the other has not received.
+5. The global lock lasts one round trip. All N sessions open their snapshots in parallel under
+   the lock.
+6. The compiler checks the parallelism. Thread bodies are checked by OxCaml modes. Shared state
+   lives only in capsules, atomics and queues, with no unsafe casts.
+7. Optimisations are checked by mutation. Fast code is compared with a simple model by property
+   tests, and every test is shown to fail on deliberately broken code.
 
 ## Numbers
 
-Measured on a laptop: Apple M5, MySQL 8.4 in Docker, 4 threads, median of 3 runs. These are our
-own numbers on our own data; reproduce them with `bench/run.sh`, `bench/load.sh` and
-`bench/wire.sh`.
+Apple M5 laptop, MySQL 8.4 in Docker, 4 threads, 3 runs, warm buffer pool, 1.3 GB of data with
+narrow and wide rows, integer and string keys and BLOBs. Scripts: `bench/run.sh`,
+`bench/load.sh`, `bench/wire.sh`.
 
-| | quiver | the usual tool | |
+| | quiver | mydumper / myloader | |
 |---|---|---|---|
-| Dump to SQL, wall time | **1.76 s** | mydumper 2.24 s | **1.27× faster** |
-| Dump to SQL + zstd, wall time | **2.23 s** | mydumper 2.67 s | **1.20× faster** |
-| Dump to SQL + zstd, client CPU | **5.2 s** | mydumper 7.6 s | **1.45× less CPU** |
-| Load 1.3 GB (no secondary indexes), CSV | **18.0 s** | myloader 22.5 s | **1.25× faster** |
-| Agent → collector over 100 ms RTT, 1 MB/s per flow, mutual TLS | **1.25 s** (16 streams) | 1.6 s (one stream per reader) | **1.3× faster** |
+| Dump to SQL, wall time | **1.32 s** | 1.79 s | 1.36× faster |
+| Dump to SQL, client CPU | **4.0 s** | 4.3 s | 0.94× |
+| Dump to SQL + zstd, wall time | **2.05 s** | 2.15 s | on par |
+| Dump to SQL + zstd, client CPU | **5.4 s** | 8.5 s | 1.57× less |
+| Load, CSV | **18.0 s** | 22.5 s | 1.25× faster |
 
-## One tool, five verbs
+Agent to collector:
+
+| | before | quiver | |
+|---|---|---|---|
+| 1 MB/s per flow, 50 ms RTT, streams grown online | 35.7 s on 4 streams | **12.6 s** | 2.8× faster |
+| 100 ms RTT, mutual TLS, 16 streams opened at once | 2.9 s | **1.25 s** | 2.3× faster |
+| Agent CPU, frames written without copies | | | 31 % less |
+
+## Commands
 
 ```sh
-quiver dump    # MySQL → files: mydumper-compatible SQL or CSV, optional zstd, a checksummed manifest
-quiver load    # files → MySQL: parallel and streaming, resumes after a crash
-quiver copy    # MySQL → MySQL with no files in between
-quiver agent   # MySQL → the network: next to the source
-quiver collect # the network → files or MySQL: next to the target, can pass everything on
-quiver relay   # a hop in between that passes bytes along
+quiver dump    # MySQL to files: mydumper-compatible SQL or CSV, optional zstd, checksummed manifest
+quiver load    # files to MySQL: parallel, streaming, resumes after a crash
+quiver copy    # MySQL to MySQL with no files in between
+quiver agent   # MySQL to the network, runs next to the source
+quiver collect # the network to files or MySQL, runs next to the target, can forward
+quiver relay   # a hop that forwards bytes
 ```
 
 ```mermaid
@@ -76,53 +103,46 @@ flowchart LR
     c2 --> files[/SQL · CSV · zstd files/]
 ```
 
-## Why it's fast
+## Speed
 
-- **Its own protocol client.** Handshake, `caching_sha2_password`, TLS, prepared statements and
-  the binary row format are implemented in OCaml on Eio. Between the socket and your data there
-  is nothing in C except OpenSSL.
-- **No allocation per cell.** Rows land in Arrow-style column buffers straight from the network
-  buffer. Integers and doubles are copied, text is copied once, and dates are decoded without
-  intermediate structs. Doubles are printed with zmij, which is about 13× faster than Grisu3.
-- **Every core.** Reader domains, render domains (SQL, CSV, zstd) and writers run
-  in parallel, joined by bounded queues, so backpressure never needs a buffer that grows.
-- **Chunks cut by the server's estimates.** quiver bisects key ranges by `EXPLAIN` row estimates
-  and then merges small neighbours. Skewed tables split evenly, and every reader gets several
-  chunks, so the slowest one doesn't hold the dump back.
-- **Readers, streams and commits are tuned apart.** Readers never wait for a commit. On a long
-  path, more TCP streams than readers fill the pipe. Control requests are pipelined, so a
-  thousand tables don't cost a thousand round trips.
-- **The wire tunes itself.** While the network holds the dump back, the agent opens more
-  streams and keeps them only when they carry more; it compresses harder when bytes are scarce
-  and lighter when the CPU is. On a path of 1 MB/s per flow, a table went from 35.7 s on four
-  streams to 12.6 s. `--max-rate` and `--dscp` keep it polite on a shared link.
-- **A broken connection is not a failed dump.** Every frame is acknowledged; when a data
-  connection breaks, its unacknowledged frames move to the others, duplicates are dropped and
-  the connection is replaced. When the control connection breaks, or goes silent for 15 s,
-  the agent keeps its snapshot and reconnects within `--reconnect` (60 s): both sides send
-  again only what the other did not get, through relays too.
+- Readers, renderers (SQL, CSV, zstd) and writers run on separate cores, joined by bounded
+  queues.
+- Key ranges are bisected by `EXPLAIN` estimates and small neighbours are merged, so skewed
+  tables split evenly and each reader gets several chunks. Data flows from the first second and
+  DDL is taken along the way.
+- Readers do not wait for commits. Network streams are sized apart from readers. Control
+  requests are pipelined.
+- Doubles are printed by zmij, about 13× faster than Grisu3, straight into the output buffer.
 
-## Why you can trust it
+## Correctness
 
-- **One consistent snapshot.** `FLUSH TABLES WITH READ LOCK` or MariaDB's `BACKUP STAGE` is held
-  only while N sessions open their transactions. The binlog position and GTID set are recorded
-  before the lock is released, and the lock time is printed and stored. The consistency level
-  never drops silently: if a mode can't guarantee it, quiver refuses to start.
-- **Exact values.** Floats are written in their shortest exact form, and decimals and fractional
-  seconds as they are stored. A conversion that would lose precision is an error, not a
-  truncation. Zero dates are an error unless you ask to keep them.
-- **Checksums end to end.** Every file is hashed with xxh3 into the manifest, and `quiver load`
-  rolls back a file that doesn't match. Over the network, every frame and every header carries
-  its own checksum, inside mutual TLS 1.3.
-- **A chunk counts only once it's durable.** A chunk counts once it has committed on the target,
-  on every target in a chain. If anything fails, the run exits non-zero with a typed error and
-  leaves no manifest, so a half-done dump never looks finished.
-- **Resumable loads.** `quiver load` records each file in the same transaction as its data, so
-  after a crash it skips what was committed and loads the rest.
-- **Tested against real servers.** quiver runs against MySQL 8.0 and 8.4 and MariaDB 10.11,
-  11.4 and 11.8 in Docker: Sakila with views, triggers, routines and events restored by
-  `myloader` and by quiver, a bank-transfer workload under concurrent writes, and chaos tests
-  for reset connections, silent peers, killed sessions and a full disk.
+- One snapshot for all sessions under `FLUSH TABLES WITH READ LOCK` or MariaDB `BACKUP STAGE`.
+  The binlog position and GTID set are taken before the lock is released. If the requested
+  consistency cannot be given, quiver refuses to start.
+- Floats in their shortest exact form, decimals and fractional seconds as stored. A lossy
+  conversion is an error. Zero dates are an error unless kept explicitly.
+- xxh3 of every file in the manifest, checked by `quiver load`. On the wire every frame and
+  header has its own checksum, inside mutual TLS 1.3 with a key update every 64 GiB.
+- Any failure exits non-zero with a typed error and writes no manifest, so an unfinished dump
+  never looks finished.
+- `quiver load` records each file in the same transaction as its data and resumes after a crash.
+- Integration tests on MySQL 8.0 and 8.4 and MariaDB 10.11, 11.4 and 11.8: random tables of every
+  type dumped and restored, Sakila with all objects through `myloader` and quiver, bank transfers
+  under concurrent writes, resets, silent peers, killed sessions and a full disk.
+- Network sessions are property tests. Random topologies with relays and chains run while
+  connections are cut, corrupted and reset. Either every node commits every part or every node
+  fails.
+
+## Connecting
+
+- Without `-h` quiver uses the local socket and finds it as the `mysql` client does: `socket` in
+  the `[client]` groups of `my.cnf` with `!include` and `!includedir`, then `MYSQL_UNIX_PORT`,
+  then the packaged paths. Servers with `skip_networking` work as they are.
+- Logins: `caching_sha2_password`, `mysql_native_password`, `sha256_password` with RSA over a
+  socket, MariaDB `unix_socket`.
+- TLS against system roots by default, your CA with `--tls-ca`, or a pinned certificate with
+  `--tls-fingerprint`.
+- `--connect-timeout` (10 s) bounds connecting, `--net-timeout` bounds silence afterwards.
 
 ## Install
 
@@ -258,7 +278,8 @@ quiver is young and moving fast.
 | Area | State |
 |---|---|
 | Dump, load and copy | ✅ |
-| Agent, collector, relays and chains | ✅ (wire protocol v5) |
+| Unix sockets, `my.cnf`, every common login | ✅ |
+| Agent, collector, relays and chains | ✅ |
 | Mutual TLS 1.3 on the wire protocol, with key updates | ✅ |
 | Broken data connections resent and replaced | ✅ |
 | Online tuning of streams and compression, rate cap, DSCP | ✅ |
@@ -273,5 +294,5 @@ quiver is free software under the [GNU Affero General Public License v3.0](LICEN
 version. You may use, change and share it. If you distribute a modified quiver, or run one as a
 service that others reach over a network, you must offer them its source under the same licence.
 The vendored zmij (`vendor/zmij`, MIT) and xxHash (`vendor/xxhash`, BSD-2-Clause) keep their own
-licences; release binaries also carry OpenSSL (Apache-2.0) and zstd (BSD-3-Clause), whose
+licences. Release binaries also carry OpenSSL (Apache-2.0) and zstd (BSD-3-Clause), whose
 licences ship next to the binary in `licenses/`.

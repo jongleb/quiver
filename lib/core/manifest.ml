@@ -46,6 +46,43 @@ type writing = {
 }
 [@@deriving sexp_of ~portable]
 
+type encoding = Plain | Zstd of int [@@deriving sexp_of ~portable, equal ~portable]
+
+type carrying = {
+  frames : int;
+  wire_bytes : int;
+  raw_bytes : int;
+  encodings : (encoding * int) list;
+  streams : int;
+  round_trip : Core.Time_ns.Span.t option;
+  sending : Core.Time_ns.Span.t;
+}
+[@@deriving sexp_of ~portable]
+
+let yojson_of_carrying
+    { frames; wire_bytes; raw_bytes; encodings; streams; round_trip; sending } =
+  `Assoc
+    [
+      ("frames", `Int frames);
+      ("wire_bytes", `Int wire_bytes);
+      ("raw_bytes", `Int raw_bytes);
+      ( "encodings",
+        `List
+          (List.map
+             (fun (encoding, frames) ->
+               `Assoc
+                 ((match encoding with
+                  | Plain -> [ ("encoding", `String "plain") ]
+                  | Zstd level ->
+                      [ ("encoding", `String "zstd"); ("level", `Int level) ])
+                 @ [ ("frames", `Int frames) ]))
+             encodings) );
+      ("streams", `Int streams);
+      ( "round_trip_ns",
+        Option.fold ~none:`Null ~some:Codec.yojson_of_span round_trip );
+      ("sending_ns", Codec.yojson_of_span sending);
+    ]
+
 type state =
   | Pending
   | Done of { part : part; reading : reading; writing : writing }
@@ -170,7 +207,7 @@ let read json =
       in
       { format; parts }
 
-let localize json ~format part =
+let rewriting json ~format change =
   let malformed what = Error (`Manifest (Malformed what)) in
   let counts = Hashtbl.create 16 in
   let replace key value fields =
@@ -183,28 +220,17 @@ let localize json ~format part =
         match
           (List.assoc_opt "table" fields, List.assoc_opt "state" fields)
         with
-        | Some table, Some (`List [ `String "Done"; `Assoc finished ]) -> (
+        | Some table, Some (`List [ `String "Done"; `Assoc done_ ]) -> (
             match Codec.decode Schema.Name.t_of_yojson table with
             | Error reason -> malformed reason
-            | Ok table -> (
+            | Ok table ->
                 let index =
                   Option.value (Hashtbl.find_opt counts table) ~default:0
                 in
                 Hashtbl.replace counts table (index + 1);
-                match part table index with
-                | None -> Error (`Manifest (Unfinished table))
-                | Some part ->
-                    Ok
-                      (`Assoc
-                         (replace "state"
-                            (`List
-                               [
-                                 `String "Done";
-                                 `Assoc
-                                   (replace "part" (yojson_of_part part)
-                                      finished);
-                               ])
-                            fields))))
+                let%map done_ = change table index done_ in
+                `Assoc
+                  (replace "state" (`List [ `String "Done"; `Assoc done_ ]) fields))
         | _ -> malformed "a chunk without a finished state")
     | _ -> malformed "a chunk that is not an object"
   in
@@ -214,9 +240,10 @@ let localize json ~format part =
         Base.Result.all
           (List.map
              (fun (key, value) ->
-               match (key, value) with
-               | "format", _ -> Ok (key, Output_format.yojson_of_t format)
-               | "chunks", `List chunks ->
+               match (key, value, format) with
+               | "format", _, Some format ->
+                   Ok (key, Output_format.yojson_of_t format)
+               | "chunks", `List chunks, _ ->
                    let%map chunks = Base.Result.all (List.map entry chunks) in
                    (key, `List chunks)
                | _ -> Ok (key, value))
@@ -224,3 +251,25 @@ let localize json ~format part =
       in
       `Assoc fields
   | _ -> malformed "not an object"
+
+let localize json ~format part =
+  rewriting json ~format:(Some format) (fun table index done_ ->
+      match part table index with
+      | None -> Error (`Manifest (Unfinished table))
+      | Some part ->
+          Ok
+            (List.map
+               (fun (key, value) ->
+                 match key with
+                 | "part" -> (key, yojson_of_part part)
+                 | _ -> (key, value))
+               done_))
+
+let annotate json carried =
+  rewriting json ~format:None (fun table index done_ ->
+      Ok
+        (Option.fold ~none:done_
+           ~some:(fun carrying ->
+             List.remove_assoc "carrying" done_
+             @ [ ("carrying", yojson_of_carrying carrying) ])
+           (carried table index)))

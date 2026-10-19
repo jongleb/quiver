@@ -2,10 +2,8 @@ type t
 (** A client connection with [utf8mb4] as its character set. *)
 
 val connect :
-  tls:Link.tls ->
-  timeout:Core.Time_ns.Span.t ->
-  host:string ->
-  port:int ->
+  Link.route ->
+  timeouts:Link.timeouts ->
   user:string ->
   password:string option ->
   (t, [> `Client of Client_error.t ]) result @@ portable

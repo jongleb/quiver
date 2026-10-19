@@ -1,8 +1,11 @@
 open Base.Result.Let_syntax
 
+type endpoint = Tcp of { host : string; port : int } | Socket of File_path.t
+[@@deriving sexp_of ~portable]
+
 type error =
   | Unresolved of string
-  | Unreachable of { host : string; port : int; message : string }
+  | Unreachable of { endpoint : endpoint; message : string }
   | Tls of string
   | Expired_certificate
   | Io of string
@@ -21,24 +24,24 @@ type channel = Plain | Secure of Quiver_openssl.Tls.session
 
 type t = {
   fd : Unix.file_descr;
-  timeout : Core.Time_ns.Span.t;
+  mutable timeout : Core.Time_ns.Span.t;
   mutable channel : channel;
   mutable failure : error option;
 }
 
 let lost = "the connection closed without TLS close_notify"
 
-let connect ~timeout ~host ~port =
+let connect ~timeout endpoint =
   Base.Portable_lazy.force Quiver_core.Blocking.sockets;
   let seconds = Core.Time_ns.Span.to_sec timeout in
-  let attempt (address : Unix.addr_info) =
-    let fd = Unix.socket ~cloexec:true address.ai_family SOCK_STREAM 0 in
+  let attempt family address ~tune =
+    let fd = Unix.socket ~cloexec:true family SOCK_STREAM 0 in
     match
       Unix.set_nonblock fd;
-      Quiver_core.Tcp.tune fd;
-      (match Unix.connect fd address.ai_addr with
+      tune fd;
+      (match Unix.connect fd address with
       | () -> ()
-      | exception Unix.Unix_error (EINPROGRESS, _, _) -> (
+      | exception Unix.Unix_error ((EINPROGRESS | EAGAIN), _, _) -> (
           match Quiver_core.Blocking.wait ~seconds Writable fd with
           | Timed_out -> raise (Unix.Unix_error (ETIMEDOUT, "connect", ""))
           | Ready -> (
@@ -54,15 +57,24 @@ let connect ~timeout ~host ~port =
         Unix.close fd;
         Error
           (`Transport
-             (Unreachable { host; port; message = Unix.error_message error }))
+             (Unreachable { endpoint; message = Unix.error_message error }))
   in
-  match Unix.getaddrinfo host (Int.to_string port) [ AI_SOCKTYPE SOCK_STREAM ] with
-  | [] | (exception Unix.Unix_error _) -> Error (`Transport (Unresolved host))
-  | first :: rest ->
-      List.fold_left
-        (fun result address ->
-          match result with Ok _ -> result | Error _ -> attempt address)
-        (attempt first) rest
+  match endpoint with
+  | Socket path ->
+      attempt PF_UNIX (ADDR_UNIX (File_path.to_string path)) ~tune:ignore
+  | Tcp { host; port } -> (
+      let attempt (address : Unix.addr_info) =
+        attempt address.ai_family address.ai_addr ~tune:Quiver_core.Tcp.tune
+      in
+      match
+        Unix.getaddrinfo host (Int.to_string port) [ AI_SOCKTYPE SOCK_STREAM ]
+      with
+      | [] | (exception Unix.Unix_error _) -> Error (`Transport (Unresolved host))
+      | first :: rest ->
+          List.fold_left
+            (fun result address ->
+              match result with Ok _ -> result | Error _ -> attempt address)
+            (attempt first) rest)
 
 let read t buffer ~off ~len =
   let fail target error =
@@ -176,6 +188,14 @@ let start_tls t ~host authority =
           match Quiver_openssl.Tls.verified session with
           | Ok () -> Ok Trusted
           | Error reason -> Ok (Unproven reason)))
+
+let set_timeout t timeout =
+  let seconds = Core.Time_ns.Span.to_sec timeout in
+  (try
+     Unix.setsockopt_float t.fd SO_RCVTIMEO seconds;
+     Unix.setsockopt_float t.fd SO_SNDTIMEO seconds
+   with Unix.Unix_error ((_ : Unix.error), _, _) -> ());
+  t.timeout <- timeout
 
 let failure t = t.failure
 

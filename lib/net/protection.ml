@@ -24,10 +24,10 @@ let mutual ~certificate ~key ~peers =
 
 (** Whether bytes go to the socket as they are or through OpenSSL. *)
 type channel : value mod contended portable =
-  | Plain  (** A blocking socket: the kernel serves a reader and a writer. *)
+  | Plain  (** The kernel serves a reader and a writer. *)
   | Secure of Quiver_openssl.Tls.session
-      (** A non-blocking socket: OpenSSL takes one call at a time, and nobody
-          holds the session while waiting for the socket. *)
+      (** OpenSSL takes one call at a time, and nobody holds the session while
+          waiting for the socket. *)
 
 (** Whether this side told the peer it sends nothing more. *)
 type notice = Unsent | Sent
@@ -55,7 +55,9 @@ let secure fd session ~start =
 
 let accepted t fd =
   match t with
-  | Plaintext -> Ok { fd; channel = Plain; notice = Atomic.make Unsent }
+  | Plaintext ->
+      Unix.set_nonblock fd;
+      Ok { fd; channel = Plain; notice = Atomic.make Unsent }
   | Mutual context -> (
       match Quiver_openssl.Tls.session context fd with
       | Error reason -> Error (`Protection (Handshake reason))
@@ -63,7 +65,9 @@ let accepted t fd =
 
 let connected t ~host fd =
   match t with
-  | Plaintext -> Ok { fd; channel = Plain; notice = Atomic.make Unsent }
+  | Plaintext ->
+      Unix.set_nonblock fd;
+      Ok { fd; channel = Plain; notice = Atomic.make Unsent }
   | Mutual context -> (
       match
         Result.bind (Quiver_openssl.Tls.session context fd) (fun session ->
@@ -91,21 +95,24 @@ let rec settled fd attempt =
       ignore (Quiver_core.Blocking.wait Writable fd);
       settled fd attempt
 
+let rec plain fd direction attempt =
+  match attempt () with
+  | count -> Ok count
+  | exception Unix.Unix_error ((EAGAIN | EWOULDBLOCK), _, _) ->
+      ignore (Quiver_core.Blocking.wait direction fd);
+      plain fd direction attempt
+  | exception Unix.Unix_error (EINTR, _, _) -> plain fd direction attempt
+  | exception Unix.Unix_error (error, _, _) -> Error (Unix.error_message error)
+
 let read flow bytes off len =
   match flow.channel with
-  | Plain -> (
-      let rec go () =
-        match Unix.read flow.fd bytes off len with
-        | count -> Ok count
-        | exception Unix.Unix_error (EINTR, _, _) -> go ()
-        | exception Unix.Unix_error (error, _, _) ->
-            Error (Unix.error_message error)
-      in
-      go ())
+  | Plain ->
+      plain flow.fd Readable (fun () ->
+          Core_unix.read_assume_fd_is_nonblocking flow.fd ~pos:off ~len bytes)
   | Secure session -> (
       match
         settled flow.fd (fun () ->
-            Quiver_openssl.Tls.read session bytes ~pos:off ~len)
+            Quiver_openssl.Tls.read_nonblocking session bytes ~pos:off ~len)
       with
       | Settled count -> Ok count
       | Ended -> Ok 0
@@ -117,15 +124,17 @@ let write flow text off len =
     else
       match flow.channel with
       | Plain -> (
-          match Unix.write_substring flow.fd text off len with
-          | count -> go (off + count) (len - count)
-          | exception Unix.Unix_error (EINTR, _, _) -> go off len
-          | exception Unix.Unix_error (error, _, _) ->
-              Error (Unix.error_message error))
+          match
+            plain flow.fd Writable (fun () ->
+                Core_unix.write_assume_fd_is_nonblocking flow.fd ~pos:off ~len
+                  (Bytes.unsafe_of_string text))
+          with
+          | Ok count -> go (off + count) (len - count)
+          | Error _ as error -> error)
       | Secure session -> (
           match
             settled flow.fd (fun () ->
-                Quiver_openssl.Tls.write session text ~pos:off ~len)
+                Quiver_openssl.Tls.write_nonblocking session text ~pos:off ~len)
           with
           | Settled count -> go (off + count) (len - count)
           | Ended -> Error ("TLS: " ^ closed)
@@ -147,6 +156,16 @@ let shutdown flow =
             (settled flow.fd (fun () -> Quiver_openssl.Tls.shutdown session)))
 
 let descriptor flow = flow.fd
+
+let rekey_after flow bytes =
+  match flow.channel with
+  | Plain -> ()
+  | Secure session -> Quiver_openssl.Tls.rekey_after session bytes
+
+let key_updates flow =
+  match flow.channel with
+  | Plain -> 0
+  | Secure session -> Quiver_openssl.Tls.key_updates session
 
 let abort flow =
   match Unix.shutdown flow.fd SHUTDOWN_ALL with

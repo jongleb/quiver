@@ -14,7 +14,7 @@
   quiver.net
   file_path)
  (preprocess
-  (pps ppx_let)))
+  (pps ppx_let ppx_sexp_conv)))
 
 (rule
  (target version.ml)

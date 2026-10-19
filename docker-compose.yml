@@ -35,6 +35,9 @@ services:
       - --enforce-gtid-consistency=ON
     ports:
       - "127.0.0.1:33084:3306"
+    # The socket, for quiver -S on a Linux host (the sockets step).
+    volumes:
+      - ${QUIVER_IT_SOCKETS:-/tmp/quiver-it-sockets}/mysql84:/var/run/mysqld
     healthcheck:
       <<: *mysql-healthcheck
       test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-pquiver"]
@@ -80,6 +83,8 @@ services:
       - --binlog-format=ROW
     ports:
       - "127.0.0.1:33118:3306"
+    volumes:
+      - ${QUIVER_IT_SOCKETS:-/tmp/quiver-it-sockets}/mariadb118:/run/mysqld
     healthcheck:
       <<: *mysql-healthcheck
       test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]

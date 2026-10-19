@@ -491,7 +491,7 @@ let case snapshots =
     oneof_list
       [ Quiver_core.Output_format.Sql; Csv Rfc4180; Csv Mysql_load_data ]
   and* restore = oneof_list [ Client; Loader ]
-  and* zero_dates = oneof_list [ Quiver_mysql.Provider.Reject; Keep ]
+  and* zero_dates = oneof_list Quiver_mysql.Provider.all_of_zero_dates
   and* batch_bytes = oneof_list [ 1; 300; 4096; 262144 ]
   and* generated =
     oneof_weighted
@@ -544,13 +544,17 @@ let case snapshots =
     flags =
       [
         "--zero-dates";
-        (match zero_dates with Reject -> "reject" | Keep -> "keep");
+        Quiver_mysql.Provider.string_of_zero_dates zero_dates;
       ]
       @ (match format with
         | Sql -> [ "--format"; "sql" ]
-        | Csv Rfc4180 -> [ "--format"; "csv"; "--csv-dialect"; "rfc4180" ]
-        | Csv Mysql_load_data ->
-            [ "--format"; "csv"; "--csv-dialect"; "mysql-load-data" ])
+        | Csv dialect ->
+            [
+              "--format";
+              "csv";
+              "--csv-dialect";
+              Quiver_core.Output_format.string_of_dialect dialect;
+            ])
       @ [
           "--batch-bytes";
           string_of_int batch_bytes;
@@ -576,31 +580,29 @@ let () =
   and snapshots = String.split_on_char ',' Sys.argv.(7)
   and count = int_of_string Sys.argv.(8)
   and out = Sys.argv.(9) in
-  let failure = function
-    | `Link error ->
-        (fun value ->
-          Sexplib0.Sexp.to_string_hum (Quiver_mysql.Link.sexp_of_error value))
-          error
-    | `Wire error ->
-        (fun value ->
-          Sexplib0.Sexp.to_string_hum (Quiver_mysql.Wire.sexp_of_error value))
-          error
-    | `Transport error ->
-        (fun value ->
-          Sexplib0.Sexp.to_string_hum
-            (Quiver_mysql.Transport.sexp_of_error value))
-          error
+  let failure error =
+    Sexplib0.Sexp.to_string_hum
+      ([%sexp_of:
+         [ `Link of Quiver_mysql.Link.error
+         | `Wire of Quiver_mysql.Wire.error
+         | `Transport of Quiver_mysql.Transport.error ]]
+         error)
   in
   let link =
     match
       Quiver_mysql.Link.connect ~local_data:Without_local_data
-        ~tls:
-          (match tls with
-          | "verified" -> Verified_tls System_roots
-          | _ -> Plaintext)
-        ~timeout:(Core.Time_ns.Span.of_int_sec 30)
-        ~host:"127.0.0.1" ~port:(int_of_string port) ~user:"root"
-        ~password:(Some "quiver")
+        (Tcp
+           {
+             host = "127.0.0.1";
+             port = int_of_string port;
+             tls =
+               (match tls with
+               | "verified" -> Verified_tls System_roots
+               | _ -> Plaintext);
+           })
+        ~timeouts:
+        { connecting = Core.Time_ns.Span.of_int_sec 30; silence = Core.Time_ns.Span.of_int_sec 30 }
+        ~user:"root" ~password:(Some "quiver")
     with
     | Ok link -> link
     | Error error ->

@@ -27,8 +27,8 @@ let column : type a. Ltype.t -> a Column.repr -> a Column.t =
   | Some Equal -> column
   | None ->
       Alcotest.failf "unexpected repr for %a"
-        (fun ppf value -> Sexplib0.Sexp.pp_hum ppf (Ltype.sexp_of_t value))
-        ltype
+        Sexplib0.Sexp.pp_hum
+        (Ltype.sexp_of_t ltype)
 
 let int ltype values =
   Case { ltype; repr = Int; testable = Alcotest.int; zero = 0; values }
@@ -46,26 +46,20 @@ let rejects name ltype repr value expected =
       | Ok () -> Alcotest.fail "value accepted"
       | Error (`Column error) ->
           Alcotest.check
-            (Alcotest.testable
-               (fun ppf value ->
-                 Sexplib0.Sexp.pp_hum ppf (Column.sexp_of_error value))
-               Column.equal_error)
+            (Support.testable Column.sexp_of_error Column.equal_error)
             "error" expected error);
       Alcotest.(check int) "nothing written" 0 (Column.length column))
 
 let tests =
   let presence =
-    Alcotest.testable
-      (fun ppf value ->
-        Sexplib0.Sexp.pp_hum ppf (Column.sexp_of_presence value))
-      Column.equal_presence
+    Support.testable Column.sexp_of_presence Column.equal_presence
   in
   List.map
     (fun (Case { ltype; repr; testable; zero; values }) ->
       Alcotest.test_case
         (Format.asprintf "%a with nulls"
-           (fun ppf value -> Sexplib0.Sexp.pp_hum ppf (Ltype.sexp_of_t value))
-           ltype)
+           Sexplib0.Sexp.pp_hum
+           (Ltype.sexp_of_t ltype))
         `Quick
         (fun () ->
           let column = column ltype repr in
@@ -172,10 +166,7 @@ let tests =
           | Ok _ -> Alcotest.fail "ragged batch sealed"
           | Error (`Batch error) ->
               Alcotest.check
-                (Alcotest.testable
-                   (fun ppf value ->
-                     Sexplib0.Sexp.pp_hum ppf (Batch.sexp_of_error value))
-                   Batch.equal_error)
+                (Support.testable Batch.sexp_of_error Batch.equal_error)
                 "error"
                 (Batch.Ragged { column = 1; length = 0; rows = 1 })
                 error);
@@ -186,9 +177,8 @@ let tests =
             | Ok () -> ()
             | Error (`Batch error) ->
                 Alcotest.failf "%a"
-                  (fun ppf value ->
-                    Sexplib0.Sexp.pp_hum ppf (Batch.sexp_of_error value))
-                  error
+                  Sexplib0.Sexp.pp_hum
+                  (Batch.sexp_of_error error)
           in
           let writer =
             Batch_writer.create ~limit_bytes:64

@@ -1,10 +1,25 @@
 (** [Plaintext] is for local test servers only. *)
 type tls = Verified_tls of Transport.authority | Plaintext
 
+(** Where the server listens, and how the bytes are protected on the way. *)
+type route =
+  | Tcp of { host : string; port : int; tls : tls }
+  | Socket of File_path.t
+      (** A Unix socket of a server on this machine: no TLS, the kernel carries
+          the bytes, and the server counts it as a secure transport, so a
+          password may go in the clear. *)
+
 (** Whether the server may ask for local data ([LOAD DATA LOCAL INFILE]); a
     request is answered only by {!load_local}, with the data it is given and
     never with a file the server names. *)
 type local_data = Without_local_data | With_local_data
+
+type timeouts = {
+  connecting : Core.Time_ns.Span.t;
+      (** Longest wait while connecting, TLS and authentication included. *)
+  silence : Core.Time_ns.Span.t;
+      (** Longest silence of an authenticated connection. *)
+}
 
 (** A capability the client cannot work without. *)
 type capability =
@@ -22,6 +37,7 @@ type error =
   | Unsupported_auth of string  (** Authentication plugin quiver lacks. *)
   | Untrusted_certificate of string  (** A remote server failed verification. *)
   | Cleartext_refused  (** Clear-text password asked without trusted TLS. *)
+  | Unusable_public_key  (** The server's RSA key does not encrypt the password. *)
   | Refused of { code : int; sqlstate : string; message : string }
       (** An ERR packet from the server. *)
   | Unexpected_packet of int  (** First byte of a packet out of place. *)
@@ -32,10 +48,8 @@ type t
 
 val connect :
   local_data:local_data ->
-  tls:tls ->
-  timeout:Core.Time_ns.Span.t ->
-  host:string ->
-  port:int ->
+  route ->
+  timeouts:timeouts ->
   user:string ->
   password:string option ->
   ( t,

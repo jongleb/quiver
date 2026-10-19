@@ -5,15 +5,13 @@
     [TIMESTAMP] as [Unchecked_date]/[Unchecked_datetime] and writes it as
     stored. *)
 type zero_dates = Reject | Keep
+[@@deriving to_string ~portable, enumerate ~portable]
 
 type conn_config = {
-  tls : Link.tls;
-  host : string;
-  port : int;
+  route : Link.route;
   user : string;
   password : string option;
-  timeout : Core.Time_ns.Span.t;
-      (** Longest silence of a connection before the dump fails. *)
+  timeouts : Link.timeouts;
   zero_dates : zero_dates;
 }
 (** Where and as whom to connect. *)
@@ -22,7 +20,11 @@ type conn_config = {
     only, blocks commits but not writes) give one point in time; [Trx_only]
     takes no lock and gives each session its own snapshot. *)
 type snapshot_mode = Ftwrl | Backup_stage | Trx_only
-[@@deriving sexp_of ~portable, yojson]
+[@@deriving
+  sexp_of ~portable,
+  yojson,
+  to_string ~portable,
+  enumerate ~portable]
 
 type error =
   | Client of Client_error.t

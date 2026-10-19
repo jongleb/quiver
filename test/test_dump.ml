@@ -1,4 +1,5 @@
 open Quiver_core
+open Sexplib0.Sexp_conv
 
 (** Where a scenario makes the dump fail, if anywhere. *)
 type fault =
@@ -8,6 +9,7 @@ type fault =
   | Append of int
   | Close of int
   | Table_ddl of int  (** The provider fails to show this table's DDL. *)
+[@@deriving sexp_of]
 
 type scenario = {
   tables : (int list * int list) list;
@@ -20,6 +22,7 @@ type scenario = {
   batch_bytes : int;
   fault : fault;
 }
+[@@deriving sexp_of]
 
 let ident = Support.ident
 
@@ -202,28 +205,7 @@ let scenario =
     in
     { tables; databases; objects; readers; renderers; batch_bytes; fault })
 
-let print
-    { tables; databases; objects; readers; renderers; batch_bytes; fault } =
-  Printf.sprintf
-    "%s; %d databases with %s objects; %d readers, %d renderers, batches of \
-     %d bytes, %s"
-    (String.concat " | "
-       (List.map
-          (fun (ids, bounds) ->
-            Printf.sprintf "%d ids cut at %s" (List.length ids)
-              (String.concat "," (List.map string_of_int bounds)))
-          tables))
-    databases
-    (String.concat "," (List.map string_of_int objects))
-    readers renderers batch_bytes
-    (match fault with
-    | Clean -> "clean"
-    | Read { chunk; row } ->
-        Printf.sprintf "read fails in chunk %d at row %d" chunk row
-    | Render chunk -> Printf.sprintf "render fails in chunk %d" chunk
-    | Append chunk -> Printf.sprintf "append fails in chunk %d" chunk
-    | Close chunk -> Printf.sprintf "close fails in chunk %d" chunk
-    | Table_ddl table -> Printf.sprintf "DDL of table %d fails" table)
+let print scenario = Sexplib0.Sexp.to_string_hum (sexp_of_scenario scenario)
 
 let dumped =
   QCheck2.Test.make ~count:150

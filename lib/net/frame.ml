@@ -1,4 +1,4 @@
-type kind = Message | Batch
+type kind = Message | Batch | Ack
 type codec = Plain | Zstd
 
 type error =
@@ -23,7 +23,7 @@ type header = {
 
 let header_bytes = 32
 let max_payload = 1 lsl 30
-let version = 3
+let version = 5
 let checked_bytes = 28
 
 let xxh3 bytes ~first ~length =
@@ -45,7 +45,7 @@ let seal (buffer : Quiver_core.Byte_buffer.t) kind codec ~raw ~chunk =
   Bytes.set bs 1 'W';
   Bytes.set_uint8 bs 2 version;
   Bytes.set_uint8 bs 3 0;
-  Bytes.set_uint8 bs 4 (match kind with Message -> 0 | Batch -> 1);
+  Bytes.set_uint8 bs 4 (match kind with Message -> 0 | Batch -> 1 | Ack -> 2);
   Bytes.set_uint8 bs 5 (match codec with Plain -> 0 | Zstd -> 1);
   Bytes.set_uint16_le bs 6 0;
   Bytes.set_int32_le bs 8 (Int32.of_int chunk);
@@ -83,7 +83,7 @@ let header text =
           unsigned 16,
           unsigned 20 )
       with
-      | kind, _, _, _ when kind > 1 -> Error (`Frame (Unknown_kind kind))
+      | kind, _, _, _ when kind > 2 -> Error (`Frame (Unknown_kind kind))
       | _, codec, _, _ when codec > 1 -> Error (`Frame (Unknown_codec codec))
       | _, _, length, _ when length > max_payload ->
           Error (`Frame (Too_large length))
@@ -91,7 +91,7 @@ let header text =
       | kind, codec, length, raw ->
           Ok
             {
-              kind = (match kind with 0 -> Message | _ -> Batch);
+              kind = (match kind with 0 -> Message | 1 -> Batch | _ -> Ack);
               codec = (match codec with 0 -> Plain | _ -> Zstd);
               chunk = unsigned 8;
               seq = unsigned 12;
@@ -103,7 +103,8 @@ let header text =
 let payload header text =
   match
     Int32.equal header.checksum
-      (xxh3 (Bytes.unsafe_of_string text) ~first:0 ~length:(String.length text))
+      (xxh3 (Bytes.unsafe_of_string text) ~first:0
+         ~length:(Int.min header.length (String.length text)))
   with
   | true -> Ok ()
   | false -> Error (`Frame Damaged_payload)

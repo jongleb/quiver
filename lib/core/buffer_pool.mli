@@ -6,7 +6,8 @@
 
 type t : value mod contended portable
 
-val create : unit -> t
+val create : ?capacity:int -> unit -> t
+(** New buffers start with room for [capacity] bytes, 1 MiB unless given. *)
 
 val take : t -> Byte_buffer.t @ unique
 (** An empty buffer, reused when one was given back. *)

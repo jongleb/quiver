@@ -35,10 +35,12 @@ type target =
     loading, so InnoDB builds each index by sorting; [With_table] keeps the
     table definition whole. *)
 type keys = After_data | With_table
+[@@deriving to_string ~portable, enumerate ~portable]
 
 (** Whether the load is written to the server's binlog; [Skip_binlog] needs the
     right to set [sql_log_bin], and replicas then miss the data. *)
-type binlog = Write_binlog | Skip_binlog
+type binlog = Write_binlog [@rename "write"] | Skip_binlog [@rename "skip"]
+[@@deriving to_string ~portable, enumerate ~portable]
 
 val session :
   Quiver_mysql.Provider.conn_config ->

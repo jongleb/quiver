@@ -1,7 +1,9 @@
 (executable
  (name link_check)
  (modules link_check)
- (libraries unix quiver.mysql))
+ (libraries unix quiver.mysql)
+ (preprocess
+  (pps ppx_sexp_conv)))
 
 (rule
  (alias runtest)
@@ -41,4 +43,6 @@
   bytesrw.zstd
   qcheck-core
   qcheck-core.runner
-  quiver.mysql))
+  quiver.mysql)
+ (preprocess
+  (pps ppx_sexp_conv)))

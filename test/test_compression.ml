@@ -35,11 +35,13 @@ let inflated compressed ~slice ~ask =
   in
   go ()
 
-let unzstd compressed =
+let unzstd compressed ~bound =
   let into = Quiver_core.Byte_buffer.create () in
   Result.map
     (fun () -> Quiver_core.Byte_buffer.contents into)
-    (Quiver_sink.Compression.unzstd compressed ~into)
+    (Quiver_sink.Compression.unzstd
+       (Quiver_sink.Compression.inflater ())
+       compressed ~length:(String.length compressed) ~bound ~into)
 
 let texts =
   QCheck2.Gen.(
@@ -74,7 +76,11 @@ let tests =
                 (inflated compressed ~slice ~ask)
                 (Ok text)
            && Result.equal ~ok:String.equal ~error:String.equal
-                (unzstd compressed) (Ok text)));
+                (unzstd compressed ~bound:(String.length text))
+                (Ok text)
+           && Result.is_error
+                (unzstd compressed ~bound:(String.length text - 1))
+              = (String.length text > 0)));
     QCheck_alcotest.to_alcotest
       (QCheck2.Test.make ~count:300
          ~name:"frames cut anywhere but between frames are refused"
@@ -101,7 +107,9 @@ let tests =
            QCheck2.assume (not (List.mem cut boundaries));
            let compressed = String.sub (String.concat "" frames) 0 cut in
            Result.is_error (inflated compressed ~slice ~ask)
-           && Result.is_error (unzstd compressed)));
+           && Result.is_error
+                (unzstd compressed
+                   ~bound:(String.length (String.concat "" texts)))));
     QCheck_alcotest.to_alcotest
       (QCheck2.Test.make ~count:500
          ~name:"xxh3 of a range and of its pieces matches the reference"

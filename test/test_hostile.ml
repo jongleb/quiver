@@ -209,7 +209,7 @@ let hostile_agent =
               (match
                  match
                    Quiver_net.Collector.accept listening
-                     Quiver_net.Protection.plaintext
+                     Quiver_net.Protection.plaintext ~reconnect:Support.reconnect
                  with
                  | Error _ -> ()
                  | Ok session -> ignore (Collecting.run listening session ())
@@ -260,7 +260,7 @@ let hostile_agent =
               write socket
                 (message
                    (Sexplib0.Sexp.to_string
-                      (Quiver_net.Message.sexp_of_attach { session = "s" })));
+                      (Quiver_net.Message.sexp_of_attach (Data { session = "s" }))));
               socket)
         in
         List.iter
@@ -390,8 +390,7 @@ let hostile_collector =
         match
           Quiver_net.Remote.create Quiver_net.Protection.plaintext
             { host = "127.0.0.1"; address }
-            ~streams ~chunks:2
-            (Result.get_ok (Quiver_sink.Compression.Level.of_int 1))
+            (Support.settings ~streams ~chunks:2 ())
         with
         | exception failure -> `Raised (Printexc.to_string failure)
         | Error _ -> `Ended
@@ -481,7 +480,8 @@ let vanishing_hop =
                   List.iter Quiver_net.Channel.close (control :: data))
         and node =
           Support.start (fun () ->
-              match Quiver_net.Collector.accept collecting plaintext with
+              match Quiver_net.Collector.accept collecting plaintext
+                      ~reconnect:Support.reconnect with
               | Error _ -> `Unaccepted
               | Ok session -> (
                   match Quiver_net.Collector.forward (peer next) session with
@@ -493,9 +493,7 @@ let vanishing_hop =
         in
         let agent =
           Result.get_ok
-            (Quiver_net.Remote.create plaintext (peer collecting) ~streams
-               ~chunks:1
-               (Result.get_ok (Quiver_sink.Compression.Level.of_int 1)))
+            (Quiver_net.Remote.create plaintext (peer collecting) (Support.settings ~streams ~chunks:1 ()))
         in
         ignore (Quiver_net.Remote.database agent (ident "db") ~ddl:"");
         let finished =

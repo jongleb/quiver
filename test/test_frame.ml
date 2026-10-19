@@ -9,7 +9,7 @@ let frame ?(chunk = 0) ?(seq = 0) kind codec payload ~raw =
   Quiver_net.Frame.number bytes ~seq;
   Bytes.to_string bytes
 
-let kinds = QCheck2.Gen.oneof_list Quiver_net.Frame.[ Message; Batch ]
+let kinds = QCheck2.Gen.oneof_list Quiver_net.Frame.[ Message; Batch; Ack ]
 let codecs = QCheck2.Gen.oneof_list Quiver_net.Frame.[ Plain; Zstd ]
 
 let read text =

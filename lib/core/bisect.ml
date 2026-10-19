@@ -62,21 +62,17 @@ let boundaries (type (k : value mod contended portable) (e : value mod contended
             weights cuts
         in
         grow
-          (List.concat
-             (List.mapi
-                (fun position range ->
-                  Option.value (Hashtbl.find_opt replaced position)
-                    ~default:[ range ])
-                ranges))
-          (count
-          + List.length (List.filter_map (fun (_, _, cut) -> cut) cuts))
+          (Base.List.concat_mapi ranges ~f:(fun position range ->
+               Option.value (Hashtbl.find_opt replaced position)
+                 ~default:[ range ]))
+          (count + Base.List.count cuts ~f:(fun (_, _, cut) -> Option.is_some cut))
   in
   let%bind total = weigh None None in
   let%map ranges =
     grow [ { lo = None; hi = None; weight = total; state = Cuttable } ] 0
   in
   let estimated =
-    List.fold_left (fun sum range -> sum + range.weight) 0 ranges
+    Base.List.sum (module Base.Int) ranges ~f:(fun range -> range.weight)
   in
   let scaled weight =
     match estimated with
@@ -114,14 +110,11 @@ let boundaries (type (k : value mod contended portable) (e : value mod contended
         in
         let first = Int.min scraps into and second = Int.max scraps into in
         fold
-          (List.concat
-             (List.mapi
-                (fun at group ->
-                  if at = first then
-                    [ (fst all.(second), snd all.(first) +. snd all.(second)) ]
-                  else if at = second then []
-                  else [ group ])
-                groups))
+          (Base.List.concat_mapi groups ~f:(fun at group ->
+               if at = first then
+                 [ (fst all.(second), snd all.(first) +. snd all.(second)) ]
+               else if at = second then []
+               else [ group ]))
   in
   List.filter_map fst (fold groups)
 

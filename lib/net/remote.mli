@@ -21,19 +21,57 @@ type error =
   | Rejected of string  (** Why the collector could not commit a chunk. *)
   | Unexpected_reply of string  (** A reply out of place: which one. *)
   | Codec of string @@ aliased  (** The compressor failed. *)
+  | Manifest of Quiver_core.Manifest.error
+      (** The dump's manifest could not take how its parts travelled. *)
   | Unstarted of Quiver_core.Concurrent.error
       (** No thread for a data connection's sender. *)
 [@@deriving sexp_of ~portable]
 
+(** How batches are encoded on the wire. *)
+type compression =
+  | Fixed of Quiver_sink.Compression.t
+  | Adaptive
+      (** Without compression, zstd at levels -5, 1 or 3, moved a step while
+          the network or rendering holds the dump back, kept only when it goes
+          faster ({!Encoding}); zstd at level 1 first. *)
+[@@deriving sexp_of ~portable]
+
+type settings = {
+  streams : int;  (** Data connections to start with. *)
+  most_streams : int;
+      (** At most so many while the network holds the dump back; as many as
+          [streams] keeps their number. *)
+  chunks : int;  (** Chunks begun and not answered at most. *)
+  compression : compression;
+  pace : int option;
+      (** Bytes a second that all data connections together carry at most. *)
+  traffic : Quiver_core.Tcp.Class.t option;  (** Of every connection's packets. *)
+  reconnect : Core.Time_ns.Span.t;
+      (** How long replacing a broken control connection may take before the
+          session fails. *)
+}
+
 val create :
-  Protection.t ->
-  Channel.peer ->
-  streams:int ->
-  chunks:int ->
-  Quiver_sink.Compression.Level.t ->
-  (t, [> `Sink of error ]) result
+  Protection.t -> Channel.peer -> settings -> (t, [> `Sink of error ]) result
 (** Connects to the collector: a control connection, then [streams] data
-    connections. *)
+    connections. A data connection that breaks gives its unacknowledged frames
+    to the others and is replaced, after a few pauses if need be; the session
+    fails once none is left. A control connection that breaks, or brings
+    nothing for 15 seconds, is replaced within [reconnect]: the collector
+    answers again what did not arrive, and is sent again what it did not
+    hear. While the network holds the dump back, the
+    session opens more data connections, up to [most_streams], and keeps them
+    only when they carry more ({!Streams}). *)
+
+val adjust : t -> Streams.decision -> unit
+(** Opens or closes so many data connections now, as the session does on its
+    own while [most_streams] allows; the last one is never closed. *)
+
+val streams : t -> int
+(** Data connections open now. *)
+
+val path : t -> Quiver_core.Tcp.path option
+(** Of the first control connection, measured once the collector answered. *)
 
 val shutdown : t -> unit
 (** Ends every connection, each with a TLS [close_notify] once its frames are

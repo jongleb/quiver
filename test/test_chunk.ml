@@ -67,8 +67,8 @@ let exact_cover domain =
     ~name:
       (Format.asprintf
          "%a chunks bisected on any estimates cover the domain exactly"
-         (fun ppf value -> Sexplib0.Sexp.pp_hum ppf (Ltype.sexp_of_t value))
-         domain.ltype)
+         Sexplib0.Sexp.pp_hum
+         (Ltype.sexp_of_t domain.ltype))
     gen
     (fun (min, max, (target, limit), probes) ->
       let table =
@@ -108,7 +108,7 @@ let exact_cover domain =
         :: (probes @ bounds @ List.map Int64.pred bounds)
       in
       let covered_once v =
-        List.length (List.filter (fun span -> contains order span v) chunks) = 1
+        Base.List.count chunks ~f:(fun span -> contains order span v) = 1
       in
       let piece = function
         | `Whole -> (min, max)
@@ -196,15 +196,11 @@ let expect_error name expected result =
       | Ok _ -> Alcotest.fail "split succeeded"
       | Error (`Key error) ->
           Alcotest.failf "%a"
-            (fun ppf value ->
-              Sexplib0.Sexp.pp_hum ppf (Key.sexp_of_error value))
-            error
+            Sexplib0.Sexp.pp_hum
+            (Key.sexp_of_error error)
       | Error (`Chunk error) ->
           Alcotest.check
-            (Alcotest.testable
-               (fun ppf value ->
-                 Sexplib0.Sexp.pp_hum ppf (Chunk.sexp_of_error value))
-               Chunk.equal_error)
+            (Support.testable Chunk.sexp_of_error Chunk.equal_error)
             "error" expected error)
 
 let tests =

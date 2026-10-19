@@ -32,6 +32,25 @@ type writing : immutable_data = {
 [@@deriving sexp_of ~portable]
 (** How one part was written. *)
 
+(** How a frame's batch was encoded on the wire. *)
+type encoding = Plain | Zstd of int  (** At this level. *)
+[@@deriving sexp_of ~portable, equal ~portable]
+
+type carrying : immutable_data = {
+  frames : int;
+  wire_bytes : int;  (** As sent, encoded, with frame headers. *)
+  raw_bytes : int;  (** The batches before encoding. *)
+  encodings : (encoding * int) list;  (** Frames per encoding. *)
+  streams : int;  (** Data connections open when it was committed. *)
+  round_trip : Core.Time_ns.Span.t option;
+      (** Of the control connection then, where the kernel tells. *)
+  sending : Core.Time_ns.Span.t;  (** From the part's start to its commit. *)
+}
+[@@deriving sexp_of ~portable]
+(** How one part travelled over quiver's wire protocol. *)
+
+val yojson_of_carrying : carrying -> Yojson.Safe.t
+
 type state =
   | Pending
   | Done of { part : part; reading : reading; writing : writing }
@@ -90,3 +109,10 @@ val localize :
   (Yojson.Safe.t, [> `Manifest of error ]) result
 (** The same manifest as written by another sink: its format, and as the part of
     each table's [n]-th chunk that sink's part number [n]. *)
+
+val annotate :
+  Yojson.Safe.t ->
+  (Schema.Name.t -> int -> carrying option) ->
+  (Yojson.Safe.t, [> `Manifest of error ]) result
+(** The same manifest with how each table's [n]-th chunk travelled, stored with
+    its state as [carrying]. *)

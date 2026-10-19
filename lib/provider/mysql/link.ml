@@ -1,7 +1,16 @@
 open Base.Result.Let_syntax
 
 type tls = Verified_tls of Transport.authority | Plaintext
+
+type route =
+  | Tcp of { host : string; port : int; tls : tls }
+  | Socket of File_path.t
 type local_data = Without_local_data | With_local_data
+
+type timeouts = {
+  connecting : Core.Time_ns.Span.t;
+  silence : Core.Time_ns.Span.t;
+}
 
 type capability =
   | Protocol_41
@@ -18,6 +27,7 @@ type error =
   | Unsupported_auth of string
   | Untrusted_certificate of string
   | Cleartext_refused
+  | Unusable_public_key
   | Refused of { code : int; sqlstate : string; message : string }
   | Unexpected_packet of int
 [@@deriving sexp_of ~portable]
@@ -66,8 +76,13 @@ let refused reader =
   in
   `Link (Refused { code; sqlstate; message = Wire.Cursor.rest reader })
 
-let connect ~local_data ~tls ~timeout ~host ~port ~user ~password =
-  let%bind transport = Transport.connect ~timeout ~host ~port in
+let connect ~local_data route ~timeouts ~user ~password =
+  let%bind transport =
+    Transport.connect ~timeout:timeouts.connecting
+      (match route with
+      | Tcp { host; port; tls = _ } -> Tcp { host; port }
+      | Socket path -> Socket path)
+  in
   let wire = Wire.create (Transport.read transport)
   and cursor = Wire.Cursor.create () in
   let receive decode = receive transport wire cursor decode
@@ -75,21 +90,30 @@ let connect ~local_data ~tls ~timeout ~host ~port ~user ~password =
   and plugin_of_name = function
     | "mysql_native_password" -> Ok `Native
     | "caching_sha2_password" -> Ok `Caching_sha2
+    | "sha256_password" -> Ok `Sha256
     | other -> Error (`Link (Unsupported_auth other))
   and without_nul text = Base.String.rstrip ~drop:(Char.equal '\000') text in
-  let answer plugin scramble =
+  let answer channel plugin scramble =
     let xor a b =
       String.init (String.length a) (fun i ->
-          Char.chr (Char.code a.[i] lxor Char.code b.[i]))
+          Char.chr (Char.code a.[i] lxor Char.code b.[i mod String.length b]))
     in
-    match (plugin, password) with
-    | (`Native | `Caching_sha2), (None | Some "") -> ""
-    | `Native, Some password ->
+    match (plugin, password, channel) with
+    | (`Native | `Caching_sha2), (None | Some ""), _ -> Ok (`Send "")
+    | `Sha256, (None | Some ""), _ -> Ok (`Send "\000")
+    | `Native, Some password, _ ->
         let once = Quiver_openssl.Sha.sha1 password in
-        xor once (Quiver_openssl.Sha.sha1 (String.sub scramble 0 20 ^ Quiver_openssl.Sha.sha1 once))
-    | `Caching_sha2, Some password ->
+        Ok (`Send (xor once (Quiver_openssl.Sha.sha1 (String.sub scramble 0 20 ^ Quiver_openssl.Sha.sha1 once))))
+    | `Caching_sha2, Some password, _ ->
         let once = Quiver_openssl.Sha.sha256 password in
-        xor once (Quiver_openssl.Sha.sha256 (Quiver_openssl.Sha.sha256 once ^ String.sub scramble 0 20))
+        Ok (`Send (xor once (Quiver_openssl.Sha.sha256 (Quiver_openssl.Sha.sha256 once ^ String.sub scramble 0 20))))
+    | `Sha256, Some password, `Secure -> Ok (`Send (password ^ "\000"))
+    | `Sha256, Some password, `Local ->
+        Ok (`Ask_key (xor (password ^ "\000") (String.sub scramble 0 20)))
+    | `Sha256, Some (_ : string), `Plaintext -> Error (`Link Cleartext_refused)
+  and opening = function
+    | `Send auth -> (auth, `Verdict)
+    | `Ask_key masked -> ("\001", `Key masked)
   in
   let handshake () =
     let%bind greeting =
@@ -184,9 +208,10 @@ let connect ~local_data ~tls ~timeout ~host ~port ~user ~password =
       out
     in
     let%bind channel, capabilities =
-      match tls with
-      | Plaintext -> Ok (`Plaintext, capabilities)
-      | Verified_tls authority -> (
+      match route with
+      | Socket (_ : File_path.t) -> Ok (`Local, capabilities)
+      | Tcp { tls = Plaintext; _ } -> Ok (`Plaintext, capabilities)
+      | Tcp { tls = Verified_tls authority; host; _ } -> (
           match greeting.capabilities land ssl with
           | 0 -> Error (`Link (Missing_capability Ssl))
           | _ -> (
@@ -200,8 +225,9 @@ let connect ~local_data ~tls ~timeout ~host ~port ~user ~password =
           )
     in
     let%bind plugin = plugin_of_name greeting.plugin in
-    let response = fixed capabilities
-    and auth = answer plugin greeting.scramble in
+    let%bind reply = answer channel plugin greeting.scramble in
+    let auth, expecting = opening reply
+    and response = fixed capabilities in
     Buffer.add_string response user;
     Buffer.add_char response '\000';
     Buffer.add_uint8 response (String.length auth);
@@ -209,7 +235,7 @@ let connect ~local_data ~tls ~timeout ~host ~port ~user ~password =
     Buffer.add_string response greeting.plugin;
     Buffer.add_char response '\000';
     let%bind () = send (Buffer.contents response) in
-    let rec await () =
+    let rec await expecting =
       let%bind step =
         receive (fun reader ->
             let first = Wire.Cursor.uint8 reader in
@@ -219,28 +245,36 @@ let connect ~local_data ~tls ~timeout ~host ~port ~user ~password =
             | Eof_packet ->
                 let name = Wire.Cursor.null_terminated reader in
                 Ok (`Switch (name, without_nul (Wire.Cursor.rest reader)))
-            | Auth_more_data -> (
-                match Wire.Cursor.uint8 reader with
-                | 0x03 -> Ok `Fast
-                | 0x04 -> Ok `Full
-                | other -> Error (`Link (Unexpected_packet other)))
+            | Auth_more_data -> Ok (`More (first, Wire.Cursor.rest reader))
             | Local_infile | Data -> Error (`Link (Unexpected_packet first)))
       in
-      match step with
-      | `Done -> Ok ()
-      | `Fast -> await ()
-      | `Switch (name, scramble) ->
+      match (step, expecting) with
+      | `Done, _ -> Ok ()
+      | `Switch (name, scramble), _ ->
           let%bind plugin = plugin_of_name name in
-          let%bind () = send (answer plugin scramble) in
-          await ()
-      | `Full -> (
+          let%bind reply = answer channel plugin scramble in
+          let auth, expecting = opening reply in
+          let%bind () = send auth in
+          await expecting
+      | `More ((_ : int), public_key), `Key masked ->
+          let%bind sealed =
+            Option.to_result ~none:(`Link Unusable_public_key)
+              (Quiver_openssl.Rsa.encrypt ~public_key masked)
+          in
+          let%bind () = send sealed in
+          await `Verdict
+      | `More ((_ : int), "\003"), `Verdict -> await `Verdict
+      | `More ((_ : int), "\004"), `Verdict -> (
           match channel with
-          | `Secure ->
+          | `Secure | `Local ->
               let%bind () = send (Option.value ~default:"" password ^ "\000") in
-              await ()
+              await `Verdict
           | `Plaintext -> Error (`Link Cleartext_refused))
+      | `More (first, (_ : string)), `Verdict ->
+          Error (`Link (Unexpected_packet first))
     in
-    let%map () = await () in
+    let%map () = await expecting in
+    Transport.set_timeout transport timeouts.silence;
     { transport; wire; cursor; server }
   in
   match handshake () with

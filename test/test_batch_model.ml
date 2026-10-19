@@ -11,6 +11,7 @@ type cell =
 
 (** The logical type a column of the scenario is created with. *)
 type kind = Flags | Bytes8 | Shorts | Ints | Longs | Singles | Reals | Texts
+[@@deriving enumerate]
 
 (** One step of a batch scenario, run by the real batch and by the model. *)
 type step = Add of int * cell | Commit
@@ -96,7 +97,7 @@ let cell kind =
 let kinds =
   QCheck2.Gen.(
     list_size (int_range 1 5)
-      (oneof_list [ Flags; Bytes8; Shorts; Ints; Longs; Singles; Reals; Texts ]))
+      (oneof_list all_of_kind))
 
 let table =
   QCheck2.Gen.(
@@ -141,7 +142,7 @@ let sealing =
             Error (column, length, rows)
         | Error (`Batch Batch.Malformed) -> Error (-1, -1, -1)
       and model =
-        let rows = List.length (List.filter (( = ) Commit) steps)
+        let rows = Base.List.count steps ~f:(( = ) Commit)
         and values =
           List.mapi
             (fun j _ ->

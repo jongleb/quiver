@@ -21,7 +21,7 @@
   uuidm
   unix)
  (preprocess
-  (pps ppx_sexp_conv ppx_compare ppx_hash ppx_yojson_conv ppx_let))
+  (pps ppx_sexp_conv ppx_compare ppx_hash ppx_yojson_conv ppx_let ppx_enumerate ppx_string_conv ppx_string))
  (flags
   (:standard
    -open
@@ -34,4 +34,7 @@
    Ppx_hash_lib.Std.Hash.Builtin
    -open
    Ppx_yojson_conv_lib.Yojson_conv.Primitives))
+ (foreign_stubs
+  (language c)
+  (names local_stubs))
  (private_modules conn))

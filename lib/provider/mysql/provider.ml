@@ -3,21 +3,23 @@
     [TIMESTAMP] as [Unchecked_date]/[Unchecked_datetime] and writes it as
     stored. *)
 type zero_dates = Reject | Keep
+[@@deriving to_string ~capitalize:"kebab-case" ~portable, enumerate]
 
 type conn_config = {
-  tls : Link.tls;
-  host : string;
-  port : int;
+  route : Link.route;
   user : string;
   password : string option;
-  timeout : Core.Time_ns.Span.t;
-      (** Longest silence of a connection before the dump fails. *)
+  timeouts : Link.timeouts;
   zero_dates : zero_dates;
 }
 
 (** How the group of sessions is opened. *)
 type snapshot_mode = Ftwrl | Backup_stage | Trx_only
-[@@deriving sexp_of ~portable, yojson]
+[@@deriving
+  sexp_of ~portable,
+  yojson,
+  to_string ~capitalize:"kebab-case" ~portable,
+  enumerate]
 
 type error =
   | Client of Client_error.t
@@ -168,9 +170,9 @@ type connections = {
 let connect config ~n =
   let opened () =
     Quiver_core.Guarded.create (fun () ->
-        let { tls; host; port; user; password; timeout; _ } = config in
+        let { route; user; password; timeouts; _ } = config in
         let%bind conn =
-          client_error (Conn.connect ~tls ~timeout ~host ~port ~user ~password)
+          client_error (Conn.connect route ~timeouts ~user ~password)
         in
         match
           client_error

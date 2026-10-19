@@ -88,33 +88,23 @@ let pull inflater progress window ~refill ~corrupt bytes ~pos ~len =
   in
   go ()
 
-let unzstd text ~(into : Quiver_core.Byte_buffer.t @ local) =
-  let window =
-    {
-      input = Bytes.unsafe_of_string text;
-      first = 0;
-      last = String.length text;
-      source = Drained;
-      hint = 1;
-    }
-  in
-  let read =
-    pull (inflater ())
-      { consumed = 0; produced = 0 }
-      window
-      ~refill:(fun () -> Ok ())
-      ~corrupt:Fun.id
-  in
-  let rec go () =
-    Quiver_core.Byte_buffer.ensure_free into 65536;
-    match read into.bs ~pos:into.len ~len:(Bytes.length into.bs - into.len) with
-    | Error message -> Error message
-    | Ok 0 -> Ok ()
-    | Ok length ->
-        into.len <- into.len + length;
-        go ()
-  in
-  match text with "" -> Ok () | _ -> go () [@nontail]
+external decompress :
+  inflater -> Bytes.t -> int -> Bytes.t -> int -> int -> int @@ portable
+  = "quiver_zstd_decompress_byte" "quiver_zstd_decompress"
+[@@noalloc]
+
+let unzstd inflater text ~length ~bound
+    ~(into : Quiver_core.Byte_buffer.t @ local) =
+  Quiver_core.Byte_buffer.ensure_free into bound;
+  match
+    decompress inflater (Bytes.unsafe_of_string text)
+      (Int.min length (String.length text))
+      into.bs into.len bound
+  with
+  | written when written >= 0 ->
+      into.len <- into.len + written;
+      Ok ()
+  | code -> Error (message (-code))
 
 let inflate read ~corrupt =
   let window =

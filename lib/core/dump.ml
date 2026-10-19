@@ -63,10 +63,10 @@ module Make (P : Provider_intf.S) (S : Sink_intf.S) = struct
           P.plan connections schema
             (Plan_opts.shared opts.plan
                ~bytes:
-                 (List.fold_left
-                    (fun total { Schema.Table.estimate = { bytes; _ }; _ } ->
-                      total + bytes)
-                    0 schema.tables)
+                 (Base.List.sum
+                    (module Base.Int)
+                    schema.tables
+                    ~f:(fun { Schema.Table.estimate = { bytes; _ }; _ } -> bytes))
                ~readers:opts.threads)
         in
         (schema, chunks)
@@ -267,9 +267,8 @@ module Make (P : Provider_intf.S) (S : Sink_intf.S) = struct
                         end)
                         ltypes
                     in
-                    match P.read_chunk session chunk writer with
-                    | Ok () -> Ok !tickets
-                    | Error error -> Error error)
+                    let%map () = P.read_chunk session chunk writer in
+                    !tickets)
               with
               | Error error ->
                   Part.abandon part;

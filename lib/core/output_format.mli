@@ -5,6 +5,11 @@ type dialect =
   | Rfc4180  (** Header, CRLF, quotes doubled, bare [\N] for NULL. *)
   | Mysql_load_data
       (** For [LOAD DATA … ENCLOSED BY '"' ESCAPED BY '\\']: no header, LF. *)
-[@@deriving sexp ~portable, equal ~portable, yojson]
+[@@deriving
+  sexp ~portable,
+  equal ~portable,
+  yojson,
+  to_string ~portable,
+  enumerate ~portable]
 
 type t = Sql | Csv of dialect [@@deriving sexp ~portable, equal ~portable, yojson]

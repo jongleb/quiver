@@ -5,12 +5,20 @@
 let () =
   let conn =
     {
-      Quiver_mysql.Provider.tls = Quiver_mysql.Link.Verified_tls System_roots;
-      host = "127.0.0.1";
-      port = 33200;
+      Quiver_mysql.Provider.route =
+        Tcp
+          {
+            host = "127.0.0.1";
+            port = 33200;
+            tls = Quiver_mysql.Link.Verified_tls System_roots;
+          };
       user = "root";
       password = Some "quiver";
-      timeout = Core.Time_ns.Span.of_int_sec 600;
+      timeouts =
+        {
+          connecting = Core.Time_ns.Span.of_int_sec 10;
+          silence = Core.Time_ns.Span.of_int_sec 600;
+        };
       zero_dates = Reject;
     }
   in

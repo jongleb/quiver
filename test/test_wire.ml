@@ -51,9 +51,8 @@ let read_all reader count =
       | Ok payload -> (payload, Quiver_mysql.Wire.Cursor.sequence cursor)
       | Error (`Wire error) ->
           Alcotest.failf "%a"
-            (fun ppf value ->
-              Sexplib0.Sexp.pp_hum ppf (Quiver_mysql.Wire.sexp_of_error value))
-            error)
+            Sexplib0.Sexp.pp_hum
+            (Quiver_mysql.Wire.sexp_of_error error))
 
 let payloads =
   QCheck2.Gen.(
@@ -151,10 +150,8 @@ let tests =
           match Quiver_mysql.Wire.next reader cursor with
           | Error (`Wire error) ->
               Alcotest.failf "%a"
-                (fun ppf value ->
-                  Sexplib0.Sexp.pp_hum ppf
-                    (Quiver_mysql.Wire.sexp_of_error value))
-                error
+                Sexplib0.Sexp.pp_hum
+                (Quiver_mysql.Wire.sexp_of_error error)
           | Ok () -> Quiver_mysql.Wire.Cursor.decode cursor (fun r -> Ok (f r))
         in
         (match
@@ -177,9 +174,8 @@ let tests =
             Alcotest.(check (pair int int)) "tail" (0xfa, 0) (last, remaining)
         | Error (`Wire error) ->
             Alcotest.failf "%a"
-              (fun ppf value ->
-                Sexplib0.Sexp.pp_hum ppf (Quiver_mysql.Wire.sexp_of_error value))
-              error);
+              Sexplib0.Sexp.pp_hum
+              (Quiver_mysql.Wire.sexp_of_error error));
         Alcotest.(check bool)
           "short lenenc" true
           (match decode Quiver_mysql.Wire.Cursor.lenenc_int with

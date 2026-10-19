@@ -1,9 +1,10 @@
 (** Messages of quiver's wire protocol, sent as S-expressions in [Message]
     frames on the control connection; data connections carry only batch frames,
-    after an [attach]. *)
+    after an [attach], and back the last node's acks of them. *)
 
 (** The byte order batches are encoded in, the sender's own. *)
-type byte_order = Little_endian | Big_endian [@@deriving sexp ~portable]
+type byte_order = Little_endian | Big_endian
+[@@deriving sexp ~portable, enumerate ~portable]
 
 val byte_order : byte_order
 (** This machine's. *)
@@ -11,7 +12,10 @@ val byte_order : byte_order
 (** What an agent sends on its control connection. [Hello], [Database], [Table],
     [Objects] and [Finish] are answered in order with [Ready], [Done], [Refused]
     or [Skipped], and may be sent before earlier ones are answered; a chunk's
-    [End] is answered with [Committed] or [Rejected] whenever it is durable. *)
+    [End] is answered with [Committed] or [Rejected] whenever it is durable.
+    Every message after [Hello] but [Heartbeat] and [Leave] is counted, and so
+    is every reply after [Ready] but [Heard] and [Failed]: a control connection
+    that replaces a broken one carries on from those counts. *)
 type control =
   | Hello of {
       session : string;
@@ -34,10 +38,19 @@ type control =
       tables : (Quiver_core.Schema.Name.t * int) list;
       manifest : string;  (** The manifest's JSON text. *)
     }
+  | Heartbeat of { replies : int }
+      (** Every second: so many replies arrived. *)
+  | Leave
+      (** The last message: the session ends, finished or given up. *)
 [@@deriving sexp ~portable]
 
-type attach = { session : string } [@@deriving sexp ~portable]
-(** The first message on a data connection. *)
+(** The first message on a connection after the control one. *)
+type attach =
+  | Data of { session : string }
+  | Control of { session : string; replies : int }
+      (** Replaces the session's control connection, which broke after so many
+          replies arrived. *)
+[@@deriving sexp ~portable]
 
 (** What a collector answers. *)
 type reply =
@@ -50,4 +63,9 @@ type reply =
       *)
   | Committed of { chunk : int; part : Quiver_core.Manifest.part }
   | Rejected of { chunk : int; reason : string }
+  | Heard of { messages : int }
+      (** So many messages arrived: every second, and first on a control
+          connection that replaces a broken one. *)
+  | Failed of string
+      (** The last reply: the session is lost, for the collector's reason. *)
 [@@deriving sexp ~portable]

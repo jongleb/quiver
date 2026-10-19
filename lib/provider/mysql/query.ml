@@ -51,10 +51,10 @@ type t =
 [@@deriving sexp_of ~portable]
 
 let quote (name : Quiver_core.Ident.t) =
-  "`" ^ String.concat "``" (String.split_on_char '`' (name :> string)) ^ "`"
+  [%string {|`%{String.concat "``" (String.split_on_char '`' (name :> string))}`|}]
 
 let qualified { Quiver_core.Schema.Name.database; table } =
-  quote database ^ "." ^ quote table
+  [%string "%{quote database}.%{quote table}"]
 
 let system = "('mysql', 'sys', 'information_schema', 'performance_schema')"
 
@@ -62,19 +62,20 @@ let columns fields =
   String.concat ", "
     (List.map (fun { Quiver_core.Schema.Field.name; _ } -> quote name) fields)
 
-let text value = "_utf8mb4 X'" ^ Hex_encode.to_hex ~case:`Lowercase value ^ "'"
+let bytes value = [%string "X'%{Hex_encode.to_hex ~case:`Lowercase value}'"]
+let text value = [%string "_utf8mb4 %{bytes value}"]
 
 let literal (value : Quiver_core.Key.value) =
   let quoted render =
     let out = Quiver_core.Byte_buffer.create ~cap:32 () in
     render out;
-    "'" ^ Quiver_core.Byte_buffer.contents out ^ "'"
+    [%string "'%{Quiver_core.Byte_buffer.contents out}'"]
   in
   match value with
   | Signed value -> Int64.to_string value
   | Unsigned value -> Printf.sprintf "%Lu" value
   | Text value -> text value
-  | Binary value -> "X'" ^ Hex_encode.to_hex ~case:`Lowercase value ^ "'"
+  | Binary value -> bytes value
   | Exact value -> value
   | Day value -> quoted (fun out -> Quiver_core.Temporal.day out value)
   | Instant value -> quoted (fun out -> Quiver_core.Temporal.moment out value)
@@ -85,23 +86,25 @@ let literal (value : Quiver_core.Key.value) =
 
 let sql = function
   | Tables ->
-      "SELECT TABLE_SCHEMA, TABLE_NAME, IFNULL(TABLE_ROWS, 0), \
-       IFNULL(DATA_LENGTH, 0) FROM information_schema.TABLES WHERE TABLE_TYPE \
-       = 'BASE TABLE' AND TABLE_SCHEMA NOT IN " ^ system
-      ^ " ORDER BY TABLE_SCHEMA, TABLE_NAME"
+      [%string
+        "SELECT TABLE_SCHEMA, TABLE_NAME, IFNULL(TABLE_ROWS, 0), \
+         IFNULL(DATA_LENGTH, 0) FROM information_schema.TABLES WHERE \
+         TABLE_TYPE = 'BASE TABLE' AND TABLE_SCHEMA NOT IN %{system} ORDER BY \
+         TABLE_SCHEMA, TABLE_NAME"]
   | Columns ->
-      "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, \
-       IS_NULLABLE, NUMERIC_PRECISION, NUMERIC_SCALE, DATETIME_PRECISION, \
-       EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA NOT IN "
-      ^ system ^ " ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION"
+      [%string
+        "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, \
+         IS_NULLABLE, NUMERIC_PRECISION, NUMERIC_SCALE, DATETIME_PRECISION, \
+         EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA NOT IN \
+         %{system} ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION"]
   | Unique_indexes ->
-      "SELECT TABLE_SCHEMA, TABLE_NAME, INDEX_NAME, COLUMN_NAME FROM \
-       information_schema.STATISTICS WHERE NON_UNIQUE = 0 AND TABLE_SCHEMA NOT \
-       IN " ^ system
-      ^ " ORDER BY TABLE_SCHEMA, TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX"
+      [%string
+        "SELECT TABLE_SCHEMA, TABLE_NAME, INDEX_NAME, COLUMN_NAME FROM \
+         information_schema.STATISTICS WHERE NON_UNIQUE = 0 AND TABLE_SCHEMA \
+         NOT IN %{system} ORDER BY TABLE_SCHEMA, TABLE_NAME, INDEX_NAME, \
+         SEQ_IN_INDEX"]
   | Key_bounds { table; key } ->
-      Printf.sprintf "SELECT MIN(%s), MAX(%s) FROM %s" (quote key) (quote key)
-        (qualified table)
+      [%string "SELECT MIN(%{quote key}), MAX(%{quote key}) FROM %{qualified table}"]
   | Binlog_status server -> (
       match server with
       | Mysql_8_0 _ -> "SHOW MASTER STATUS"
@@ -113,112 +116,109 @@ let sql = function
       | Mysql_8_0 _ | Mysql_8_4 _ -> "SELECT @@GLOBAL.gtid_executed"
       | Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _ ->
           "SELECT @@GLOBAL.gtid_binlog_pos")
-  | Show_create (Database database) -> "SHOW CREATE DATABASE " ^ quote database
-  | Show_create (Table name) -> "SHOW CREATE TABLE " ^ qualified name
+  | Show_create (Database database) ->
+      [%string "SHOW CREATE DATABASE %{quote database}"]
+  | Show_create (Table name) -> [%string "SHOW CREATE TABLE %{qualified name}"]
   | View_columns database ->
-      "SELECT c.TABLE_NAME, c.COLUMN_NAME FROM information_schema.COLUMNS c \
-       JOIN information_schema.VIEWS v ON v.TABLE_SCHEMA = c.TABLE_SCHEMA AND \
-       v.TABLE_NAME = c.TABLE_NAME WHERE c.TABLE_SCHEMA = "
-      ^ text (database :> string)
-      ^ " ORDER BY c.TABLE_NAME, c.ORDINAL_POSITION"
+      [%string
+        "SELECT c.TABLE_NAME, c.COLUMN_NAME FROM information_schema.COLUMNS c \
+         JOIN information_schema.VIEWS v ON v.TABLE_SCHEMA = c.TABLE_SCHEMA \
+         AND v.TABLE_NAME = c.TABLE_NAME WHERE c.TABLE_SCHEMA = %{text \
+         (database :> string)} ORDER BY c.TABLE_NAME, c.ORDINAL_POSITION"]
   | Triggers database ->
-      "SELECT TRIGGER_NAME, EVENT_OBJECT_TABLE FROM \
-       information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = "
-      ^ text (database :> string)
-      ^ " ORDER BY EVENT_OBJECT_TABLE, ACTION_TIMING, EVENT_MANIPULATION, \
-         ACTION_ORDER"
+      [%string
+        "SELECT TRIGGER_NAME, EVENT_OBJECT_TABLE FROM \
+         information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = %{text (database \
+         :> string)} ORDER BY EVENT_OBJECT_TABLE, ACTION_TIMING, \
+         EVENT_MANIPULATION, ACTION_ORDER"]
   | Routines database ->
-      "SELECT ROUTINE_NAME, ROUTINE_TYPE FROM information_schema.ROUTINES \
-       WHERE ROUTINE_SCHEMA = "
-      ^ text (database :> string)
-      ^ " ORDER BY ROUTINE_TYPE, ROUTINE_NAME"
+      [%string
+        "SELECT ROUTINE_NAME, ROUTINE_TYPE FROM information_schema.ROUTINES \
+         WHERE ROUTINE_SCHEMA = %{text (database :> string)} ORDER BY \
+         ROUTINE_TYPE, ROUTINE_NAME"]
   | Events database ->
-      "SELECT EVENT_NAME FROM information_schema.EVENTS WHERE EVENT_SCHEMA = "
-      ^ text (database :> string)
-      ^ " ORDER BY EVENT_NAME"
+      [%string
+        "SELECT EVENT_NAME FROM information_schema.EVENTS WHERE EVENT_SCHEMA = \
+         %{text (database :> string)} ORDER BY EVENT_NAME"]
   | Show_definition { database; name; kind } ->
-      "SHOW CREATE "
-      ^ (match kind with
-        | View _ -> "VIEW "
-        | Trigger _ -> "TRIGGER "
-        | Procedure -> "PROCEDURE "
-        | Function -> "FUNCTION "
-        | Event -> "EVENT ")
-      ^ quote database ^ "." ^ quote name
-  | Chunk chunk -> (
+      let kind =
+        match kind with
+        | View _ -> "VIEW"
+        | Trigger _ -> "TRIGGER"
+        | Procedure -> "PROCEDURE"
+        | Function -> "FUNCTION"
+        | Event -> "EVENT"
+      in
+      [%string "SHOW CREATE %{kind} %{quote database}.%{quote name}"]
+  | Chunk chunk ->
       let table = Quiver_core.Chunk.table chunk in
       let first, rest = table.fields in
-      "SELECT "
-      ^ columns (first :: rest)
-      ^ " FROM " ^ qualified table.name
-      ^
-      match chunk with
-      | Whole _ -> ""
-      | Range _ ->
-          let rec condition (predicate : Quiver_core.Predicate.t) =
-            match predicate with
-            | Always -> "TRUE"
-            | Compare { field; comparison; value } ->
-                quote field.name
-                ^ (match comparison with
-                  | Less -> " < "
-                  | Equal -> " = "
-                  | Greater -> " > "
-                  | At_least -> " >= ")
-                ^ literal value
-            | All (first, rest) ->
-                "("
-                ^ String.concat " AND " (List.map condition (first :: rest))
-                ^ ")"
-            | Any (first, rest) ->
-                "("
-                ^ String.concat " OR " (List.map condition (first :: rest))
-                ^ ")"
-          in
-          " WHERE " ^ condition (Quiver_core.Predicate.of_chunk chunk))
+      let where =
+        match chunk with
+        | Whole _ -> ""
+        | Range _ ->
+            let rec condition (predicate : Quiver_core.Predicate.t) =
+              match predicate with
+              | Always -> "TRUE"
+              | Compare { field; comparison; value } ->
+                  let comparison =
+                    match comparison with
+                    | Less -> "<"
+                    | Equal -> "="
+                    | Greater -> ">"
+                    | At_least -> ">="
+                  in
+                  [%string "%{quote field.name} %{comparison} %{literal value}"]
+              | All (first, rest) ->
+                  [%string {|(%{String.concat " AND " (List.map condition (first :: rest))})|}]
+              | Any (first, rest) ->
+                  [%string {|(%{String.concat " OR " (List.map condition (first :: rest))})|}]
+            in
+            [%string " WHERE %{condition (Quiver_core.Predicate.of_chunk chunk)}"]
+      in
+      [%string "SELECT %{columns (first :: rest)} FROM %{qualified table.name}%{where}"]
   | Collation { table = { database; table }; column } ->
-      Printf.sprintf
+      [%string
         "SELECT CHARACTER_SET_NAME, COLLATION_NAME FROM \
-         information_schema.COLUMNS WHERE TABLE_SCHEMA = _utf8mb4 X'%s' AND \
-         TABLE_NAME = _utf8mb4 X'%s' AND COLUMN_NAME = _utf8mb4 X'%s'"
-        (Hex_encode.to_hex ~case:`Lowercase (database :> string))
-        (Hex_encode.to_hex ~case:`Lowercase (table :> string))
-        (Hex_encode.to_hex ~case:`Lowercase (column :> string))
+         information_schema.COLUMNS WHERE TABLE_SCHEMA = %{text (database :> \
+         string)} AND TABLE_NAME = %{text (table :> string)} AND COLUMN_NAME = \
+         %{text (column :> string)}"]
   | Load_columns { database; table } ->
-      Printf.sprintf
+      [%string
         "SELECT COLUMN_NAME, DATA_TYPE FROM information_schema.COLUMNS WHERE \
-         TABLE_SCHEMA = _utf8mb4 X'%s' AND TABLE_NAME = _utf8mb4 X'%s' AND \
-         EXTRA NOT LIKE '%%GENERATED%%' ORDER BY ORDINAL_POSITION"
-        (Hex_encode.to_hex ~case:`Lowercase (database :> string))
-        (Hex_encode.to_hex ~case:`Lowercase (table :> string))
+         TABLE_SCHEMA = %{text (database :> string)} AND TABLE_NAME = %{text \
+         (table :> string)} AND EXTRA NOT LIKE '%GENERATED%' ORDER BY \
+         ORDINAL_POSITION"]
   | Loaded_files { dump; target } ->
-      Printf.sprintf
-        "SELECT file FROM quiver_load.progress WHERE dump = X'%s' AND target = \
-         _utf8mb4 X'%s'"
-        (Hex_encode.to_hex ~case:`Lowercase dump)
-        (Hex_encode.to_hex ~case:`Lowercase target)
+      [%string
+        "SELECT file FROM quiver_load.progress WHERE dump = %{bytes dump} AND \
+         target = %{text target}"]
   | Probe { table; key = (first, _) as key; from; collation } ->
-      Printf.sprintf "SELECT %s FROM %s WHERE %s >= %s ORDER BY %s LIMIT 1"
-        (columns (fst key :: snd key))
-        (qualified table) (quote first.name)
-        (Option.fold ~none:(literal from)
-           ~some:(fun { charset; collation } ->
-             Printf.sprintf "CONVERT(%s USING %s) COLLATE %s" (literal from)
-               (quote charset) (quote collation))
-           collation)
-        (columns (fst key :: snd key))
-  | Estimate { table; key; from; below } -> (
-      "EXPLAIN SELECT 1 FROM " ^ qualified table
-      ^
-      match
-        List.filter_map Fun.id
-          [
-            Option.map (fun from -> quote key ^ " >= " ^ literal from) from;
-            Option.map (fun below -> quote key ^ " < " ^ literal below) below;
-          ]
-      with
-      | [] -> ""
-      | conditions -> " WHERE " ^ String.concat " AND " conditions)
+      let from =
+        Option.fold ~none:(literal from)
+          ~some:(fun { charset; collation } ->
+            [%string
+              "CONVERT(%{literal from} USING %{quote charset}) COLLATE %{quote \
+               collation}"])
+          collation
+      in
+      [%string
+        "SELECT %{columns (fst key :: snd key)} FROM %{qualified table} WHERE \
+         %{quote first.name} >= %{from} ORDER BY %{columns (fst key :: snd \
+         key)} LIMIT 1"]
+  | Estimate { table; key; from; below } ->
+      let where =
+        match
+          List.filter_map Fun.id
+            [
+              Option.map (fun from -> [%string "%{quote key} >= %{literal from}"]) from;
+              Option.map (fun below -> [%string "%{quote key} < %{literal below}"]) below;
+            ]
+        with
+        | [] -> ""
+        | conditions -> [%string {| WHERE %{String.concat " AND " conditions}|}]
+      in
+      [%string "EXPLAIN SELECT 1 FROM %{qualified table}%{where}"]
   | Ordered_keys { table; key = first, rest; candidates = candidate, others } ->
       let fields = first :: rest in
       let tuple (bound : Quiver_core.Key.t) =
@@ -228,12 +228,14 @@ let sql = function
         let literals = List.map literal (value :: values) in
         match literals with
         | [ single ] -> single
-        | _ -> "(" ^ String.concat ", " literals ^ ")"
+        | _ -> [%string {|(%{String.concat ", " literals})|}]
       in
-      Printf.sprintf "SELECT %s FROM %s WHERE %s IN (%s) ORDER BY %s"
-        (columns fields) (qualified table)
-        (match fields with
+      let candidates = String.concat ", " (List.map tuple (candidate :: others))
+      and key =
+        match fields with
         | [ { name; _ } ] -> quote name
-        | _ -> "(" ^ columns fields ^ ")")
-        (String.concat ", " (List.map tuple (candidate :: others)))
-        (columns fields)
+        | _ -> [%string "(%{columns fields})"]
+      in
+      [%string
+        "SELECT %{columns fields} FROM %{qualified table} WHERE %{key} IN \
+         (%{candidates}) ORDER BY %{columns fields}"]

@@ -28,7 +28,7 @@ let compression t = t.compression
 let buffers t = t.buffers
 
 let quote (name : Quiver_core.Ident.t) =
-  "`" ^ String.concat "``" (String.split_on_char '`' (name :> string)) ^ "`"
+  [%string {|`%{String.concat "``" (String.split_on_char '`' (name :> string))}`|}]
 
 let file_name (name : Quiver_core.Ident.t) =
   Base.String.concat_map
@@ -43,29 +43,32 @@ type script = { name : string; statements : string list }
 let restore_sql_mode = "'NO_AUTO_VALUE_ON_ZERO,ALLOW_INVALID_DATES'"
 
 let header =
-  "/*!40101 SET NAMES utf8mb4*/;\n\
-   /*!40014 SET FOREIGN_KEY_CHECKS=0*/;\n\
-   /*!40101 SET SQL_MODE=" ^ restore_sql_mode
-  ^ "*/;\n/*!40103 SET TIME_ZONE='+00:00'*/;\n"
+  [%string
+    "/*!40101 SET NAMES utf8mb4*/;\n\
+     /*!40014 SET FOREIGN_KEY_CHECKS=0*/;\n\
+     /*!40101 SET SQL_MODE=%{restore_sql_mode}*/;\n\
+     /*!40103 SET TIME_ZONE='+00:00'*/;\n"]
 
 let schema t name text =
   Output.save
     File_path.Operators.(
-      t.dir /?. ~.(name ^ ".sql" ^ Compression.extension t.compression))
+      t.dir /?. ~.[%string "%{name}.sql%{Compression.extension t.compression}"])
     t.compression text
 
 let database t database ~ddl =
-  schema t (file_name database ^ "-schema-create") (header ^ ddl ^ ";\n")
+  schema t
+    [%string "%{file_name database}-schema-create"]
+    [%string "%{header}%{ddl};\n"]
 
 let table t ({ name = { database; table }; _ } : Quiver_core.Schema.Table.t)
     ~ddl =
   schema t
-    (file_name database ^ "." ^ file_name table ^ "-schema")
-    (header ^ ddl ^ ";\n")
+    [%string "%{file_name database}.%{file_name table}-schema"]
+    [%string "%{header}%{ddl};\n"]
 
 let scripts database definitions =
   let literal text =
-    "'" ^ String.concat "''" (String.split_on_char '\'' text) ^ "'"
+    [%string {|'%{String.concat "''" (String.split_on_char '\'' text)}'|}]
   in
   let wrapped
       ({ context = { charset; collation; sql_mode; time_zone }; text; name; _ } :
@@ -118,18 +121,21 @@ let scripts database definitions =
         | Trigger _ | Procedure | Function | Event -> None)
       definitions
   in
-  let base name = file_name database ^ "." ^ file_name name in
+  let base name = [%string "%{file_name database}.%{file_name name}"] in
   let stubs =
     List.concat_map
       (fun (_, name, (first, rest)) ->
         file
           (base name ^ "-schema")
-          [
-            "CREATE TABLE IF NOT EXISTS " ^ quote name ^ "(\n"
-            ^ String.concat ",\n"
-                (List.map (fun column -> quote column ^ " int") (first :: rest))
-            ^ "\n) ENGINE=MEMORY";
-          ])
+          (let columns =
+             String.concat ",\n"
+               (List.map (fun column -> quote column ^ " int") (first :: rest))
+           in
+           [
+             [%string
+               "CREATE TABLE IF NOT EXISTS %{quote name}(\n%{columns}\n) \
+                ENGINE=MEMORY"];
+           ]))
       views
   in
   let%bind views =

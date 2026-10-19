@@ -213,6 +213,46 @@ linked() {
   printf '%s\n' "$result" | grep -q "wrong password: (Refused (code 1045)" || fail "own client auth: $result"
   echo "$service: own client connects ($tls)"
 }
+# Over the server's Unix socket, mounted on the host (Linux only: Docker on
+# macOS shows the file but does not carry its connections): a dump with the
+# password in the clear after FLUSH PRIVILEGES empties caching_sha2's cache,
+# quiver load back, localhost found through MYSQL_UNIX_PORT, and on MariaDB a
+# user that unix_socket lets in by the uid of the process, without a password.
+sockets() {
+  service=$1 client=$2
+  selected "$1" || return 0
+  [ "$(uname -s)" = Linux ] || { echo "$service: sockets skipped (not Linux)"; return 0; }
+  socket=${QUIVER_IT_SOCKETS:-/tmp/quiver-it-sockets}/$service/mysqld.sock
+  sql() {
+    docker compose -p quiver -f "$compose" exec -T -e MYSQL_PWD=quiver "$service" \
+      "$client" -uroot --default-character-set=utf8mb4 "$@"
+  }
+  sums() { sql -N -e "CHECKSUM TABLE $tables"; }
+  sed "s/cte_max_recursion_depth/${3:-cte_max_recursion_depth}/" "$fixture" | sql
+  before=$(sums)
+  dir="$out/$service-socket"
+  rm -rf "$dir"
+  sql -e "FLUSH PRIVILEGES"
+  "$quiver" dump -S "$socket" -p quiver -B quiver_it -t 4 --chunk-bytes 200000 \
+    --compress zstd -o "$dir" > "$dir.log" 2>&1 || fail "dump over the socket: $(cat "$dir.log")"
+  sql -e "DROP DATABASE quiver_it"
+  "$quiver" load -S "$socket" -p quiver -d "$dir" -t 4 > "$dir.load.log" 2>&1 \
+    || fail "load over the socket: $(cat "$dir.load.log")"
+  [ "$(sums)" = "$before" ] || fail "checksums differ after a dump and load over the socket"
+  MYSQL_UNIX_PORT=$socket "$quiver" dump -h localhost -p quiver -B quiver_it -t 2 -o "$dir-localhost" \
+    > "$dir-localhost.log" 2>&1 || fail "localhost through MYSQL_UNIX_PORT: $(cat "$dir-localhost.log")"
+  if [ "$client" = mariadb ]; then
+    uid=$(id -u)
+    docker compose -p quiver -f "$compose" exec -T "$service" sh -c \
+      "getent passwd $uid > /dev/null || useradd -u $uid quiverit"
+    name=$(docker compose -p quiver -f "$compose" exec -T "$service" getent passwd "$uid" | cut -d: -f1)
+    sql -e "CREATE USER IF NOT EXISTS '$name'@'localhost' IDENTIFIED VIA unix_socket; \
+      GRANT ALL ON *.* TO '$name'@'localhost'"
+    "$quiver" dump -S "$socket" -u "$name" -B quiver_it -t 2 -o "$dir-peer" > "$dir-peer.log" 2>&1 \
+      || fail "unix_socket as $name: $(cat "$dir-peer.log")"
+  fi
+  echo "$service: dump and load over the Unix socket match"
+}
 # Loads sakila (views, triggers, routines, GEOMETRY, FULLTEXT) plus an event,
 # dumps it, restores it with myloader as sakila_q, and requires identical
 # table checksums and object definitions (sql_mode and time zone included;
@@ -470,6 +510,8 @@ for service in mysql80 mysql84; do
     docker compose -p quiver -f "$compose" exec -T -e MYSQL_PWD=quiver "$service" mysql -uroot -e "SET GLOBAL local_infile = 1"
   fi
 done
+sockets mysql84 mysql
+sockets mariadb118 mariadb max_recursive_iterations
 linked mysql80 33080 verified
 linked mysql84 33084 verified
 linked mariadb1011 33101 plain

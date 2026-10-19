@@ -13,6 +13,8 @@
 #include <caml/signals.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/rsa.h>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
@@ -26,13 +28,15 @@
    [quiver_tls_mutual] and only read afterwards, which OpenSSL allows from any
    thread at once.
 
-   A session carries its own mutex. Every call into OpenSSL on a session first
+   A session carries its own mutex. A call that may wait for the socket first
    releases the OCaml runtime, then takes the mutex, and gives both back in the
-   other order, so a thread waiting for the mutex never holds the runtime and
-   threads may share a session. While the runtime is released no stub touches
-   an OCaml block that can move: data goes through a malloc'd buffer, or
-   straight into a bigarray, whose data never moves and which the caller keeps
-   alive as a parameter.
+   other order, so threads may share a session. While the runtime is released
+   no stub touches an OCaml block that can move: data goes through a malloc'd
+   buffer, or straight into a bigarray, whose data never moves and which the
+   caller keeps alive as a parameter. The [_nonblocking] transfers never wait,
+   so they keep the runtime and use OCaml's bytes in place; a thread waiting
+   for the mutex then holds the runtime only while another finishes a call
+   that does not wait either.
 
    OpenSSL's error queue belongs to the calling thread, so [quiver_tls_error]
    reads what the same thread's last failed call left. */
@@ -49,9 +53,20 @@ static struct custom_operations quiver_context_ops = {
     custom_hash_default,     custom_serialize_default, custom_deserialize_default,
     custom_compare_ext_default, custom_fixed_length_default};
 
+/* TLS 1.3 with AES-GCM must change keys long before 2^24.5 full records
+   (RFC 8446, 5.5); OpenSSL does not on its own, so a session changes its
+   sending keys once this many bytes, or [rekey_after] when set, went out. The
+   change is asked for right before a write, which then carries the KeyUpdate
+   message: asked for after the last write, it would wait for a write that
+   never comes, and close_notify would go out under keys the peer lacks. */
+#define QUIVER_REKEY_BYTES (1LL << 36)
+
 struct quiver_session {
   SSL *ssl;
   pthread_mutex_t lock;
+  long long written;    /* Since the last key update. */
+  long long rekey_after;
+  long updates;         /* Key updates sent. */
 };
 
 #define Session_val(v) (*((struct quiver_session **)Data_custom_val(v)))
@@ -194,6 +209,9 @@ value quiver_tls_session(value context, value fd)
     CAMLreturn(quiver_error(0));
   }
   pthread_mutex_init(&session->lock, NULL);
+  session->written = 0;
+  session->rekey_after = QUIVER_REKEY_BYTES;
+  session->updates = 0;
   block = caml_alloc_custom_mem(&quiver_session_ops,
                                 sizeof(struct quiver_session *),
                                 sizeof(struct quiver_session));
@@ -259,25 +277,62 @@ value quiver_tls_step(value v, value step)
 
 #define QUIVER_CHUNK 65536
 
-value quiver_tls_read(value v, value bytes, value pos, value len)
+/* On a non-blocking socket SSL_read and SSL_write never wait, so these two keep
+   the runtime and move bytes straight between OCaml's buffer and OpenSSL: no
+   collection can run, and the block stays where it is. Another thread may hold
+   the session's mutex only for a call that does not wait either. */
+value quiver_tls_read_nonblocking(value v, value bytes, value pos, value len)
 {
-  CAMLparam2(v, bytes);
   struct quiver_session *session = Session_val(v);
-  int length = Long_val(len) < QUIVER_CHUNK ? Long_val(len) : QUIVER_CHUNK;
-  char *buffer = malloc(length > 0 ? length : 1);
+  int length = Long_val(len) < INT32_MAX ? Long_val(len) : INT32_MAX;
   int returned;
   intnat outcome;
-  if (buffer == NULL) caml_raise_out_of_memory();
-  caml_enter_blocking_section();
   pthread_mutex_lock(&session->lock);
   ERR_clear_error();
-  returned = SSL_read(session->ssl, buffer, length);
+  returned = SSL_read(session->ssl, Bytes_val(bytes) + Long_val(pos), length);
   outcome = returned > 0 ? returned : quiver_outcome(session->ssl, returned);
   pthread_mutex_unlock(&session->lock);
-  caml_leave_blocking_section();
-  if (outcome > 0) memcpy(Bytes_val(bytes) + Long_val(pos), buffer, outcome);
-  free(buffer);
-  CAMLreturn(Val_long(outcome));
+  return Val_long(outcome);
+}
+
+value quiver_tls_write_nonblocking(value v, value text, value pos, value len)
+{
+  struct quiver_session *session = Session_val(v);
+  int length = Long_val(len) < QUIVER_CHUNK ? Long_val(len) : QUIVER_CHUNK;
+  int returned;
+  intnat outcome;
+  pthread_mutex_lock(&session->lock);
+  ERR_clear_error();
+  if (session->written >= session->rekey_after
+      && SSL_version(session->ssl) == TLS1_3_VERSION
+      && SSL_key_update(session->ssl, SSL_KEY_UPDATE_NOT_REQUESTED) == 1) {
+    session->written = 0;
+    session->updates++;
+  }
+  returned = SSL_write(session->ssl, String_val(text) + Long_val(pos), length);
+  outcome = returned > 0 ? returned : quiver_outcome(session->ssl, returned);
+  if (returned > 0) session->written += returned;
+  pthread_mutex_unlock(&session->lock);
+  return Val_long(outcome);
+}
+
+value quiver_tls_rekey_after(value v, value bytes)
+{
+  struct quiver_session *session = Session_val(v);
+  pthread_mutex_lock(&session->lock);
+  session->rekey_after = Long_val(bytes);
+  pthread_mutex_unlock(&session->lock);
+  return Val_unit;
+}
+
+value quiver_tls_key_updates(value v)
+{
+  struct quiver_session *session = Session_val(v);
+  long updates;
+  pthread_mutex_lock(&session->lock);
+  updates = session->updates;
+  pthread_mutex_unlock(&session->lock);
+  return Val_long(updates);
 }
 
 value quiver_tls_read_bigstring(value v, value bigstring, value pos, value len)
@@ -393,4 +448,37 @@ value quiver_sha(value algorithm, value text)
   result = caml_alloc_string(length);
   memcpy(Bytes_val(result), digest, length);
   CAMLreturn(result);
+}
+
+/* No OCaml allocation happens while [pem] and [text] are read, so the
+   pointers stay valid. */
+value quiver_rsa_encrypt(value pem, value text)
+{
+  CAMLparam2(pem, text);
+  CAMLlocal1(result);
+  BIO *bio = BIO_new_mem_buf(String_val(pem), caml_string_length(pem));
+  EVP_PKEY *key = bio == NULL ? NULL : PEM_read_bio_PUBKEY(bio, NULL, NULL, NULL);
+  EVP_PKEY_CTX *context = key == NULL ? NULL : EVP_PKEY_CTX_new(key, NULL);
+  const unsigned char *input = (const unsigned char *)String_val(text);
+  size_t input_length = caml_string_length(text);
+  unsigned char *output = NULL;
+  size_t length = 0;
+  int done = context != NULL
+             && EVP_PKEY_encrypt_init(context) > 0
+             && EVP_PKEY_CTX_set_rsa_padding(context, RSA_PKCS1_OAEP_PADDING) > 0
+             && EVP_PKEY_encrypt(context, NULL, &length, input, input_length) > 0
+             && (output = malloc(length)) != NULL
+             && EVP_PKEY_encrypt(context, output, &length, input, input_length) > 0;
+  EVP_PKEY_CTX_free(context);
+  EVP_PKEY_free(key);
+  BIO_free(bio);
+  if (!done) {
+    free(output);
+    ERR_clear_error();
+    CAMLreturn(Val_none);
+  }
+  result = caml_alloc_string(length);
+  memcpy(Bytes_val(result), output, length);
+  free(output);
+  CAMLreturn(caml_alloc_some(result));
 }

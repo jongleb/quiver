@@ -92,6 +92,15 @@ flowchart LR
 - **Readers, streams and commits are tuned apart.** Readers never wait for a commit. On a long
   path, more TCP streams than readers fill the pipe. Control requests are pipelined, so a
   thousand tables don't cost a thousand round trips.
+- **The wire tunes itself.** While the network holds the dump back, the agent opens more
+  streams and keeps them only when they carry more; it compresses harder when bytes are scarce
+  and lighter when the CPU is. On a path of 1 MB/s per flow, a table went from 35.7 s on four
+  streams to 12.6 s. `--max-rate` and `--dscp` keep it polite on a shared link.
+- **A broken connection is not a failed dump.** Every frame is acknowledged; when a data
+  connection breaks, its unacknowledged frames move to the others, duplicates are dropped and
+  the connection is replaced. When the control connection breaks, or goes silent for 15 s,
+  the agent keeps its snapshot and reconnects within `--reconnect` (60 s): both sides send
+  again only what the other did not get, through relays too.
 
 ## Why you can trust it
 
@@ -182,6 +191,9 @@ quiver dump -h db.example -u backup -p secret -t 8 -o ./dump      # whole server
 quiver dump -B shop --compress zstd -o ./shop                      # one database
 quiver dump -T shop.orders --format csv --csv-dialect mysql-load-data -o ./csv
 quiver dump --snapshot backup-stage -o ./dump                      # MariaDB: block commits only
+quiver dump -S /var/run/mysqld/mysqld.sock -o ./dump              # over a Unix socket (skip_networking)
+quiver dump -o ./dump                                              # no -h: the local socket, as mysql (my.cnf [client], MYSQL_UNIX_PORT)
+quiver dump -h 127.0.0.1 -o ./dump                                 # local server over TCP
 
 quiver load -d ./shop -B shop_copy -t 8                            # or: myloader -d ./shop
 ```
@@ -246,10 +258,11 @@ quiver is young and moving fast.
 | Area | State |
 |---|---|
 | Dump, load and copy | ✅ |
-| Agent, collector, relays and chains | ✅ (wire protocol v2) |
-| Mutual TLS 1.3 on the wire protocol | ✅ |
+| Agent, collector, relays and chains | ✅ (wire protocol v5) |
+| Mutual TLS 1.3 on the wire protocol, with key updates | ✅ |
+| Broken data connections resent and replaced | ✅ |
+| Online tuning of streams and compression, rate cap, DSCP | ✅ |
 | Resuming a network transfer from the same snapshot | 🚧 next |
-| Online tuning of streams and compression | 🚧 next |
 | Postgres and other providers | 🗺️ after MySQL is done |
 
 Run `quiver <command> --help` for every option.

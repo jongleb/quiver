@@ -15,6 +15,7 @@ type error : value mod contended portable =
   | Out_of_place of string  (** A message the protocol does not allow there. *)
   | Downstream of string  (** The next hop's own description of its failure. *)
   | Manifest of Quiver_core.Manifest.error  (** The agent's manifest. *)
+  | Abandoned  (** The agent left before it finished. *)
 [@@deriving sexp_of ~portable]
 
 type session
@@ -23,8 +24,11 @@ type session
 val accept :
   Channel.listener ->
   Protection.t ->
+  reconnect:Core.Time_ns.Span.t ->
   (session, [> `Collector of error ]) result
-(** Its data connections and the next hop are protected alike. *)
+(** Its data connections and the next hop are protected alike. A control
+    connection that breaks may be replaced by the agent within [reconnect]: the
+    session goes on, its replies that did not arrive sent again. *)
 
 val chunks : session -> int
 (** At most so many chunks are open at once: a sink with sessions per part needs
@@ -37,6 +41,8 @@ val forward :
   Channel.peer ->
   session ->
   (downstream, [> `Collector of error ]) result
+(** Greets the next hop and opens as many data connections to it; when that
+    fails, the agent is refused and the session ends. *)
 
 val relay :
   Channel.listener ->
@@ -44,7 +50,12 @@ val relay :
   downstream ->
   (unit, [> `Collector of error ]) result
 (** Accepts the data connections and copies every byte both ways between the
-    agent and the next hop, without reading frames, until both are done. *)
+    agent and the next hop, without reading frames, until both are done; a
+    data connection that breaks is the agent's to send again, and to replace:
+    replacements are accepted and paired with new ones to the next hop until
+    the session ends, when the listener stops. So is a control connection;
+    the relay fails when none replaced a broken one within the session's
+    [reconnect]. *)
 
 module Make (S : Quiver_core.Sink_intf.S) : sig
   val run :
@@ -56,5 +67,7 @@ module Make (S : Quiver_core.Sink_intf.S) : sig
   (** Answers the hello, accepts the data connections and writes everything sent
       until the agent finishes, passing it on to [forward] too; the first
       failure of the sink, the protocol or the next hop, or [Ok] once the sink
-      finished. *)
+      finished and the agent left. Data and control connections that replace
+      broken ones are accepted until then, when the listener stops; the next
+      hop's control connection is not replaced. *)
 end

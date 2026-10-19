@@ -91,8 +91,8 @@ let connect session = outcome (step session Connect) ~done_:ignore
 let accept session = outcome (step session Accept) ~done_:ignore
 let shutdown session = outcome (step session Shutdown) ~done_:ignore
 
-external read_code : session -> Bytes.t -> int -> int -> int @@ portable
-  = "quiver_tls_read"
+external read_nonblocking_code : session -> Bytes.t -> int -> int -> int @@ portable
+  = "quiver_tls_read_nonblocking"
 
 external read_bigstring_code :
   session -> Base_bigstring.t -> int -> int -> int @@ portable
@@ -101,10 +101,13 @@ external read_bigstring_code :
 external write_code : session -> string -> int -> int -> int @@ portable
   = "quiver_tls_write"
 
-let read session bytes ~pos ~len =
+external write_nonblocking_code : session -> string -> int -> int -> int @@ portable
+  = "quiver_tls_write_nonblocking"
+
+let read_nonblocking session bytes ~pos ~len =
   Base.Ordered_collection_common.check_pos_len_exn ~pos ~len
     ~total_length:(Bytes.length bytes);
-  outcome (read_code session bytes pos len) ~done_:Fun.id
+  outcome (read_nonblocking_code session bytes pos len) ~done_:Fun.id
 
 let read_bigstring session bigstring ~pos ~len =
   Base.Ordered_collection_common.check_pos_len_exn ~pos ~len
@@ -115,6 +118,18 @@ let write session text ~pos ~len =
   Base.Ordered_collection_common.check_pos_len_exn ~pos ~len
     ~total_length:(String.length text);
   outcome (write_code session text pos len) ~done_:Fun.id
+
+let write_nonblocking session text ~pos ~len =
+  Base.Ordered_collection_common.check_pos_len_exn ~pos ~len
+    ~total_length:(String.length text);
+  outcome (write_nonblocking_code session text pos len) ~done_:Fun.id
+
+external rekey_after : session -> int -> unit @@ portable
+  = "quiver_tls_rekey_after"
+[@@noalloc]
+
+external key_updates : session -> int @@ portable = "quiver_tls_key_updates"
+[@@noalloc]
 
 external verify_result : session -> int @@ portable = "quiver_tls_verify_result"
 external verify_message : int -> string @@ portable = "quiver_tls_verify_message"

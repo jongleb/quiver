@@ -1,4 +1,4 @@
-type byte_order = Little_endian | Big_endian [@@deriving sexp ~portable]
+type byte_order = Little_endian | Big_endian [@@deriving sexp ~portable, enumerate]
 
 let byte_order =
   match Sys.big_endian with true -> Big_endian | false -> Little_endian
@@ -24,9 +24,14 @@ type control =
       tables : (Quiver_core.Schema.Name.t * int) list;
       manifest : string;
     }
+  | Heartbeat of { replies : int }
+  | Leave
 [@@deriving sexp ~portable]
 
-type attach = { session : string } [@@deriving sexp ~portable]
+type attach =
+  | Data of { session : string }
+  | Control of { session : string; replies : int }
+[@@deriving sexp ~portable]
 
 type reply =
   | Ready of Quiver_core.Output_format.t
@@ -35,4 +40,6 @@ type reply =
   | Skipped
   | Committed of { chunk : int; part : Quiver_core.Manifest.part }
   | Rejected of { chunk : int; reason : string }
+  | Heard of { messages : int }
+  | Failed of string
 [@@deriving sexp ~portable]

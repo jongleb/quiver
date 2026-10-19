@@ -18,7 +18,9 @@ type error =
 
 type target = Same_names | Into of Quiver_core.Ident.t
 type keys = After_data | With_table
-type binlog = Write_binlog | Skip_binlog
+[@@deriving to_string ~capitalize:"kebab-case" ~portable, enumerate]
+type binlog = Write_binlog [@rename "write"] | Skip_binlog [@rename "skip"]
+[@@deriving to_string ~capitalize:"kebab-case" ~portable, enumerate]
 type summary = { files : int; rows : int; bytes : int; skipped : int }
 
 (** Whether an earlier load of the same dump into the same target left committed
@@ -69,9 +71,8 @@ let session (config : Quiver_mysql.Provider.conn_config) binlog =
     Quiver_mysql.Link.execute link (Quiver_mysql.Statement.sql statement)
   in
   let%bind link =
-    Quiver_mysql.Link.connect ~local_data:With_local_data ~tls:config.tls
-      ~timeout:config.timeout ~host:config.host ~port:config.port
-      ~user:config.user ~password:config.password
+    Quiver_mysql.Link.connect ~local_data:With_local_data config.route
+      ~timeouts:config.timeouts ~user:config.user ~password:config.password
   in
   let%bind () = execute link Prepare_load in
   let%map () =
@@ -291,10 +292,10 @@ let run config ~dir target ~keys ~binlog ~threads =
     | result -> result
   in
   let size parts =
-    List.fold_left
-      (fun total (part : Quiver_core.Manifest.part) ->
-        total + part.stored_bytes)
-      0 parts
+    Base.List.sum
+      (module Base.Int)
+      parts
+      ~f:(fun (part : Quiver_core.Manifest.part) -> part.stored_bytes)
   in
   let add_keys link { later; mark; _ } =
     match (later, done_ mark) with
@@ -383,8 +384,8 @@ let run config ~dir target ~keys ~binlog ~threads =
     let%bind () =
       retried 5 (fun () ->
           let%bind () = execute link Begin in
-          match
-            match
+          let loaded =
+            match%bind
               match delivery with
               | As_statements ->
                   statements Quiver_mysql.Link.execute link file Fun.id
@@ -393,16 +394,13 @@ let run config ~dir target ~keys ~binlog ~threads =
                       rejected file statement
                         (Quiver_mysql.Link.load_local link statement data))
             with
-            | Ok found when Quiver_core.Checksum.equal found checksum ->
+            | found when Quiver_core.Checksum.equal found checksum ->
                 let%bind () = record link (File_path.Part.to_string file) in
                 execute link Commit
-            | Ok _ -> Error (`Load (Corrupt file))
-            | Error error -> Error error
-          with
-          | Ok () -> Ok ()
-          | Error error ->
-              ignore (execute link Rollback);
-              Error error)
+            | _ -> Error (`Load (Corrupt file))
+          in
+          Result.iter_error (fun _ -> ignore (execute link Rollback)) loaded;
+          loaded)
     in
     match Portable.Atomic.fetch_and_add keys.remaining (-1) with
     | 1 -> add_keys link keys

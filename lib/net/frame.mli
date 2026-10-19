@@ -5,7 +5,12 @@
     of the payload on the wire, and those of xxh3-64 of the 28 bytes before. *)
 
 (** What the payload is. *)
-type kind = Message  (** A JSON message. *) | Batch  (** An encoded batch. *)
+type kind =
+  | Message  (** A message. *)
+  | Batch  (** An encoded batch. *)
+  | Ack
+      (** No payload: the receiver's count of batch frames received on this
+          connection, in [chunk]. *)
 
 (** How the payload is encoded on the wire. *)
 type codec = Plain | Zstd
@@ -23,7 +28,7 @@ type error =
 type header = private {
   kind : kind;
   codec : codec;
-  chunk : int;  (** Zero for a message. *)
+  chunk : int;  (** Zero for a message, the count for an ack. *)
   seq : int;  (** Of a batch within its chunk, from zero. *)
   length : int;  (** Of the payload on the wire. *)
   raw : int;  (** Of the payload decoded. *)
@@ -47,4 +52,5 @@ val header : string -> (header, [> `Frame of error ]) result
 (** Of the first {!header_bytes} bytes of a frame. *) @@ portable
 
 val payload : header -> string -> (unit, [> `Frame of error ]) result
-(** Checks the payload read after the header. *) @@ portable
+(** Checks the payload read after the header: the text's first [length]
+    bytes. *) @@ portable

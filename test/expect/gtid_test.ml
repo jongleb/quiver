@@ -10,10 +10,7 @@ let%expect_test "gtid sets" =
         (match Quiver_mysql.Gtid.of_server_string server raw with
         | Ok gtid -> Quiver_mysql.Gtid.to_string gtid
         | Error (`Gtid error) ->
-            (fun value ->
-              Sexplib0.Sexp.to_string_hum
-                (Quiver_mysql.Gtid.sexp_of_error value))
-              error))
+            Sexplib0.Sexp.to_string_hum (Quiver_mysql.Gtid.sexp_of_error error)))
     [
       (mysql_8_4, "");
       (mysql_8_4, "  ");

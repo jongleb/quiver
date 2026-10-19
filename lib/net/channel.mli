@@ -14,7 +14,9 @@ type peer = { host : string; address : Unix.sockaddr }
 
 (** A frame received. *)
 type incoming =
-  | Message of string  (** JSON text. *)
+  | Message of string  (** S-expression text. *)
+  | Acknowledged of int
+      (** Batch frames this connection carried that the far end has. *)
   | Batch of {
       codec : Frame.codec;
       chunk : int;
@@ -22,6 +24,8 @@ type incoming =
       raw : int;
       header : string;  (** As received, to pass the frame on unchanged. *)
       payload : string;
+          (** Its first [length] bytes, valid until the channel's next read. *)
+      length : int;
     }
 
 type t : value mod contended portable
@@ -49,15 +53,17 @@ val all :
 (** Opens so many connections at once, each on a thread of its own, so their
     handshakes overlap; after a failure the others are closed. *)
 
-val write : t -> string -> (unit, [> `Channel of error ]) result @@ portable
-(** A whole frame. *)
-
-val write_bytes : t -> Bytes.t -> (unit, [> `Channel of error ]) result @@ portable
-(** A whole frame. *)
+val write :
+  t -> string -> length:int -> (unit, [> `Channel of error ]) result @@ portable
+(** A whole frame, the first [length] bytes. *)
 
 val send : t -> Sexplib0.Sexp.t -> (unit, [> `Channel of error ]) result
   @@ portable
 (** A message in a frame of its own. *)
+
+val acknowledge :
+  t -> received:int -> (unit, [> `Channel of error ]) result @@ portable
+(** Tells the sender so many batch frames of this connection arrived. *)
 
 val read :
   t -> (incoming, [> `Channel of error | `Frame of Frame.error ]) result @@ portable
@@ -70,11 +76,18 @@ val receive :
 (** The next frame, which must be a message decoding as given. *)
 
 val forward :
-  t -> header:string -> payload:string -> (unit, [> `Channel of error ]) result @@ portable
-(** A frame received elsewhere, unchanged. *)
+  t ->
+  header:string ->
+  payload:string ->
+  length:int ->
+  (unit, [> `Channel of error ]) result
+  @@ portable
+(** A frame received elsewhere, unchanged: the payload's first [length]
+    bytes. *)
 
 val splice : t -> t -> (unit, [> `Channel of error ]) result @@ portable
-(** Copies what each side sends to the other until both have finished. *)
+(** Copies what each side sends to the other until both have finished; a
+    failure either way ends both connections. *)
 
 val finish : t -> unit @@ portable
 (** Tells the peer nothing more will be sent. *)
@@ -83,6 +96,8 @@ type handle : immutable_data
 (** A way to end a connection from a thread that does not own it. *)
 
 val handle : t -> handle @@ portable
+val path : t -> Quiver_core.Tcp.path option @@ portable
+val mark : t -> Quiver_core.Tcp.Class.t -> unit @@ portable
 val sever : handle -> unit @@ portable
 (** Ends both directions, waking the owner if it is blocked reading. *)
 

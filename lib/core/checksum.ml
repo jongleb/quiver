@@ -1,6 +1,5 @@
-type t = Xxh3_64 of int64
+type t = Xxh3_64 of int64 [@@deriving equal ~portable]
 
-let equal (Xxh3_64 a) (Xxh3_64 b) = Int64.equal a b
 let hex (Xxh3_64 digest) = Printf.sprintf "%016Lx" digest
 
 let sexp_of_t checksum =

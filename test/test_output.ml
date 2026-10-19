@@ -25,9 +25,7 @@ let stored =
        stored bytes"
     ~print:(fun (frames, compression) ->
       Printf.sprintf "%s: %s"
-        ((fun value ->
-           Sexplib0.Sexp.to_string_hum (Quiver_sink.Compression.sexp_of_t value))
-           compression)
+        (Sexplib0.Sexp.to_string_hum (Quiver_sink.Compression.sexp_of_t compression))
         (String.concat ","
            (List.map (fun f -> string_of_int (String.length f)) frames)))
     QCheck2.Gen.(pair frames compression)

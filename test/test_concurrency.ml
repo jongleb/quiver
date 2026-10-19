@@ -1,15 +1,12 @@
-(** One step of a single-threaded mailbox scenario. *)
-type step = Add of int | Take | Close
+open Sexplib0.Sexp_conv
 
-let print_step = function
-  | Add value -> Printf.sprintf "add %d" value
-  | Take -> "take"
-  | Close -> "close"
+(** One step of a single-threaded mailbox scenario. *)
+type step = Add of int | Take | Close [@@deriving sexp_of]
 
 let mailbox_model =
   QCheck2.Test.make ~count:2000
     ~name:"a mailbox behaves as a queue that close stops filling"
-    ~print:(fun steps -> String.concat "; " (List.map print_step steps))
+    ~print:(fun steps -> Sexplib0.Sexp.to_string_hum ([%sexp_of: step list] steps))
     QCheck2.Gen.(
       list_size (int_range 0 60)
         (oneof_weighted

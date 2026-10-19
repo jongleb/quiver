@@ -48,6 +48,13 @@ val shutdown : flow -> unit
 
 val descriptor : flow -> Unix.file_descr @@ portable
 
+val rekey_after : flow -> int -> unit @@ portable
+(** Under TLS, the first write after so many more bytes went out changes this
+    side's sending keys; 64 GiB unless set. *)
+
+val key_updates : flow -> int @@ portable
+(** Key updates this side sent; 0 in plaintext. *)
+
 val abort : flow -> unit
 (** Ends both directions at once, waking a reader blocked on the socket. *) @@ portable
 

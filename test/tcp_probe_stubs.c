@@ -46,3 +46,9 @@ value quiver_tcp_probe(value fd)
   Store_field(settings, 6, Val_int(unacknowledged));
   CAMLreturn(settings);
 }
+
+/* The IP_TOS of the socket, or -1. */
+value quiver_tcp_probe_tos(value fd)
+{
+  return Val_int(quiver_get(Int_val(fd), IPPROTO_IP, IP_TOS));
+}

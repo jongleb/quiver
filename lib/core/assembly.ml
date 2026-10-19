@@ -132,6 +132,9 @@ module Make (S : Sink_intf.S) = struct
         state.rendering <- Core.Time_ns.Span.( + ) state.rendering took;
         match (state.stage, result) with
         | (Broken _ | Ended), _ -> ()
+        | (Open | Sealed _), (Ok _ | Error _)
+          when number < state.next || Hashtbl.mem state.pending number ->
+            ()
         | (Open | Sealed _), Error error -> break state error
         | (Open | Sealed _), Ok rendered when number = state.next ->
             append rendered;

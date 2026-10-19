@@ -24,6 +24,29 @@ type 'r consumer = {
 (** What runs with a sink of any kind. *)
 
 let () =
+  let told message =
+    Format.eprintf "quiver: %s@." message;
+    1
+  and failed sexp =
+    Format.eprintf "quiver: %a@." Sexplib0.Sexp.pp_hum sexp;
+    1
+  and ident =
+    Cmdliner.Arg.conv
+      ( (fun name ->
+          Result.map_error
+            (fun (`Ident error) ->
+              `Msg (Sexplib0.Sexp.to_string_hum (Quiver_core.Ident.sexp_of_error error)))
+            (Quiver_core.Ident.of_string name)),
+        fun ppf name -> Format.pp_print_string ppf (name :> string) )
+  in
+  let choices to_string all =
+    Cmdliner.Arg.enum (List.map (fun value -> (to_string value, value)) all)
+  in
+  let target into =
+    Option.fold ~none:Quiver_load.Load.Same_names
+      ~some:(fun name -> Quiver_load.Load.Into name)
+      into
+  in
   let file_path text =
     match File_path.of_string text with
     | path -> Ok path
@@ -48,31 +71,26 @@ let () =
     | Ok (manifest : Quiver_core.Manifest.t) ->
         report
           ~rows:
-            (List.fold_left
-               (fun total ({ state; _ } : Quiver_core.Manifest.entry) ->
+            (Base.List.sum
+               (module Base.Int)
+               manifest.chunks
+               ~f:(fun ({ state; _ } : Quiver_core.Manifest.entry) ->
                  match state with
-                 | Done { part = { rows; _ }; _ } -> total + rows
-                 | Pending -> total)
-               0 manifest.chunks)
+                 | Done { part = { rows; _ }; _ } -> rows
+                 | Pending -> 0))
           ~chunks:(List.length manifest.chunks);
         Result.iter
           (function
             | Quiver_mysql.Provider.Locked { lock; lock_held; _ } ->
-                Format.printf "%a held for %a@."
-                  (fun ppf value ->
-                    Sexplib0.Sexp.pp_hum ppf
-                      (Quiver_mysql.Provider.sexp_of_lock value))
-                  lock Core.Time_ns.Span.pp lock_held
+                Format.printf "%a held for %a@." Sexplib0.Sexp.pp_hum
+                  (Quiver_mysql.Provider.sexp_of_lock lock)
+                  Core.Time_ns.Span.pp lock_held
             | Unlocked ->
                 Format.printf "no lock: each session has its own snapshot@.")
           (Quiver_core.Codec.decode Quiver_mysql.Provider.position_of_yojson
              manifest.position);
         0
-    | Error error ->
-        Format.eprintf "quiver: %a@."
-          (fun ppf value -> Sexplib0.Sexp.pp_hum ppf (Dump.sexp_of_error value))
-          error;
-        1
+    | Error error -> failed (Dump.sexp_of_error error)
   in
   let files output { consume } =
     let setup =
@@ -87,20 +105,11 @@ let () =
     in
     match setup with
     | Error error ->
-        Format.eprintf "quiver: %a@."
-          (fun ppf -> function
-            | `Compression error ->
-                (fun ppf value ->
-                  Sexplib0.Sexp.pp_hum ppf
-                    (Quiver_sink.Compression.sexp_of_error value))
-                  ppf error
-            | `Output error ->
-                (fun ppf value ->
-                  Sexplib0.Sexp.pp_hum ppf
-                    (Quiver_sink.Output.sexp_of_error value))
-                  ppf error)
-          error;
-        1
+        failed
+          ([%sexp_of:
+             [ `Compression of Quiver_sink.Compression.error
+             | `Output of Quiver_sink.Output.error ]]
+             error)
     | Ok layout -> (
         match output.format with
         | Sql ->
@@ -146,62 +155,109 @@ let () =
     Format.printf "listening on %s@." text;
     listener
   in
-  let agent reading protection collector level streams chunks =
+  let agent reading protection collector level streams most_streams chunks
+      rate traffic reconnect =
     (
         (
             let started = Quiver_core.Stopwatch.start () in
             match
               let%bind peer = resolve collector in
-              let%bind level = Quiver_sink.Compression.Level.of_int level in
-              Quiver_net.Remote.create protection peer
-                ~streams:(Option.value streams ~default:reading.opts.threads)
-                ~chunks:
-                  (Option.value chunks ~default:(2 * reading.opts.threads))
-                level
+              let%bind compression =
+                match level with
+                | `Auto -> Ok Quiver_net.Remote.Adaptive
+                | `Level level ->
+                    Result.map
+                      (fun level ->
+                        Quiver_net.Remote.Fixed (Quiver_sink.Compression.Zstd level))
+                      (Quiver_sink.Compression.Level.of_int level)
+              in
+              let streams =
+                Option.value streams ~default:reading.opts.threads
+              in
+              let%map sink =
+                Quiver_net.Remote.create protection peer
+                  {
+                    streams;
+                    most_streams;
+                    chunks =
+                      Option.value chunks ~default:(2 * reading.opts.threads);
+                    compression;
+                    pace =
+                      Option.map
+                        (fun megabytes -> Float.to_int (megabytes *. 1e6))
+                        rate;
+                    traffic;
+                    reconnect = Core.Time_ns.Span.of_sec reconnect;
+                  }
+              in
+              (sink, streams)
             with
-            | Error error ->
-                Format.eprintf "quiver: %a@."
-                  (fun ppf -> function
-                    | `Msg message -> Format.pp_print_string ppf message
-                    | `Compression error ->
-                        (fun ppf value ->
-                          Sexplib0.Sexp.pp_hum ppf
-                            (Quiver_sink.Compression.sexp_of_error value))
-                          ppf error
-                    | `Sink error ->
-                        (fun ppf value ->
-                          Sexplib0.Sexp.pp_hum ppf
-                            (Quiver_net.Remote.sexp_of_error value))
-                          ppf error)
-                  error;
-                1
-            | Ok sink ->
+            | Error (`Msg message) -> told message
+            | Error ((`Compression _ | `Sink _) as error) ->
+                failed
+                  ([%sexp_of:
+                     [ `Compression of Quiver_sink.Compression.error
+                     | `Sink of Quiver_net.Remote.error ]]
+                     error)
+            | Ok (sink, streams) ->
+                Option.iter
+                  (fun (path : Quiver_core.Tcp.path) ->
+                    Format.printf "path to %s: round trip %a, send buffer up to %d KiB%s@."
+                      collector Core.Time_ns.Span.pp path.rtt
+                      (path.send_buffer / 1024)
+                      (Option.fold ~none:""
+                         ~some:(fun ceiling ->
+                           Printf.sprintf
+                             ": one connection carries at most %.0f MB/s, %d \
+                              streams %.0f MB/s"
+                             (ceiling /. 1e6) streams
+                             (Float.of_int streams *. ceiling /. 1e6))
+                         (Quiver_core.Tcp.ceiling path)))
+                  (Quiver_net.Remote.path sink);
                 let code =
                   read
                     (module Quiver_net.Remote)
                     sink reading
                     ~report:(fun ~rows ~chunks ->
-                      Format.printf "sent %d rows in %d chunks to %s in %a@."
+                      Format.printf
+                        "sent %d rows in %d chunks to %s in %a, %d streams at \
+                         the end@."
                         rows chunks collector Core.Time_ns.Span.pp
-                        (Quiver_core.Stopwatch.elapsed started))
+                        (Quiver_core.Stopwatch.elapsed started)
+                        (Quiver_net.Remote.streams sink))
                 in
                 Quiver_net.Remote.shutdown sink;
                 code))
   in
-  let collect protection listen forward output target into keys binlog =
-    (
+  let warned (config : Quiver_mysql.Provider.conn_config) =
+    (match config.route with
+    | Tcp _ -> ()
+    | Socket _ -> (
+        match Quiver_mysql.Local.send_space () with
+        | Some space when space < 65536 ->
+            Format.eprintf
+              "quiver: this system lets a Unix socket hold %d bytes, so the \
+               server sends at a fraction of TCP's speed; run sudo sysctl \
+               net.local.stream.sendspace=262144 before starting it@."
+              space
+        | Some _ | None -> ()));
+    config
+  in
+  let collect protection reconnect listen forward output to_server into keys
+      binlog =
+    match
+      match output with
+      | Some output -> Ok (`Files output)
+      | None -> Result.map (fun config -> `Server (warned config)) to_server
+    with
+    | Error (`Msg message) -> told message
+    | Ok destination ->
         (
             match
               let%bind listening = listening listen in
-              let%bind into =
-                Option.fold ~none:(Ok Quiver_load.Load.Same_names)
-                  ~some:(fun name ->
-                    let%map name = Quiver_core.Ident.of_string name in
-                    Quiver_load.Load.Into name)
-                  into
-              in
               let%bind session =
                 Quiver_net.Collector.accept listening protection
+                  ~reconnect:(Core.Time_ns.Span.of_sec reconnect)
               in
               let%map downstream =
                 match forward with
@@ -213,25 +269,11 @@ let () =
                     in
                     Some downstream
               in
-              (listening, session, into, downstream)
+              (listening, session, downstream)
             with
-            | Error error ->
-                Format.eprintf "quiver: %a@."
-                  (fun ppf -> function
-                    | `Msg message -> Format.pp_print_string ppf message
-                    | `Ident error ->
-                        (fun ppf value ->
-                          Sexplib0.Sexp.pp_hum ppf
-                            (Quiver_core.Ident.sexp_of_error value))
-                          ppf error
-                    | `Collector error ->
-                        (fun ppf value ->
-                          Sexplib0.Sexp.pp_hum ppf
-                            (Quiver_net.Collector.sexp_of_error value))
-                          ppf error)
-                  error;
-                1
-            | Ok (listening, session, into, downstream) -> (
+            | Error (`Msg message) -> told message
+            | Error (`Collector error) -> failed (Quiver_net.Collector.sexp_of_error error)
+            | Ok (listening, session, downstream) -> (
                 let started = Quiver_core.Stopwatch.start () in
                 let collected (type (s : value mod contended portable))
                     (module S : Quiver_core.Sink_intf.S with type t = s)
@@ -245,69 +287,32 @@ let () =
                         (Quiver_core.Stopwatch.elapsed started);
                       0
                   | Error (`Collector error) ->
-                      Format.eprintf "quiver: %a@."
-                        (fun ppf value ->
-                          Sexplib0.Sexp.pp_hum ppf
-                            (Quiver_net.Collector.sexp_of_error value))
-                        error;
-                      1
-                  | Error (`Sink error) ->
-                      Format.eprintf "quiver: %a@."
-                        (fun ppf value ->
-                          Sexplib0.Sexp.pp_hum ppf (S.sexp_of_error value))
-                        error;
-                      1
+                      failed (Quiver_net.Collector.sexp_of_error error)
+                  | Error (`Sink error) -> failed (S.sexp_of_error error)
                 in
-                match output with
-                | Some output -> files output { consume = collected }
-                | None -> (
+                match destination with
+                | `Files output -> files output { consume = collected }
+                | `Server to_server -> (
                     match
-                      Quiver_load.Copy.create target into ~keys ~binlog
+                      Quiver_load.Copy.create to_server (target into) ~keys ~binlog
                         ~sessions:(Quiver_net.Collector.chunks session)
                     with
-                    | Error (`Sink error) ->
-                        Format.eprintf "quiver: %a@."
-                          (fun ppf value ->
-                            Sexplib0.Sexp.pp_hum ppf
-                              (Quiver_load.Copy.sexp_of_error value))
-                          error;
-                        1
+                    | Error (`Sink error) -> failed (Quiver_load.Copy.sexp_of_error error)
                     | Ok sink ->
                         let code = collected (module Quiver_load.Copy) sink in
                         Quiver_load.Copy.shutdown sink;
-                        code))))
+                        code)))
   in
-  let copy reading target into keys binlog target_threads =
+  let copy reading to_server into keys binlog target_threads =
     (
         (
             let started = Quiver_core.Stopwatch.start () in
             match
-              let%bind into =
-                Option.fold ~none:(Ok Quiver_load.Load.Same_names)
-                  ~some:(fun name ->
-                    let%map name = Quiver_core.Ident.of_string name in
-                    Quiver_load.Load.Into name)
-                  into
-              in
-              Quiver_load.Copy.create target into ~keys ~binlog
+              Quiver_load.Copy.create to_server (target into) ~keys ~binlog
                 ~sessions:
                   (Option.value target_threads ~default:reading.opts.threads)
             with
-            | Error error ->
-                Format.eprintf "quiver: %a@."
-                  (fun ppf -> function
-                    | `Ident error ->
-                        (fun ppf value ->
-                          Sexplib0.Sexp.pp_hum ppf
-                            (Quiver_core.Ident.sexp_of_error value))
-                          ppf error
-                    | `Sink error ->
-                        (fun ppf value ->
-                          Sexplib0.Sexp.pp_hum ppf
-                            (Quiver_load.Copy.sexp_of_error value))
-                          ppf error)
-                  error;
-                1
+            | Error (`Sink error) -> failed (Quiver_load.Copy.sexp_of_error error)
             | Ok sink ->
                 let code =
                   read
@@ -323,41 +328,10 @@ let () =
   in
   let load conn dir into keys binlog threads =
     (
-        let pp out = function
-          | `Load error ->
-              (fun ppf value ->
-                Sexplib0.Sexp.pp_hum ppf (Quiver_load.Load.sexp_of_error value))
-                out error
-          | `Manifest error ->
-              (fun ppf value ->
-                Sexplib0.Sexp.pp_hum ppf
-                  (Quiver_core.Manifest.sexp_of_error value))
-                out error
-          | `Statements error ->
-              (fun ppf value ->
-                Sexplib0.Sexp.pp_hum ppf
-                  (Quiver_load.Statements.sexp_of_error value))
-                out error
-          | `Ident error ->
-              (fun ppf value ->
-                Sexplib0.Sexp.pp_hum ppf (Quiver_core.Ident.sexp_of_error value))
-                out error
-          | #Quiver_load.Load.cause as cause ->
-              (fun ppf value ->
-                Sexplib0.Sexp.pp_hum ppf (Quiver_load.Load.sexp_of_cause value))
-                out cause
-        in
         let started = Quiver_core.Stopwatch.start () in
         match
-          let%bind target =
-            Option.fold ~none:(Ok Quiver_load.Load.Same_names)
-              ~some:(fun name ->
-                let%map name = Quiver_core.Ident.of_string name in
-                Quiver_load.Load.Into name)
-              into
-          in
           Quiver_load.Load.run
-            conn ~dir:(File_path.of_string dir) target ~keys ~binlog ~threads
+            conn ~dir:(File_path.of_string dir) (target into) ~keys ~binlog ~threads
         with
         | Ok { files; rows; bytes; skipped } ->
             Format.printf "loaded %d rows (%d bytes) from %d files in %a@." rows
@@ -370,8 +344,14 @@ let () =
                   "resumed: %d files were loaded by an earlier run@." n);
             0
         | Error error ->
-            Format.eprintf "quiver: %a@." pp error;
-            1)
+            failed
+              ([%sexp_of:
+                 [ `Load of Quiver_load.Load.error
+                 | `Manifest of Quiver_core.Manifest.error
+                 | `Statements of Quiver_load.Statements.error
+                 | `Ident of Quiver_core.Ident.error
+                 | Quiver_load.Load.cause ]]
+                 error))
   in
   let conn side =
     let open Cmdliner in
@@ -385,15 +365,15 @@ let () =
         Arg.(
           value
           & opt
-              (enum [ ("verified", `Verified); ("disabled", `Disabled) ])
-              `Verified
+              (some (enum [ ("verified", `Verified); ("disabled", `Disabled) ]))
+              None
           & info (names [] "tls") ~docv:"MODE"
               ~doc:
                 "$(b,verified) encrypts the connection and verifies the \
                  server: by the system's CAs (on 127.0.0.1 only the \
                  certificate's validity period), by $(b,--tls-ca) or by \
-                 $(b,--tls-fingerprint); $(b,disabled) is for local test \
-                 servers.")
+                 $(b,--tls-fingerprint) (the default); $(b,disabled) is for \
+                 local test servers.")
       and ca =
         Arg.(
           value
@@ -415,48 +395,71 @@ let () =
                  and host name are not checked.")
       in
       Term.(
-        term_result
-          (const (fun mode ca fingerprint ->
-               match (mode, ca, fingerprint) with
-               | `Verified, None, None ->
-                   Ok
-                     (Quiver_mysql.Link.Verified_tls
-                        Quiver_mysql.Transport.System_roots)
-               | `Verified, Some ca, None ->
-                   Result.map
-                     (fun ca ->
-                       Quiver_mysql.Link.Verified_tls
-                         (Quiver_mysql.Transport.Ca_file ca))
-                     (file_path ca)
-               | `Verified, None, Some fingerprint -> (
-                   match Quiver_mysql.Fingerprint.of_string fingerprint with
-                   | Ok fingerprint ->
+        const (fun mode ca fingerprint ->
+            match (mode, ca, fingerprint) with
+            | None, None, None -> `Unset
+            | (Some _ | None), (Some _ | None), (Some _ | None) ->
+                `Set
+                  (match
+                     (Option.value mode ~default:`Verified, ca, fingerprint)
+                   with
+                   | `Verified, None, None ->
                        Ok
                          (Quiver_mysql.Link.Verified_tls
-                            (Quiver_mysql.Transport.Pinned fingerprint))
-                   | Error (`Fingerprint error) ->
+                            Quiver_mysql.Transport.System_roots)
+                   | `Verified, Some ca, None ->
+                       Result.map
+                         (fun ca ->
+                           Quiver_mysql.Link.Verified_tls
+                             (Quiver_mysql.Transport.Ca_file ca))
+                         (file_path ca)
+                   | `Verified, None, Some fingerprint -> (
+                       match Quiver_mysql.Fingerprint.of_string fingerprint with
+                       | Ok fingerprint ->
+                           Ok
+                             (Quiver_mysql.Link.Verified_tls
+                                (Quiver_mysql.Transport.Pinned fingerprint))
+                       | Error (`Fingerprint error) ->
+                           Error
+                             (`Msg
+                                (Sexplib0.Sexp.to_string_hum
+                                   (Quiver_mysql.Fingerprint.sexp_of_error error))))
+                   | `Verified, Some _, Some _ ->
+                       Error
+                         (`Msg "--tls-ca and --tls-fingerprint exclude each other")
+                   | `Disabled, None, None -> Ok Quiver_mysql.Link.Plaintext
+                   | `Disabled, (Some _ | None), (Some _ | None) ->
                        Error
                          (`Msg
-                            ((fun value ->
-                               Sexplib0.Sexp.to_string_hum
-                                 (Quiver_mysql.Fingerprint.sexp_of_error value))
-                               error)))
-               | `Verified, Some _, Some _ ->
-                   Error
-                     (`Msg "--tls-ca and --tls-fingerprint exclude each other")
-               | `Disabled, None, None -> Ok Quiver_mysql.Link.Plaintext
-               | `Disabled, (Some _ | None), (Some _ | None) ->
-                   Error
-                     (`Msg
-                        "--tls disabled takes neither --tls-ca nor \
-                         --tls-fingerprint"))
-          $ mode $ ca $ fingerprint))
+                            "--tls disabled takes neither --tls-ca nor \
+                             --tls-fingerprint")))
+          $ mode $ ca $ fingerprint)
     and host =
       Arg.(
-        value & opt string "127.0.0.1"
-        & info (names [ "h" ] "host") ~docv:"HOST")
+        value
+        & opt (some string) None
+        & info (names [ "h" ] "host") ~docv:"HOST"
+            ~doc:
+              "The server's host. As for the mysql client, without it or with \
+               $(b,localhost) quiver connects to this machine's Unix socket: \
+               $(b,socket) in the [client] groups of my.cnf, \
+               $(b,MYSQL_UNIX_PORT), or where packages put it. With \
+               $(b,--port) or $(b,--tls) but no host it is 127.0.0.1 over TCP.")
     and port =
-      Arg.(value & opt int 3306 & info (names [ "P" ] "port") ~docv:"PORT")
+      Arg.(
+        value
+        & opt (some int) None
+        & info (names [ "P" ] "port") ~docv:"PORT"
+            ~doc:"The server's TCP port; 3306 unless given.")
+    and socket =
+      Arg.(
+        value
+        & opt (some string) None
+        & info (names [ "S" ] "socket") ~docv:"PATH"
+            ~doc:
+              "Connect over this Unix socket instead of TCP, as to a server \
+               started with $(b,skip_networking); there is no TLS on it, and \
+               it takes no $(b,--host), $(b,--port) or $(b,--tls) options.")
     and user =
       Arg.(value & opt string "root" & info (names [ "u" ] "user") ~docv:"USER")
     and password =
@@ -469,14 +472,27 @@ let () =
                  (match side with
                  | `Source -> "MYSQL_PWD"
                  | `Target -> "QUIVER_TO_PWD")))
-    and timeout =
-      Arg.(
-        value & opt int 600
-        & info (names [] "net-timeout") ~docv:"SECONDS"
-            ~doc:
-              "Fail when a connection sends and receives nothing for so long. \
-               A global read lock can wait for long queries, so keep it above \
-               the longest one.")
+    and timeouts =
+      Term.(
+        const (fun connecting silence ->
+            {
+              Quiver_mysql.Link.connecting =
+                Core.Time_ns.Span.of_int_sec (Int.max 1 connecting);
+              silence = Core.Time_ns.Span.of_int_sec (Int.max 1 silence);
+            })
+        $ Arg.(
+            value & opt int 10
+            & info (names [] "connect-timeout") ~docv:"SECONDS"
+                ~doc:
+                  "Fail when connecting, TLS or authentication waits for the \
+                   server so long.")
+        $ Arg.(
+            value & opt int 600
+            & info (names [] "net-timeout") ~docv:"SECONDS"
+                ~doc:
+                  "Fail when a connection sends and receives nothing for so \
+                   long. A global read lock can wait for long queries, so \
+                   keep it above the longest one."))
     and zero_dates =
       match side with
       | `Target -> Term.const Quiver_mysql.Provider.Reject
@@ -484,8 +500,8 @@ let () =
           Arg.(
             value
             & opt
-                (enum
-                   [ ("reject", Quiver_mysql.Provider.Reject); ("keep", Keep) ])
+                (choices Quiver_mysql.Provider.string_of_zero_dates
+                   Quiver_mysql.Provider.all_of_zero_dates)
                 Quiver_mysql.Provider.Reject
             & info [ "zero-dates" ] ~docv:"MODE"
                 ~doc:
@@ -494,18 +510,62 @@ let () =
                    $(b,keep) writes every date as stored, and restoring it \
                    needs a server that accepts it.")
     in
+    let route =
+      Term.(
+        const (fun socket host port tls ->
+            match (socket, host, port, tls) with
+            | Some path, None, None, `Unset ->
+                Result.map
+                  (fun path -> Quiver_mysql.Link.Socket path)
+                  (file_path path)
+            | Some _, _, _, _ ->
+                Error
+                  (`Msg "--socket takes no --host, --port or --tls options")
+            | None, (None | Some "localhost"), None, `Unset ->
+                Result.map_error
+                  (fun (`Local error) ->
+                    `Msg
+                      ("without --host, or with localhost, quiver connects to \
+                        this machine's Unix socket, as the mysql client does, \
+                        and none was found: "
+                      ^ Sexplib0.Sexp.to_string
+                          (Quiver_mysql.Local.sexp_of_error error)
+                      ^ "; give --socket, or --host 127.0.0.1 for TCP"))
+                  (Result.map
+                     (fun path -> Quiver_mysql.Link.Socket path)
+                     (Quiver_mysql.Local.socket Quiver_mysql.Local.system))
+            | None, Some "localhost", _, _ ->
+                Error
+                  (`Msg
+                     "localhost is this machine's Unix socket, which takes no \
+                      --port or --tls options; give 127.0.0.1 for TCP")
+            | None, host, port, tls ->
+                Result.map
+                  (fun tls ->
+                    Quiver_mysql.Link.Tcp
+                      {
+                        host = Option.value host ~default:"127.0.0.1";
+                        port = Option.value port ~default:3306;
+                        tls;
+                      })
+                  (match tls with
+                  | `Unset ->
+                      Ok
+                        (Quiver_mysql.Link.Verified_tls
+                           Quiver_mysql.Transport.System_roots)
+                  | `Set tls -> tls))
+        $ socket $ host $ port $ tls)
+    in
     Term.(
-      const (fun tls host port user password seconds zero_dates ->
-          {
-            Quiver_mysql.Provider.tls;
-            host;
-            port;
-            user;
-            password;
-            timeout = Core.Time_ns.Span.of_int_sec (Int.max 1 seconds);
-            zero_dates;
-          })
-      $ tls $ host $ port $ user $ password $ timeout $ zero_dates)
+      const (fun route user password timeouts zero_dates ->
+          Result.map
+            (fun route ->
+              { Quiver_mysql.Provider.route; user; password; timeouts; zero_dates })
+            route)
+      $ route $ user $ password $ timeouts $ zero_dates)
+  in
+  let server side =
+    Cmdliner.Term.(term_result (const (Result.map warned) $ conn side))
   in
   let reading =
     let open Cmdliner in
@@ -513,12 +573,8 @@ let () =
       Arg.(
         value
         & opt
-            (enum
-               [
-                 ("ftwrl", Quiver_mysql.Provider.Ftwrl);
-                 ("backup-stage", Backup_stage);
-                 ("trx-only", Trx_only);
-               ])
+            (choices Quiver_mysql.Provider.string_of_snapshot_mode
+               Quiver_mysql.Provider.all_of_snapshot_mode)
             Quiver_mysql.Provider.Ftwrl
         & info [ "snapshot" ] ~docv:"MODE"
             ~doc:
@@ -526,16 +582,7 @@ let () =
                snapshot; $(b,trx-only) takes no lock and is only best effort.")
     in
     let filter =
-      let ident name =
-        Result.map_error
-          (fun (`Ident error) ->
-            `Msg
-              ((fun value ->
-                 Sexplib0.Sexp.to_string_hum
-                   (Quiver_core.Ident.sexp_of_error value))
-                 error))
-          (Quiver_core.Ident.of_string name)
-      in
+      let name = Cmdliner.Arg.conv_parser ident in
       Term.(
         const (fun databases tables ->
             match databases @ tables with
@@ -545,13 +592,13 @@ let () =
             value
             & opt_all
                 (conv
-                   ( (fun name ->
+                   ( (fun text ->
                        Result.map
                          (fun database -> Quiver_core.Filter.Database database)
-                         (ident name)),
-                     fun ppf value ->
+                         (name text)),
+                     fun ppf rule ->
                        Sexplib0.Sexp.pp_hum ppf
-                         (Quiver_core.Filter.sexp_of_rule value) ))
+                         (Quiver_core.Filter.sexp_of_rule rule) ))
                 []
             & info [ "B"; "database" ] ~docv:"DB"
                 ~doc:"Dump only $(docv); repeatable.")
@@ -559,16 +606,16 @@ let () =
             value
             & opt_all
                 (conv
-                   ( (fun name ->
-                       match Base.String.lsplit2 name ~on:'.' with
+                   ( (fun text ->
+                       match Base.String.lsplit2 text ~on:'.' with
                        | None -> Error (`Msg "expected DB.TABLE")
                        | Some (database, table) ->
-                           let%map database = ident database
-                           and table = ident table in
+                           let%map database = name database
+                           and table = name table in
                            Quiver_core.Filter.Table { database; table }),
-                     fun ppf value ->
+                     fun ppf rule ->
                        Sexplib0.Sexp.pp_hum ppf
-                         (Quiver_core.Filter.sexp_of_rule value) ))
+                         (Quiver_core.Filter.sexp_of_rule rule) ))
                 []
             & info [ "T"; "table" ] ~docv:"DB.TABLE"
                 ~doc:"Dump only $(docv); repeatable."))
@@ -604,11 +651,7 @@ let () =
              conn mode filter threads render_threads chunk_bytes batch_bytes ->
              Result.map_error
                (fun error ->
-                 `Msg
-                   ((fun value ->
-                      Sexplib0.Sexp.to_string_hum
-                        (Quiver_core.Error.sexp_of_t value))
-                      error))
+                 `Msg (Sexplib0.Sexp.to_string_hum (Quiver_core.Error.sexp_of_t error)))
                (let%bind plan = Quiver_core.Plan_opts.make ~chunk_bytes in
                 let%map opts =
                   Quiver_core.Dump_opts.make ~plan ~threads
@@ -621,7 +664,7 @@ let () =
                     ~batch_bytes
                 in
                 { conn; mode; filter; opts }))
-        $ conn `Source $ mode $ filter $ threads $ render_threads $ chunk_bytes
+        $ server `Source $ mode $ filter $ threads $ render_threads $ chunk_bytes
         $ batch_bytes))
   in
   let output =
@@ -635,11 +678,8 @@ let () =
       Arg.(
         value
         & opt
-            (enum
-               [
-                 ("rfc4180", Quiver_core.Output_format.Rfc4180);
-                 ("mysql-load-data", Mysql_load_data);
-               ])
+            (choices Quiver_core.Output_format.string_of_dialect
+               Quiver_core.Output_format.all_of_dialect)
             Quiver_core.Output_format.Rfc4180
         & info [ "csv-dialect" ] ~docv:"DIALECT")
     and compress =
@@ -688,11 +728,7 @@ let () =
     Arg.(
       value
       & opt
-          (enum
-             [
-               ("after-data", Quiver_load.Load.After_data);
-               ("with-table", With_table);
-             ])
+          (choices Quiver_load.Load.string_of_keys Quiver_load.Load.all_of_keys)
           Quiver_load.Load.With_table
       & info [ "secondary-keys" ] ~docv:"WHEN"
           ~doc:
@@ -706,8 +742,7 @@ let () =
     Arg.(
       value
       & opt
-          (enum
-             [ ("write", Quiver_load.Load.Write_binlog); ("skip", Skip_binlog) ])
+          (choices Quiver_load.Load.string_of_binlog Quiver_load.Load.all_of_binlog)
           Quiver_load.Load.Write_binlog
       & info [ "binlog" ] ~docv:"MODE"
           ~doc:
@@ -725,7 +760,7 @@ let () =
     and into =
       Arg.(
         value
-        & opt (some string) None
+        & opt (some ident) None
         & info [ "B"; "database" ] ~docv:"DB"
             ~doc:"Load the dump's only database under this name.")
     and threads =
@@ -736,14 +771,14 @@ let () =
     in
     Cmd.v
       (Cmd.info "load" ~doc:"Load a quiver dump into MySQL or MariaDB")
-      Term.(const load $ conn `Source $ dir $ into $ keys $ binlog $ threads)
+      Term.(const load $ server `Source $ dir $ into $ keys $ binlog $ threads)
   in
   let copy_cmd =
     let open Cmdliner in
     let into =
       Arg.(
         value
-        & opt (some string) None
+        & opt (some ident) None
         & info [ "to-database" ] ~docv:"DB"
             ~doc:"Copy the only database read under this name.")
     in
@@ -753,7 +788,7 @@ let () =
            "Copy MySQL or MariaDB into another server, with no files: each \
             reading session's chunks stream into a loading session of its own")
       Term.(
-        const copy $ reading $ conn `Target $ into $ keys $ binlog
+        const copy $ reading $ server `Target $ into $ keys $ binlog
         $ Arg.(
             value
             & opt (some int) None
@@ -776,10 +811,8 @@ let () =
                  Result.map_error
                    (fun (`Protection error) ->
                      `Msg
-                       ((fun value ->
-                          Sexplib0.Sexp.to_string_hum
-                            (Quiver_net.Protection.sexp_of_error value))
-                          error))
+                       (Sexplib0.Sexp.to_string_hum
+                          (Quiver_net.Protection.sexp_of_error error)))
                    (Quiver_net.Protection.mutual
                       ~certificate:(File_path.of_string certificate)
                       ~key:(File_path.of_string key)
@@ -817,6 +850,15 @@ let () =
               "PEM certificates a peer's must chain to: the CA of your nodes, \
                or the peers' own self-signed certificates."))
   in
+  let reconnect =
+    Cmdliner.Arg.(
+      value & opt float 60.
+      & info [ "reconnect" ] ~docv:"SECONDS"
+          ~doc:
+            "How long a broken control connection may take to be replaced \
+             before the session fails; the agent keeps its snapshot and \
+             sends again what did not arrive.")
+  in
   let agent_cmd =
     let open Cmdliner in
     let collector =
@@ -827,9 +869,24 @@ let () =
             ~doc:"The collector that receives the dump ($(b,quiver collect)).")
     and level =
       Arg.(
-        value & opt int 3
+        value
+        & opt
+            (conv
+               ( (function
+                 | "auto" -> Ok `Auto
+                 | text -> (
+                     match int_of_string_opt text with
+                     | Some level -> Ok (`Level level)
+                     | None -> Error (`Msg ("not a level: " ^ text)))),
+                 fun ppf -> function
+                   | `Auto -> Format.pp_print_string ppf "auto"
+                   | `Level level -> Format.pp_print_int ppf level ))
+            `Auto
         & info [ "zstd-level" ] ~docv:"LEVEL"
-            ~doc:"Compression of batches on the wire.")
+            ~doc:
+              "Compression of batches on the wire: a zstd level, or $(b,auto) \
+               to move between none and zstd -5, 1 and 3 by what holds the \
+               dump back.")
     in
     Cmd.v
       (Cmd.info "agent"
@@ -848,6 +905,13 @@ let () =
                    connection carries batches of any chunk, so more of them \
                    than readers fill a long or lossy path.")
         $ Arg.(
+            value & opt int 64
+            & info [ "most-streams" ] ~docv:"N"
+                ~doc:
+                  "While the network holds the dump back, open more data \
+                   connections, up to so many, keeping those that carry \
+                   more; as many as $(b,--streams) keeps their number.")
+        $ Arg.(
             value
             & opt (some int) None
             & info [ "chunks-in-flight" ] ~docv:"N"
@@ -855,7 +919,33 @@ let () =
                   "Chunks begun and not yet committed by the collector; \
                    defaults to twice $(b,--threads), so readers go on while \
                    commits travel back. The collector loads a server with as \
-                   many sessions."))
+                   many sessions.")
+        $ Arg.(
+            value
+            & opt (some float) None
+            & info [ "max-rate" ] ~docv:"MB/S"
+                ~doc:
+                  "Megabytes a second that all data connections together \
+                   send at most, so the dump leaves room on a shared path.")
+        $ Arg.(
+            value
+            & opt
+                (some
+                   (conv
+                      ( (fun text ->
+                          Option.fold
+                            ~none:(Error (`Msg "expected 0 to 63"))
+                            ~some:Result.ok
+                            (Option.bind (int_of_string_opt text)
+                               Quiver_core.Tcp.Class.of_int)),
+                        fun ppf traffic ->
+                          Format.pp_print_int ppf (traffic :> int) )))
+                None
+            & info [ "dscp" ] ~docv:"N"
+                ~doc:
+                  "The DSCP every packet of the dump carries; 8 (CS1) asks \
+                   routers to let other traffic go first.")
+        $ reconnect)
   in
   let listen =
     Cmdliner.Arg.(
@@ -864,12 +954,13 @@ let () =
       & info [ "listen" ] ~docv:"HOST:PORT"
           ~doc:"Where to wait for the agent or the hop before.")
   in
-  let relay protection listen next =
+  let relay protection reconnect listen next =
     (match
               let%bind next = resolve next in
               let%bind listening = listening listen in
               let%bind session =
                 Quiver_net.Collector.accept listening protection
+                  ~reconnect:(Core.Time_ns.Span.of_sec reconnect)
               in
               let%bind downstream =
                 Quiver_net.Collector.forward next session
@@ -879,17 +970,8 @@ let () =
             | Ok () ->
                 Format.printf "relayed@.";
                 0
-            | Error error ->
-                Format.eprintf "quiver: %a@."
-                  (fun ppf -> function
-                    | `Msg message -> Format.pp_print_string ppf message
-                    | `Collector error ->
-                        (fun ppf value ->
-                          Sexplib0.Sexp.pp_hum ppf
-                            (Quiver_net.Collector.sexp_of_error value))
-                          ppf error)
-                  error;
-                1)
+            | Error (`Msg message) -> told message
+            | Error (`Collector error) -> failed (Quiver_net.Collector.sexp_of_error error))
   in
   let relay_cmd =
     let open Cmdliner in
@@ -901,7 +983,7 @@ let () =
             decompressed or written, and a chunk still counts only once the \
             last hop committed it")
       Term.(
-        const relay $ wire $ listen
+        const relay $ wire $ reconnect $ listen
         $ Arg.(
             required
             & opt (some string) None
@@ -912,7 +994,7 @@ let () =
     let into =
       Arg.(
         value
-        & opt (some string) None
+        & opt (some ident) None
         & info [ "to-database" ] ~docv:"DB"
             ~doc:"Load the only database received under this name.")
     in
@@ -924,10 +1006,11 @@ let () =
             $(b,--to-) options)")
       Term.(
         const
-          (fun protection listen forward dir output target into keys binlog ->
-            collect protection listen forward (Option.map output dir) target
-              into keys binlog)
-        $ wire $ listen
+          (fun protection reconnect listen forward dir output target into keys
+               binlog ->
+            collect protection reconnect listen forward (Option.map output dir)
+              target into keys binlog)
+        $ wire $ reconnect $ listen
         $ Arg.(
             value
             & opt (some string) None

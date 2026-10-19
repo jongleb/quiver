@@ -61,3 +61,9 @@ type t =
 
 val sql : t -> string @@ portable
 val quote : Quiver_core.Ident.t -> string @@ portable
+
+val bytes : string -> string @@ portable
+(** A binary string literal: [X'…']. *)
+
+val text : string -> string @@ portable
+(** A UTF-8 string literal in hex, so no byte is ever escaped: [_utf8mb4 X'…']. *)

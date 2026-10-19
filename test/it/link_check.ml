@@ -5,20 +5,13 @@ let () =
     | "verified" -> Quiver_mysql.Link.Verified_tls System_roots
     | _ -> Quiver_mysql.Link.Plaintext
   in
-  let failure = function
-    | `Link error ->
-        (fun value ->
-          Sexplib0.Sexp.to_string_hum (Quiver_mysql.Link.sexp_of_error value))
-          error
-    | `Wire error ->
-        (fun value ->
-          Sexplib0.Sexp.to_string_hum (Quiver_mysql.Wire.sexp_of_error value))
-          error
-    | `Transport error ->
-        (fun value ->
-          Sexplib0.Sexp.to_string_hum
-            (Quiver_mysql.Transport.sexp_of_error value))
-          error
+  let failure error =
+    Sexplib0.Sexp.to_string_hum
+      ([%sexp_of:
+         [ `Link of Quiver_mysql.Link.error
+         | `Wire of Quiver_mysql.Wire.error
+         | `Transport of Quiver_mysql.Transport.error ]]
+         error)
   in
   let row cells =
     String.concat "|"
@@ -26,9 +19,11 @@ let () =
   in
   ignore ();
   match
-    Quiver_mysql.Link.connect ~local_data:Without_local_data ~tls
-      ~timeout:(Core.Time_ns.Span.of_int_sec 30)
-      ~host:"127.0.0.1" ~port ~user:"root" ~password:(Some "quiver")
+    Quiver_mysql.Link.connect ~local_data:Without_local_data
+      (Tcp { host = "127.0.0.1"; port; tls })
+      ~timeouts:
+        { connecting = Core.Time_ns.Span.of_int_sec 30; silence = Core.Time_ns.Span.of_int_sec 30 }
+      ~user:"root" ~password:(Some "quiver")
   with
   | Error error ->
       prerr_endline ("connect: " ^ failure error);
@@ -52,9 +47,11 @@ let () =
         ];
       Quiver_mysql.Link.close link;
       match
-        Quiver_mysql.Link.connect ~local_data:Without_local_data ~tls
-          ~timeout:(Core.Time_ns.Span.of_int_sec 30)
-          ~host:"127.0.0.1" ~port ~user:"root" ~password:(Some "wrong")
+        Quiver_mysql.Link.connect ~local_data:Without_local_data
+          (Tcp { host = "127.0.0.1"; port; tls })
+          ~timeouts:
+        { connecting = Core.Time_ns.Span.of_int_sec 30; silence = Core.Time_ns.Span.of_int_sec 30 }
+          ~user:"root" ~password:(Some "wrong")
       with
       | Ok _ -> print_endline "wrong password accepted"
       | Error error -> print_endline ("wrong password: " ^ failure error))

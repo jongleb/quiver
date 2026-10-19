@@ -219,9 +219,11 @@ let greeting =
           ()
       in
       ignore
-        (Quiver_mysql.Link.connect ~local_data:Without_local_data ~tls:Plaintext
-           ~timeout:(Core.Time_ns.Span.of_int_sec 5)
-           ~host:"127.0.0.1" ~port ~user:"root" ~password:(Some "x"));
+        (Quiver_mysql.Link.connect ~local_data:Without_local_data
+           (Tcp { host = "127.0.0.1"; port; tls = Plaintext })
+           ~timeouts:
+        { connecting = Core.Time_ns.Span.of_int_sec 5; silence = Core.Time_ns.Span.of_int_sec 5 }
+           ~user:"root" ~password:(Some "x"));
       Thread.join server;
       Unix.close listener)
 

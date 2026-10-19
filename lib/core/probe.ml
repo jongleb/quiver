@@ -5,14 +5,6 @@ let between (low : Key.value) (high : Key.value) ~count =
     let step = Int64.unsigned_div width (Int64.of_int (Int.max 1 count)) in
     List.map (fun i -> Int64.add lo (Int64.mul step (Int64.of_int i))) steps
   in
-  let prefix a b =
-    let rec go i =
-      if i < String.length a && i < String.length b && a.[i] = b.[i] then
-        go (i + 1)
-      else i
-    in
-    go 0
-  in
   match (low, high) with
   | Signed lo, Signed hi -> List.map (fun v -> Key.Signed v) (along lo hi)
   | Unsigned lo, Unsigned hi -> List.map (fun v -> Key.Unsigned v) (along lo hi)
@@ -44,7 +36,7 @@ let between (low : Key.value) (high : Key.value) ~count =
             steps
       | _ -> [])
   | Binary lo, Binary hi ->
-      let shared = prefix lo hi in
+      let shared = Base.String.common_prefix2_length lo hi in
       let tail text =
         List.fold_left
           (fun acc k ->

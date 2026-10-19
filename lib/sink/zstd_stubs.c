@@ -97,6 +97,24 @@ value quiver_zstd_inflate(value inflater, value source, value from, value until,
   return Val_long(quiver_zstd_result(code));
 }
 
+/* Decompresses every frame of the first [length] bytes of [source] into
+   [target] at [at], at most [limit] bytes; returns how many it wrote or an
+   error. Allocates nothing. */
+value quiver_zstd_decompress(value inflater, value source, value length,
+                             value target, value at, value limit)
+{
+  size_t code = ZSTD_decompressDCtx(Dctx_val(inflater),
+                                    Bytes_val(target) + Long_val(at), Long_val(limit),
+                                    Bytes_val(source), Long_val(length));
+  return Val_long(quiver_zstd_result(code));
+}
+
+value quiver_zstd_decompress_byte(value *argv, int argn)
+{
+  return quiver_zstd_decompress(argv[0], argv[1], argv[2], argv[3], argv[4],
+                                argv[5]);
+}
+
 value quiver_zstd_inflate_byte(value *argv, int argn)
 {
   return quiver_zstd_inflate(argv[0], argv[1], argv[2], argv[3], argv[4],

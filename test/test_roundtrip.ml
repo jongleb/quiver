@@ -70,9 +70,8 @@ let gtid (name, version, gen) =
       | Ok gtid -> String.equal (Quiver_mysql.Gtid.to_string gtid) text
       | Error (`Gtid error) ->
           QCheck2.Test.fail_reportf "%a"
-            (fun ppf value ->
-              Sexplib0.Sexp.pp_hum ppf (Quiver_mysql.Gtid.sexp_of_error value))
-            error)
+            Sexplib0.Sexp.pp_hum
+            (Quiver_mysql.Gtid.sexp_of_error error))
 
 let date =
   QCheck2.Gen.(
@@ -388,8 +387,8 @@ let table =
 
 let table_json =
   property "table descriptions decode back from JSON, checked as built"
-    ~print:(fun value ->
-      Sexplib0.Sexp.to_string_hum (Quiver_core.Schema.Table.sexp_of_t value))
+    ~print:(fun table ->
+      Sexplib0.Sexp.to_string_hum (Quiver_core.Schema.Table.sexp_of_t table))
     table
     (fun table ->
       match
@@ -397,15 +396,9 @@ let table_json =
           (Quiver_core.Schema.Table.yojson_of_t table)
       with
       | Ok decoded ->
-          String.equal
-            ((fun value ->
-               Sexplib0.Sexp.to_string_hum
-                 (Quiver_core.Schema.Table.sexp_of_t value))
-               decoded)
-            ((fun value ->
-               Sexplib0.Sexp.to_string_hum
-                 (Quiver_core.Schema.Table.sexp_of_t value))
-               table)
+          Sexplib0.Sexp.equal
+            (Quiver_core.Schema.Table.sexp_of_t decoded)
+            (Quiver_core.Schema.Table.sexp_of_t table)
       | Error _ -> false)
 
 let unchecked_json =
@@ -609,7 +602,7 @@ let messages =
         oneof
           [
             (let* session = text and* streams = count and* chunks = count in
-             let+ byte_order = oneof_list [ Quiver_net.Message.Little_endian; Big_endian ] in
+             let+ byte_order = oneof_list Quiver_net.Message.all_of_byte_order in
              Quiver_net.Message.Hello { session; byte_order; streams; chunks });
             map2 (fun name ddl -> Quiver_net.Message.Database { name; ddl }) name text;
             (let* table = table and* ddl = text in
@@ -626,6 +619,8 @@ let messages =
             (let* source = text and* tables = list_small (pair table_name count) in
              let+ manifest = text in
              Quiver_net.Message.Finish { source; tables; manifest });
+            map (fun replies -> Quiver_net.Message.Heartbeat { replies }) count;
+            pure Quiver_net.Message.Leave;
           ]
       in
       let reply : Quiver_net.Message.reply t =
@@ -654,6 +649,8 @@ let messages =
             map2
               (fun chunk reason -> Quiver_net.Message.Rejected { chunk; reason })
               count text;
+            map (fun messages -> Quiver_net.Message.Heard { messages }) count;
+            map (fun reason -> Quiver_net.Message.Failed reason) text;
           ]
       in
       oneof
@@ -669,10 +666,17 @@ let messages =
                 [ Atom "reply"; Quiver_net.Message.sexp_of_reply message ])
             reply;
           map
-            (fun session ->
+            (fun attach ->
               Sexplib0.Sexp.List
-                [ Atom "attach"; Quiver_net.Message.sexp_of_attach { session } ])
-            text;
+                [ Atom "attach"; Quiver_net.Message.sexp_of_attach attach ])
+            (oneof
+               [
+                 map (fun session -> Quiver_net.Message.Data { session }) text;
+                 map2
+                   (fun session replies ->
+                     Quiver_net.Message.Control { session; replies })
+                   text count;
+               ]);
         ])
     (fun tagged ->
       let back sexp decode encode =

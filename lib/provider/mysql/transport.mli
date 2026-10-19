@@ -1,6 +1,12 @@
+(** Where a server listens. *)
+type endpoint =
+  | Tcp of { host : string; port : int }
+  | Socket of File_path.t  (** A Unix socket of a server on this machine. *)
+[@@deriving sexp_of ~portable]
+
 type error =
   | Unresolved of string  (** The host name has no address. *)
-  | Unreachable of { host : string; port : int; message : string }
+  | Unreachable of { endpoint : endpoint; message : string }
   | Tls of string  (** OpenSSL's description of a failed TLS handshake. *)
   | Expired_certificate  (** Outside its validity period. *)
   | Io of string  (** The connection failed after it was set up. *)
@@ -26,12 +32,12 @@ type trust =
 [@@deriving sexp_of ~portable]
 
 type t
-(** A TCP connection to a server, plain or upgraded to TLS. *)
+(** A connection to a server: over TCP, plain or upgraded to TLS, or over a
+    Unix socket. *)
 
 val connect :
   timeout:Core.Time_ns.Span.t ->
-  host:string ->
-  port:int ->
+  endpoint ->
   (t, [> `Transport of error ]) result @@ portable
 
 val read : t -> Base_bigstring.t -> off:int -> len:int -> int @@ portable
@@ -40,5 +46,6 @@ val write : t -> string -> (unit, [> `Transport of error ]) result @@ portable
 val start_tls :
   t -> host:string -> authority -> (trust, [> `Transport of error ]) result @@ portable
 
+val set_timeout : t -> Core.Time_ns.Span.t -> unit @@ portable
 val failure : t -> error option @@ portable
 val close : t -> unit @@ portable

@@ -1,5 +1,6 @@
 open Base.Result.Let_syntax
 open Quiver_core
+open Sexplib0.Sexp_conv
 
 (** A cell as the model sees it. *)
 type value =
@@ -8,9 +9,10 @@ type value =
   | Text of string
   | Binary of string
   | Real of float
+[@@deriving sexp_of]
 
 (** The logical type of a generated column. *)
-type kind = Ints | Texts | Binaries | Reals | Years
+type kind = Ints | Texts | Binaries | Reals | Years [@@deriving enumerate, sexp_of]
 
 let ltype : kind -> Ltype.t = function
   | Ints -> Int32
@@ -65,28 +67,15 @@ let table =
   QCheck2.Gen.(
     let* kinds =
       list_size (int_range 1 5)
-        (oneof_list [ Ints; Texts; Binaries; Reals; Years ])
+        (oneof_list all_of_kind)
     in
     let+ rows =
       list_size (int_range 1 30) (flatten_list (List.map value kinds))
     in
     (kinds, rows))
 
-let print (kinds, rows) =
-  Printf.sprintf "%d columns, rows: %s" (List.length kinds)
-    (String.concat " | "
-       (List.map
-          (fun row ->
-            String.concat ","
-              (List.map
-                 (function
-                   | Null -> "NULL"
-                   | Int n -> string_of_int n
-                   | Text s -> Printf.sprintf "%S" s
-                   | Binary s -> "b" ^ Printf.sprintf "%S" s
-                   | Real x -> Printf.sprintf "%h" x)
-                 row))
-          rows))
+let print scenario =
+  Sexplib0.Sexp.to_string_hum ([%sexp_of: kind list * value list list] scenario)
 
 let write (type (a : value mod contended portable))
     (module S : Sink_intf.S with type t = a)

@@ -20,10 +20,21 @@ val zstd :
   into:Quiver_core.Byte_buffer.t @ local ->
   (unit, string) result @@ portable
 
+type inflater
+(** A zstd decompression context, reused by one thread at a time. *)
+
+val inflater : unit -> inflater @@ portable
+
 val unzstd :
-  string -> into:Quiver_core.Byte_buffer.t @ local -> (unit, string) result
+  inflater ->
+  string ->
+  length:int ->
+  bound:int ->
+  into:Quiver_core.Byte_buffer.t @ local ->
+  (unit, string) result
   @@ portable
-(** Appends the decompressed frames of the text. *)
+(** Appends the decompressed frames of the text's first [length] bytes, which
+    must decompress to at most [bound] bytes. *)
 
 val inflate :
   (Bytes.t -> pos:int -> len:int -> (int, 'e) result) ->

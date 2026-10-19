@@ -4,9 +4,7 @@ let%expect_test "release lines" =
       Format.printf "%-36s %s@." version
         (match Quiver_mysql.Server.of_version_string version with
         | Ok server ->
-            (fun value ->
-              Sexplib0.Sexp.to_string_hum (Quiver_mysql.Server.sexp_of_t value))
-              server
+            Sexplib0.Sexp.to_string_hum (Quiver_mysql.Server.sexp_of_t server)
         | Error (`Unsupported _) -> "unsupported"))
     [
       "8.0.46";

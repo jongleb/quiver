@@ -1,7 +1,11 @@
 #define CAML_NAME_SPACE
+#include <stdio.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#endif
 #include <caml/mlvalues.h>
 
 /* Settings for every TCP connection quiver makes or accepts. Each is best
@@ -50,6 +54,57 @@ value quiver_tcp_tune(value fd)
   quiver_set(socket, IPPROTO_TCP, TCP_USER_TIMEOUT, QUIVER_UNACKNOWLEDGED * 1000);
 #elif defined(TCP_RXT_CONNDROPTIME)
   quiver_set(socket, IPPROTO_TCP, TCP_RXT_CONNDROPTIME, QUIVER_UNACKNOWLEDGED);
+#endif
+  return Val_unit;
+}
+
+/* The connection's smoothed round trip time in microseconds (milliseconds
+   on macOS, scaled), or -1 where the kernel does not tell. */
+value quiver_tcp_rtt(value fd)
+{
+#if defined(TCP_INFO) && defined(__linux__)
+  struct tcp_info info;
+  socklen_t size = sizeof(info);
+  if (getsockopt(Int_val(fd), IPPROTO_TCP, TCP_INFO, &info, &size) == 0)
+    return Val_long(info.tcpi_rtt);
+#elif defined(TCP_CONNECTION_INFO)
+  struct tcp_connection_info info;
+  socklen_t size = sizeof(info);
+  if (getsockopt(Int_val(fd), IPPROTO_TCP, TCP_CONNECTION_INFO, &info, &size) == 0)
+    return Val_long((long)info.tcpi_srtt * 1000);
+#endif
+  return Val_long(-1);
+}
+
+/* The most bytes the kernel lets one connection's send buffer grow to, or -1
+   where it does not tell. */
+value quiver_tcp_send_buffer_limit(value unit)
+{
+  long limit = -1;
+#if defined(__linux__)
+  long least, initial;
+  FILE *settings = fopen("/proc/sys/net/ipv4/tcp_wmem", "r");
+  if (settings != NULL) {
+    if (fscanf(settings, "%ld %ld %ld", &least, &initial, &limit) != 3) limit = -1;
+    fclose(settings);
+  }
+#elif defined(__APPLE__)
+  int largest;
+  size_t size = sizeof(largest);
+  if (sysctlbyname("net.inet.tcp.autosndbufmax", &largest, &size, NULL, 0) == 0)
+    limit = largest;
+#endif
+  return Val_long(limit);
+}
+
+/* Marks the connection's packets with this DSCP (0 to 63), for IPv4 and
+   IPv6 alike; best effort. */
+value quiver_tcp_mark(value fd, value dscp)
+{
+  int socket = Int_val(fd), tos = Int_val(dscp) << 2;
+  quiver_set(socket, IPPROTO_IP, IP_TOS, tos);
+#ifdef IPV6_TCLASS
+  quiver_set(socket, IPPROTO_IPV6, IPV6_TCLASS, tos);
 #endif
   return Val_unit;
 }

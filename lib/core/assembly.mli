@@ -23,7 +23,7 @@ module Make (S : Sink_intf.S) : sig
   val render : t -> Batch.sealed @ local -> rendered @ unique @@ portable
 
   val deliver : t -> int -> rendered @ unique -> unit @@ portable
-  (** The batch with this number. *)
+  (** The batch with this number; one delivered again is dropped. *)
 
   val seal :
     t -> batches:int -> (outcome -> unit) @ portable -> unit @@ portable

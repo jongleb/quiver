@@ -6,16 +6,9 @@ type ('a : value mod contended portable) t = {
   state : state Portable.Atomic.t;
 }
 
-module Number = struct
-  type t = int
-
-  let equal = Int.equal
-  let hash = Hashtbl.hash
-end
-
 let create () =
   {
-    slots = Portable_lockfree_htbl.create (module Number);
+    slots = Portable_lockfree_htbl.create (module Base.Int);
     state = Portable.Atomic.make Open;
   }
 

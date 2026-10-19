@@ -1,10 +1,12 @@
+let testable sexp_of equal =
+  Alcotest.testable (fun ppf value -> Sexplib0.Sexp.pp_hum ppf (sexp_of value)) equal
+
 let get_ok = function
   | Ok value -> value
   | Error (error : Quiver_core.Error.t) ->
       Alcotest.failf "%a"
-        (fun ppf value ->
-          Sexplib0.Sexp.pp_hum ppf (Quiver_core.Error.sexp_of_t value))
-        error
+        Sexplib0.Sexp.pp_hum
+        (Quiver_core.Error.sexp_of_t error)
 
 let ident name = get_ok (Quiver_core.Ident.of_string name)
 let name = { Quiver_core.Schema.Name.database = ident "db"; table = ident "t" }
@@ -40,9 +42,8 @@ let protection ~node ~peers =
   | Ok protection -> protection
   | Error (`Protection error) ->
       Alcotest.failf "%a"
-        (fun ppf value ->
-          Sexplib0.Sexp.pp_hum ppf (Quiver_net.Protection.sexp_of_error value))
-        error
+        Sexplib0.Sexp.pp_hum
+        (Quiver_net.Protection.sexp_of_error error)
 
 let int64s (batch : Quiver_core.Batch.sealed @ local) =
   let (Quiver_core.Column.Any column) =
@@ -131,3 +132,20 @@ let finished part =
           committing = Core.Time_ns.Span.zero;
         };
     }
+
+let reconnect = Core.Time_ns.Span.of_sec 0.5
+
+let settings ?(compression =
+    Quiver_net.Remote.Fixed
+      (Quiver_sink.Compression.Zstd
+         (Result.get_ok (Quiver_sink.Compression.Level.of_int 1)))) ~streams
+    ~chunks () =
+  {
+    Quiver_net.Remote.streams;
+    most_streams = streams;
+    chunks;
+    compression;
+    pace = None;
+    traffic = None;
+    reconnect;
+  }

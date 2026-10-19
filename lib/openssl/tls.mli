@@ -57,8 +57,9 @@ type 'a outcome =
 val connect : session -> unit outcome
 val accept : session -> unit outcome
 
-val read : session -> Bytes.t -> pos:int -> len:int -> int outcome
-(** Into the bytes; [Done n] with [n > 0]. *)
+val read_nonblocking : session -> Bytes.t -> pos:int -> len:int -> int outcome
+(** Into the bytes, without a copy; [Done n] with [n > 0]. The socket must be
+    non-blocking: the call keeps the runtime. *)
 
 val read_bigstring :
   session -> Base_bigstring.t -> pos:int -> len:int -> int outcome
@@ -66,6 +67,17 @@ val read_bigstring :
 val write : session -> string -> pos:int -> len:int -> int outcome
 (** A prefix of the substring; after [Want_read] or [Want_write] the same
     substring must be written again. *)
+
+val write_nonblocking : session -> string -> pos:int -> len:int -> int outcome
+(** {!write} without a copy, on a non-blocking socket: the call keeps the
+    runtime. *)
+
+val rekey_after : session -> int -> unit
+(** Under TLS 1.3, the first {!write_nonblocking} after so many more bytes
+    went out changes this side's sending keys; 64 GiB unless set. *)
+
+val key_updates : session -> int
+(** Key updates this side sent. *)
 
 val shutdown : session -> unit outcome
 (** Sends close_notify. *)

@@ -11,6 +11,8 @@ let () =
       ("rows", Test_rows.tests);
       ("myloader", Test_myloader.tests);
       ("fuzz", Test_fuzz.tests);
+      ("link", Test_link.tests);
+      ("option file", Test_option_file.tests);
       ("roundtrip", Test_roundtrip.tests);
       ("bisect", Test_bisect.tests);
       ("session", Test_session.tests);
@@ -23,6 +25,8 @@ let () =
       ("statements", Test_statements.tests);
       ("compression", Test_compression.tests);
       ("tcp", Test_tcp.tests);
+      ("streams", Test_streams.tests);
+      ("encoding", Test_encoding.tests);
       ("deferred keys", Test_deferred_keys.tests);
       ("moment", Test_moment.tests);
       ("assembly", Test_assembly.tests);

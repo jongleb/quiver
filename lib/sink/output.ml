@@ -26,8 +26,6 @@ let io file f =
   | exception Unix.Unix_error (error, _, _) ->
       Error (`Output (Io { file; message = Unix.error_message error }))
 
-let start buffers = Quiver_core.Buffer_pool.take buffers
-
 let seal buffers (compression : Compression.t)
     (source : Quiver_core.Byte_buffer.t @ unique) =
   let plain = Quiver_core.Byte_buffer.length (borrow_ source) in
@@ -63,11 +61,7 @@ let append t ({ buffer; plain; owner } : frame @ once unique) =
   let written =
     let { Quiver_core.Byte_buffer.bs; len } = borrow_ buffer in
     io t.file (fun () ->
-        let rec write pos =
-          match pos < len with
-          | true -> write (pos + Unix.write t.fd bs pos (len - pos))
-          | false -> ()
-        in
+        let rec write pos = if pos < len then write (pos + Unix.write t.fd bs pos (len - pos)) in
         write 0;
         Xxh3.add t.hash bs ~pos:0 ~len;
         t.stored <- t.stored + len;
@@ -86,7 +80,7 @@ let close t ~rows =
     match (t.compression, t.stored) with
     | Zstd _, 0 ->
         let buffers = Quiver_core.Buffer_pool.create () in
-        emit t buffers (start buffers)
+        emit t buffers (Quiver_core.Buffer_pool.take buffers)
     | Zstd _, _ | Plain, _ -> Ok ()
   in
   io t.file (fun () ->
@@ -105,7 +99,7 @@ let discard t =
 let save file compression contents =
   let pool = Quiver_core.Buffer_pool.create () in
   let%bind output = create file compression in
-  let buffer = start pool in
+  let buffer = Quiver_core.Buffer_pool.take pool in
   Quiver_core.Byte_buffer.append_string (borrow_ buffer) contents;
   let%bind () = emit output pool buffer in
   let%map _ = close output ~rows:0 in

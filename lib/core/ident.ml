@@ -10,20 +10,12 @@ let of_string name =
     Error (`Ident (Invalid_utf8 name))
   else Ok name
 
+let backquoted name = "`" ^ Base.String.substr_replace_all name ~pattern:"`" ~with_:"``" ^ "`"
+
 let t_of_sexp sexp =
-  match of_string (string_of_sexp sexp) with
-  | Ok ident -> ident
-  | Error (`Ident error) ->
-      Sexplib0.Sexp_conv.of_sexp_error
-        (Sexplib0.Sexp.to_string (sexp_of_error error))
-        sexp
+  Codec.checked_of_sexp (fun (`Ident e) -> sexp_of_error e) (of_string (string_of_sexp sexp)) sexp
 
 let t_of_yojson = function
-  | `String name as json -> (
-      match of_string name with
-      | Ok ident -> ident
-      | Error (`Ident error) ->
-          Ppx_yojson_conv_lib.Yojson_conv.of_yojson_error
-            (Sexplib0.Sexp.to_string (sexp_of_error error))
-            json)
+  | `String name as json ->
+      Codec.checked_of_yojson (fun (`Ident e) -> sexp_of_error e) (of_string name) json
   | json -> Ppx_yojson_conv_lib.Yojson_conv.of_yojson_error "Ident.t" json

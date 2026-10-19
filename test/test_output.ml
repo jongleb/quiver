@@ -38,7 +38,7 @@ let stored =
         let%bind output = Quiver_sink.Output.create file compression in
         let%bind () =
           Base.List.fold_result frames ~init:() ~f:(fun () text ->
-              let buffer = Quiver_sink.Output.start buffers in
+              let buffer = Quiver_core.Buffer_pool.take buffers in
               Quiver_core.Byte_buffer.append_string (borrow_ buffer) text;
               Quiver_sink.Output.emit output buffers buffer)
         in

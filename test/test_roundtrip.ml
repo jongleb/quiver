@@ -214,7 +214,7 @@ let quoting =
       match Quiver_core.Ident.of_string text with
       | Error _ -> true
       | Ok name ->
-          let quoted = Quiver_mysql.Query.quote name in
+          let quoted = Quiver_core.Ident.backquoted name in
           let inner = String.sub quoted 1 (String.length quoted - 2) in
           quoted.[0] = '`'
           && quoted.[String.length quoted - 1] = '`'

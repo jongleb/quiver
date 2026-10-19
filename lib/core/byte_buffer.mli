@@ -16,8 +16,7 @@ val[@zero_alloc] ensure_free : t @ local -> int -> unit
 
 val[@zero_alloc] add_char : t @ local -> char -> unit
 val[@zero_alloc] append_subbytes : t @ local -> Bytes.t -> int -> int -> unit
-val[@zero_alloc] append_bytes : t @ local -> Bytes.t -> unit
+val[@zero_alloc] add_int32_le : t @ local -> int -> unit
 val[@zero_alloc] append_string : t @ local -> string -> unit
 val[@zero_alloc] append_buffer : t @ local -> t @ local -> unit
 val contents : t @ local -> string
-val to_bytes : t @ local -> Bytes.t

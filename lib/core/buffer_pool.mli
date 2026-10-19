@@ -1,6 +1,6 @@
 @@ portable
 
-(** Byte buffers shared by every domain of a dump: a lock-free free list, so
+(** Byte buffers shared by every thread of a dump: a lock-free free list, so
     taking one never blocks and work reuses buffers instead of allocating. A
     buffer is owned by one holder at a time, from [take] to [give]. *)
 

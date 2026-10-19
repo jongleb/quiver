@@ -27,9 +27,6 @@ let create ~dir compression =
 let compression t = t.compression
 let buffers t = t.buffers
 
-let quote (name : Quiver_core.Ident.t) =
-  [%string {|`%{String.concat "``" (String.split_on_char '`' (name :> string))}`|}]
-
 let file_name (name : Quiver_core.Ident.t) =
   Base.String.concat_map
     (name :> string)
@@ -67,19 +64,14 @@ let table t ({ name = { database; table }; _ } : Quiver_core.Schema.Table.t)
     [%string "%{header}%{ddl};\n"]
 
 let scripts database definitions =
-  let literal text =
-    [%string {|'%{String.concat "''" (String.split_on_char '\'' text)}'|}]
-  in
+  let literal text = [%string {|'%{Base.String.substr_replace_all text ~pattern:"'" ~with_:"''"}'|}] in
   let wrapped
       ({ context = { charset; collation; sql_mode; time_zone }; text; name; _ } :
         Quiver_core.Definition.t) before =
     let%map text =
-      Option.fold
-        ~none:
-          (Error
-             (`Unsplittable { Quiver_core.Schema.Name.database; table = name }))
-        ~some:Result.ok
+      Base.Result.of_option
         (Myloader.statement (Myloader.escapes sql_mode) text)
+        ~error:(`Unsplittable { Quiver_core.Schema.Name.database; table = name })
     in
     [
       "SET @PREV_CHARACTER_SET_CLIENT=@@CHARACTER_SET_CLIENT";
@@ -129,11 +121,11 @@ let scripts database definitions =
           (base name ^ "-schema")
           (let columns =
              String.concat ",\n"
-               (List.map (fun column -> quote column ^ " int") (first :: rest))
+               (List.map (fun column -> Quiver_core.Ident.backquoted column ^ " int") (first :: rest))
            in
            [
              [%string
-               "CREATE TABLE IF NOT EXISTS %{quote name}(\n%{columns}\n) \
+               "CREATE TABLE IF NOT EXISTS %{Quiver_core.Ident.backquoted name}(\n%{columns}\n) \
                 ENGINE=MEMORY"];
            ]))
       views
@@ -145,15 +137,15 @@ let scripts database definitions =
            let%map view =
              wrapped definition
                [
-                 "DROP TABLE IF EXISTS " ^ quote name;
-                 "DROP VIEW IF EXISTS " ^ quote name;
+                 "DROP TABLE IF EXISTS " ^ Quiver_core.Ident.backquoted name;
+                 "DROP VIEW IF EXISTS " ^ Quiver_core.Ident.backquoted name;
                ]
            in
            file (base name ^ "-schema-view") view)
          views)
   in
   let dropped keyword ({ name; _ } as definition : Quiver_core.Definition.t) =
-    wrapped definition [ "DROP " ^ keyword ^ " IF EXISTS " ^ quote name ]
+    wrapped definition [ "DROP " ^ keyword ^ " IF EXISTS " ^ Quiver_core.Ident.backquoted name ]
   in
   let%bind triggers =
     Base.Result.all
@@ -210,17 +202,7 @@ let part t ({ name = { database; table }; _ } : Quiver_core.Schema.Table.t)
     t.compression
 
 let finish t ~source ~tables ~manifest =
-  let stamp moment =
-    let date, ofday =
-      Core.Time_ns.to_date_ofday moment ~zone:Core.Time_float.Zone.utc
-    in
-    let { Core.Time_ns.Span.Parts.hr; min; sec; _ } =
-      Core.Time_ns.Ofday.to_parts ofday
-    in
-    Printf.sprintf "%04d-%02d-%02d %02d:%02d:%02d" (Core.Date.year date)
-      (Core.Month.to_int (Core.Date.month date))
-      (Core.Date.day date) hr min sec
-  in
+  let stamp moment = Core.Time_ns.to_sec_string moment ~zone:Core.Time_float.Zone.utc in
   let metadata =
     String.concat ""
       ([
@@ -235,13 +217,13 @@ let finish t ~source ~tables ~manifest =
           (fun { Quiver_core.Schema.Name.database; table } ->
             Printf.sprintf
               "[%s.%s]\nreal_table_name=%s\nrows = 0\nis_view = 1\n\n"
-              (quote database) (quote table)
+              (Quiver_core.Ident.backquoted database) (Quiver_core.Ident.backquoted table)
               (table :> string))
           (Portable.Atomic.get t.views)
       @ List.map
           (fun ({ Quiver_core.Schema.Name.database; table }, rows) ->
             Printf.sprintf "[%s.%s]\nreal_table_name=%s\nrows = %d\n\n"
-              (quote database) (quote table)
+              (Quiver_core.Ident.backquoted database) (Quiver_core.Ident.backquoted table)
               (table :> string)
               rows)
           tables

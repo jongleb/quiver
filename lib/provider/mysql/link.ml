@@ -18,6 +18,7 @@ type capability =
   | Plugin_auth
   | Deprecate_eof
   | Ssl
+  | Lenenc_auth_data
 [@@deriving sexp_of ~portable]
 
 type error =
@@ -28,6 +29,7 @@ type error =
   | Untrusted_certificate of string
   | Cleartext_refused
   | Unusable_public_key
+  | Short_scramble
   | Refused of { code : int; sqlstate : string; message : string }
   | Unexpected_packet of int
 [@@deriving sexp_of ~portable]
@@ -77,12 +79,10 @@ let refused reader =
   `Link (Refused { code; sqlstate; message = Wire.Cursor.rest reader })
 
 let connect ~local_data route ~timeouts ~user ~password =
-  let%bind transport =
-    Transport.connect ~timeout:timeouts.connecting
-      (match route with
-      | Tcp { host; port; tls = _ } -> Tcp { host; port }
-      | Socket path -> Socket path)
+  let endpoint : Transport.endpoint =
+    match route with Tcp { host; port; tls = _ } -> Tcp { host; port } | Socket path -> Socket path
   in
+  let%bind transport = Transport.connect ~timeout:timeouts.connecting endpoint in
   let wire = Wire.create (Transport.read transport)
   and cursor = Wire.Cursor.create () in
   let receive decode = receive transport wire cursor decode
@@ -101,6 +101,10 @@ let connect ~local_data route ~timeouts ~user ~password =
     match (plugin, password, channel) with
     | (`Native | `Caching_sha2), (None | Some ""), _ -> Ok (`Send "")
     | `Sha256, (None | Some ""), _ -> Ok (`Send "\000")
+    | (`Native | `Caching_sha2), Some (_ : string), (`Secure | `Local | `Plaintext)
+    | `Sha256, Some (_ : string), `Local
+      when String.length scramble < 20 ->
+        Error (`Link Short_scramble)
     | `Native, Some password, _ ->
         let once = Quiver_openssl.Sha.sha1 password in
         Ok (`Send (xor once (Quiver_openssl.Sha.sha1 (String.sub scramble 0 20 ^ Quiver_openssl.Sha.sha1 once))))
@@ -194,6 +198,7 @@ let connect ~local_data route ~timeouts ~user ~password =
              (secure_connection, Secure_connection);
              (plugin_auth, Plugin_auth);
              (deprecate_eof, Deprecate_eof);
+             (lenenc_auth_data, Lenenc_auth_data);
            ])
     in
     let fixed flags =
@@ -230,7 +235,17 @@ let connect ~local_data route ~timeouts ~user ~password =
     and response = fixed capabilities in
     Buffer.add_string response user;
     Buffer.add_char response '\000';
-    Buffer.add_uint8 response (String.length auth);
+    let length = String.length auth in
+    let () =
+      if length < 0xFB then Buffer.add_uint8 response length
+      else if length < 0x10000 then (
+        Buffer.add_uint8 response 0xFC;
+        Buffer.add_uint16_le response length)
+      else (
+        Buffer.add_uint8 response 0xFD;
+        Buffer.add_uint16_le response (length land 0xFFFF);
+        Buffer.add_uint8 response (length lsr 16))
+    in
     Buffer.add_string response auth;
     Buffer.add_string response greeting.plugin;
     Buffer.add_char response '\000';
@@ -376,3 +391,6 @@ let load_local t sql read =
         Error error
   in
   stream ()
+
+let run_query t typed = query t (Query.sql typed)
+let run_statement t statement = execute t (Statement.sql statement)

@@ -7,9 +7,9 @@ type t = {
 let create ~batches =
   let batches = Int.max 1 batches in
   let free = Free_list.create () in
-  for _ = 1 to batches do
-    Free_list.put free (Batch.create [])
-  done;
+  Base.Fn.apply_n_times ~n:batches
+    (fun () -> Free_list.put free (Batch.create []))
+    ();
   {
     free;
     available = Await.Await.Semaphore.create batches;
@@ -17,13 +17,15 @@ let create ~batches =
   }
 
 let take t ltypes =
-  (match Await.Await.Semaphore.try_acquire t.available with
-  | Acquired -> ()
-  | Would_block ->
-      let blocked = Stopwatch.start () in
-      Await.Await.Semaphore.acquire Blocking.await t.available;
-      Portable.Atomic.add t.waited
-        (Core.Time_ns.Span.to_int_ns (Stopwatch.elapsed blocked)));
+  let () =
+    match Await.Await.Semaphore.try_acquire t.available with
+    | Acquired -> ()
+    | Would_block ->
+        let blocked = Stopwatch.start () in
+        Await.Await.Semaphore.acquire Blocking.await t.available;
+        Portable.Atomic.add t.waited
+          (Core.Time_ns.Span.to_int_ns (Stopwatch.elapsed blocked))
+  in
   let rec pop () =
     match Free_list.take t.free with
     | This batch -> batch

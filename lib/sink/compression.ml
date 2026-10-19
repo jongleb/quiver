@@ -60,34 +60,6 @@ type window = {
 (** The compressed bytes read but not yet inflated, and zstd's hint after the
     last step: 0 once every frame begun has ended. *)
 
-let pull inflater progress window ~refill ~corrupt bytes ~pos ~len =
-  let rec go () =
-    match refill () with
-    | Error error -> Error error
-    | Ok () -> (
-        match (window.first = window.last, window.source, window.hint) with
-        | true, Drained, 0 -> Ok 0
-        | _ -> (
-            match
-              step inflater window.input window.first window.last bytes pos
-                (pos + len) progress
-            with
-            | code when code < 0 -> Error (corrupt (message (-code)))
-            | hint -> (
-                window.first <- progress.consumed;
-                window.hint <- hint;
-                match
-                  ( progress.produced - pos,
-                    window.first = window.last,
-                    window.source )
-                with
-                | 0, true, Drained when hint <> 0 ->
-                    Error (corrupt "truncated zstd frame")
-                | 0, _, _ -> go ()
-                | produced, _, _ -> Ok produced)))
-  in
-  go ()
-
 external decompress :
   inflater -> Bytes.t -> int -> Bytes.t -> int -> int -> int @@ portable
   = "quiver_zstd_decompress_byte" "quiver_zstd_decompress"
@@ -107,27 +79,47 @@ let unzstd inflater text ~length ~bound
   | code -> Error (message (-code))
 
 let inflate read ~corrupt =
+  let inflater = inflater () and progress = { consumed = 0; produced = 0 } in
   let window =
     { input = Bytes.create 131072; first = 0; last = 0; source = Open; hint = 1 }
   in
-  let refill () =
-    match (window.first = window.last, window.source) with
-    | true, Open -> (
-        match read window.input ~pos:0 ~len:(Bytes.length window.input) with
-        | Error error -> Error error
-        | Ok 0 ->
-            window.source <- Drained;
-            Ok ()
-        | Ok length ->
-            window.first <- 0;
-            window.last <- length;
-            Ok ())
-    | _ -> Ok ()
+  let drained () =
+    window.first = window.last && match window.source with Drained -> true | Open -> false
   in
-  let read =
-    pull (inflater ()) { consumed = 0; produced = 0 } window ~refill ~corrupt
+  let refill () =
+    if window.first <> window.last then Ok ()
+    else
+      match window.source with
+      | Drained -> Ok ()
+      | Open -> (
+          match read window.input ~pos:0 ~len:(Bytes.length window.input) with
+          | Error error -> Error error
+          | Ok 0 ->
+              window.source <- Drained;
+              Ok ()
+          | Ok length ->
+              window.first <- 0;
+              window.last <- length;
+              Ok ())
+  in
+  let rec pull bytes ~pos ~len =
+    match refill () with
+    | Error error -> Error error
+    | Ok () when drained () && window.hint = 0 -> Ok 0
+    | Ok () ->
+        let hint =
+          step inflater window.input window.first window.last bytes pos (pos + len) progress
+        in
+        if hint < 0 then Error (corrupt (message (-hint)))
+        else
+          let () = window.first <- progress.consumed in
+          let () = window.hint <- hint in
+          let produced = progress.produced - pos in
+          if produced > 0 then Ok produced
+          else if drained () && hint <> 0 then Error (corrupt "truncated zstd frame")
+          else pull bytes ~pos ~len
   in
   fun bytes ~pos ~len ->
     Base.Ordered_collection_common.check_pos_len_exn ~pos ~len
       ~total_length:(Bytes.length bytes);
-    match len with 0 -> Ok 0 | _ -> read bytes ~pos ~len
+    if len = 0 then Ok 0 else pull bytes ~pos ~len

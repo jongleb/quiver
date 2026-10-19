@@ -13,6 +13,7 @@ type error =
   | Rejected of { file : File_path.Part.t; statement : string; cause : cause }
   | Several_databases of Quiver_core.Ident.t list
   | Non_positive_threads of int
+  | Unstarted of Quiver_core.Concurrent.error
   | Unreadable_columns of Quiver_core.Schema.Name.t
 [@@deriving sexp_of ~portable]
 
@@ -67,20 +68,52 @@ type report = Created of data_file list | Filled | Ran | Failed of failure
 type course = Going | Stopping
 
 let session (config : Quiver_mysql.Provider.conn_config) binlog =
-  let execute link statement =
-    Quiver_mysql.Link.execute link (Quiver_mysql.Statement.sql statement)
-  in
   let%bind link =
     Quiver_mysql.Link.connect ~local_data:With_local_data config.route
       ~timeouts:config.timeouts ~user:config.user ~password:config.password
   in
-  let%bind () = execute link Prepare_load in
+  let%bind () = Quiver_mysql.Link.run_statement link Prepare_load in
   let%map () =
     match binlog with
     | Write_binlog -> Ok ()
-    | Skip_binlog -> execute link Skip_binlog
+    | Skip_binlog -> Quiver_mysql.Link.run_statement link Skip_binlog
   in
   link
+
+let sessions config binlog ~count ~control ~close =
+  let loaders, control =
+    Quiver_core.Concurrent.both
+      (fun () ->
+        Quiver_core.Concurrent.spread ~workers:count (Iarray.init count Fun.id) (fun (_ : int) ->
+            Quiver_core.Guarded.create (fun () ->
+                (session config binlog : (Quiver_mysql.Link.t, cause) result))))
+      control
+  in
+  match
+    Base.Result.combine control (Base.Result.all loaders)
+      ~ok:(fun control loaders -> (control, loaders))
+      ~err:(fun error _ -> error)
+  with
+  | Ok opened -> Ok opened
+  | Error (#cause as error) ->
+      Result.iter close control;
+      List.iter
+        (Result.iter (fun link ->
+             Quiver_core.Guarded.hold link (fun link -> Quiver_mysql.Link.close link)))
+        loaders;
+      Error error
+
+let retried ~cause run =
+  let rec attempt left =
+    match run () with
+    | Ok _ as done_ -> done_
+    | Error error as failed -> (
+        match (cause error, left) with
+        | Some (`Link (Quiver_mysql.Link.Refused { code = 1213 | 1205; _ })), left when left > 1 ->
+            attempt (left - 1)
+        | _ -> failed)
+  in
+  attempt 5
 
 let renamed target database =
   match target with Same_names -> database | Into renamed -> renamed
@@ -89,15 +122,12 @@ let create_database target database statement =
   Option.fold ~none:statement
     ~some:(fun rest ->
       "CREATE DATABASE "
-      ^ Quiver_sink.Layout.quote (renamed target database)
+      ^ Quiver_core.Ident.backquoted (renamed target database)
       ^ rest)
     (Base.String.chop_prefix statement
-       ~prefix:("CREATE DATABASE " ^ Quiver_sink.Layout.quote database))
+       ~prefix:("CREATE DATABASE " ^ Quiver_core.Ident.backquoted database))
 
 let run config ~dir target ~keys ~binlog ~threads =
-  let execute link statement =
-    Quiver_mysql.Link.execute link (Quiver_mysql.Statement.sql statement)
-  in
   let read file consume =
     match
       In_channel.open_bin
@@ -115,15 +145,12 @@ let run config ~dir target ~keys ~binlog ~threads =
               Quiver_sink.Xxh3.add hash bytes ~pos ~len:length;
               Ok length
         in
-        let result =
-          consume
-            (match
-               Base.String.is_suffix (File_path.Part.to_string file)
-                 ~suffix:".zst"
-             with
-            | true -> Quiver_sink.Compression.inflate stored ~corrupt:unreadable
-            | false -> stored)
+        let source =
+          if Base.String.is_suffix (File_path.Part.to_string file) ~suffix:".zst" then
+            Quiver_sink.Compression.inflate stored ~corrupt:unreadable
+          else stored
         in
+        let result = consume source in
         In_channel.close channel;
         let%map () = result in
         Quiver_core.Checksum.Xxh3_64 (Quiver_sink.Xxh3.value hash)
@@ -150,12 +177,9 @@ let run config ~dir target ~keys ~binlog ~threads =
       (List.find_map
          (fun extension ->
            let file = File_path.Part.of_string (base ^ extension) in
-           match
-             Sys.file_exists
-               (File_path.to_string File_path.Operators.(dir /?. file))
-           with
-           | true -> Some file
-           | false -> None)
+           Base.Option.some_if
+             (Sys.file_exists (File_path.to_string File_path.Operators.(dir /?. file)))
+             file)
          [ ".sql"; ".sql.zst" ])
   in
   let table_base ({ database; table } : Quiver_core.Schema.Name.t) =
@@ -212,46 +236,58 @@ let run config ~dir target ~keys ~binlog ~threads =
     | Into _, ([] | [ _ ]) | Same_names, _ -> Ok ()
     | Into _, several -> Error (`Load (Several_databases several))
   in
-  let links, prepared =
-    Quiver_core.Concurrent.both
-      (fun () ->
-        Quiver_core.Concurrent.spread ~workers:threads
-          (Iarray.init threads Fun.id)
-          (fun (_ : int) ->
-            Quiver_core.Guarded.create (fun () ->
-                (session config binlog : (Quiver_mysql.Link.t, cause) result))))
-      (fun () ->
+  let%bind entries =
+    match Sys.readdir (File_path.to_string dir) with
+    | entries -> Ok (List.sort String.compare (Array.to_list entries))
+    | exception Sys_error message ->
+        Error (`Load (Unreadable { file = File_path.Part.of_string "."; message }))
+  in
+  let%bind objects =
+    Base.Result.all
+      (List.map
+         (fun database ->
+           let prefix = Quiver_sink.Layout.file_name database in
+           let views =
+             List.filter_map
+               (fun entry ->
+                 Option.bind
+                   (Base.String.chop_prefix entry ~prefix:(prefix ^ "."))
+                   (fun rest ->
+                     Option.map
+                       (fun view -> prefix ^ "." ^ view)
+                       (List.find_map
+                          (fun suffix -> Base.String.chop_suffix rest ~suffix)
+                          [ "-schema-view.sql"; "-schema-view.sql.zst" ])))
+               entries
+           in
+           let files suffix =
+             Base.Result.all (List.map (fun view -> schema_file (view ^ suffix)) views)
+           in
+           let%bind stubs = files "-schema" in
+           let%map views = files "-schema-view" in
+           let optional base = Result.to_list (schema_file base) in
+           ( List.map (fun stub -> Run { database; files = [ stub ] }) stubs,
+             List.filter_map
+               (function [] -> None | files -> Some (Run { database; files }))
+               [ views; optional (prefix ^ "-schema-triggers"); optional (prefix ^ "-schema-post") ] ))
+         databases)
+  in
+  let%bind (control, loaded), links =
+    sessions config binlog ~count:threads
+      ~control:(fun () ->
         let%bind control = session config binlog in
         match
-          let%bind () = execute control Create_progress_schema in
-          let%bind () = execute control Create_progress_table in
-          Quiver_mysql.Link.query control
-            (Quiver_mysql.Query.sql
-               (Loaded_files { dump; target = progress_target }))
+          let%bind () = Quiver_mysql.Link.run_statement control Create_progress_schema in
+          let%bind () = Quiver_mysql.Link.run_statement control Create_progress_table in
+          Quiver_mysql.Link.run_query control (Loaded_files { dump; target = progress_target })
         with
-        | Ok loaded -> Ok (control, List.filter_map (fun row -> row.(0)) loaded)
+        | Ok rows -> Ok (control, List.filter_map (function [| file |] -> file | _ -> None) rows)
         | Error error ->
             Quiver_mysql.Link.close control;
             Error error)
-  in
-  let%bind control, loaded, links =
-    match
-      Base.Result.combine prepared (Base.Result.all links)
-        ~ok:(fun (control, loaded) links -> (control, loaded, links))
-        ~err:(fun error _ -> error)
-    with
-    | Ok opened -> Ok opened
-    | Error (#cause as error) ->
-        Result.iter (fun (control, _) -> Quiver_mysql.Link.close control) prepared;
-        List.iter
-          (Result.iter (fun link ->
-               Quiver_core.Guarded.hold link (fun link ->
-                   Quiver_mysql.Link.close link)))
-          links;
-        Error error
+      ~close:(fun (control, _) -> Quiver_mysql.Link.close control)
   in
   let committed = Base.Set.of_list (module Base.String) loaded in
-  let done_ file = Base.Set.mem committed file in
   let resume = match loaded with [] -> Fresh | _ -> Resuming in
   let ddl link sql =
     match (resume, Quiver_mysql.Link.execute link sql) with
@@ -265,31 +301,29 @@ let run config ~dir target ~keys ~binlog ~threads =
     | (Fresh | Resuming), result -> result
   in
   let record link file =
-    execute link (Record_progress { dump; target = progress_target; file })
+    Quiver_mysql.Link.run_statement link (Record_progress { dump; target = progress_target; file })
   in
-  let started = "(started)" in
+  let close link = Quiver_core.Guarded.hold link (fun link -> Quiver_mysql.Link.close link) in
   let%bind () =
-    match resume with Fresh -> record control started | Resuming -> Ok ()
+    match
+      let%bind () =
+        match resume with Fresh -> record control "(started)" | Resuming -> Ok ()
+      in
+      Base.List.fold_result databases ~init:() ~f:(fun () database ->
+          let%bind file = schema_file (Quiver_sink.Layout.file_name database ^ "-schema-create") in
+          let%map _ = statements ddl control file (create_database target database) in
+          ())
+    with
+    | Ok () -> Ok ()
+    | Error error ->
+        Quiver_mysql.Link.close control;
+        List.iter close links;
+        Error error
   in
-  let%bind () =
-    Base.List.fold_result databases ~init:() ~f:(fun () database ->
-        let%bind file =
-          schema_file (Quiver_sink.Layout.file_name database ^ "-schema-create")
-        in
-        let%map _ =
-          statements ddl control file (create_database target database)
-        in
-        ())
-  in
-  let rec retried attempts run =
-    match run () with
-    | Error
-        ( `Load
-            (Rejected { cause = `Link (Refused { code = 1213 | 1205; _ }); _ })
-        | `Link (Quiver_mysql.Link.Refused { code = 1213 | 1205; _ }) )
-      when attempts > 1 ->
-        retried (attempts - 1) run
-    | result -> result
+  let cause = function
+    | `Load (Rejected { cause; _ }) -> Some cause
+    | #cause as cause -> Some cause
+    | `Load _ | `Statements _ | `Ident _ -> None
   in
   let size parts =
     Base.List.sum
@@ -298,25 +332,22 @@ let run config ~dir target ~keys ~binlog ~threads =
       ~f:(fun (part : Quiver_core.Manifest.part) -> part.stored_bytes)
   in
   let add_keys link { later; mark; _ } =
-    match (later, done_ mark) with
-    | [], _ | _, true -> Ok ()
-    | statements, false ->
-        let%bind () =
-          Base.List.fold_result statements ~init:() ~f:(fun () statement ->
-              retried 5 (fun () ->
-                  rejected
-                    (File_path.Part.of_string mark)
-                    statement (ddl link statement)))
-        in
-        record link mark
+    if List.is_empty later || Base.Set.mem committed mark then Ok ()
+    else
+      let%bind () =
+        Base.List.fold_result later ~init:() ~f:(fun () statement ->
+            retried ~cause (fun () ->
+                rejected (File_path.Part.of_string mark) statement (ddl link statement)))
+      in
+      record link mark
   in
   let create link (({ Quiver_core.Schema.Name.database; table } as name), parts)
       =
-    let%bind () = execute link (Use (renamed target database)) in
+    let%bind () = Quiver_mysql.Link.run_statement link (Use (renamed target database)) in
     let%bind file = schema_file (table_base name ^ "-schema") in
     let deferred = ref [] in
     let%bind _ =
-      retried 5 (fun () ->
+      retried ~cause (fun () ->
           statements ddl link file (fun statement ->
               match keys with
               | With_table -> statement
@@ -339,7 +370,7 @@ let run config ~dir target ~keys ~binlog ~threads =
               { database = renamed target database; table }
           in
           let%bind rows =
-            Quiver_mysql.Link.query link (Quiver_mysql.Query.sql query)
+            Quiver_mysql.Link.run_query link (query)
           in
           let%map columns =
             Base.Result.all
@@ -366,7 +397,7 @@ let run config ~dir target ~keys ~binlog ~threads =
     let pending =
       List.filter
         (fun ({ file; _ } : Quiver_core.Manifest.part) ->
-          not (done_ (File_path.Part.to_string file)))
+          not (Base.Set.mem committed (File_path.Part.to_string file)))
         parts
     in
     let keys =
@@ -380,10 +411,10 @@ let run config ~dir target ~keys ~binlog ~threads =
     List.map (fun part -> { database; part; delivery; keys }) pending
   in
   let fill link { database; part = { file; checksum; _ }; delivery; keys } =
-    let%bind () = execute link (Use (renamed target database)) in
+    let%bind () = Quiver_mysql.Link.run_statement link (Use (renamed target database)) in
     let%bind () =
-      retried 5 (fun () ->
-          let%bind () = execute link Begin in
+      retried ~cause (fun () ->
+          let%bind () = Quiver_mysql.Link.run_statement link Begin in
           let loaded =
             match%bind
               match delivery with
@@ -396,10 +427,10 @@ let run config ~dir target ~keys ~binlog ~threads =
             with
             | found when Quiver_core.Checksum.equal found checksum ->
                 let%bind () = record link (File_path.Part.to_string file) in
-                execute link Commit
+                Quiver_mysql.Link.run_statement link Commit
             | _ -> Error (`Load (Corrupt file))
           in
-          Result.iter_error (fun _ -> ignore (execute link Rollback)) loaded;
+          Result.iter_error (fun _ -> ignore (Quiver_mysql.Link.run_statement link Rollback)) loaded;
           loaded)
     in
     match Portable.Atomic.fetch_and_add keys.remaining (-1) with
@@ -411,56 +442,52 @@ let run config ~dir target ~keys ~binlog ~threads =
   and course = Portable.Atomic.make Going in
   let (work @ portable) link =
     Quiver_core.Guarded.hold link (fun link ->
-    let rec serve () =
-      match Await.Await.Mpmc_queue.pop Quiver_core.Blocking.await tasks with
-      | Stop -> Quiver_mysql.Link.close link
-      | Create table ->
-          Await.Await.Mpmc_queue.push reports
-            (match Portable.Atomic.get course with
-            | Stopping -> Created []
+        let report going stopped =
+          let report =
+            match Portable.Atomic.get course with
+            | Stopping -> stopped
             | Going -> (
-                match create link table with
-                | Ok files -> Created files
-                | Error failure -> Failed failure));
-          serve ()
-      | Fill file ->
-          Await.Await.Mpmc_queue.push reports
-            (match Portable.Atomic.get course with
-            | Stopping -> Filled
-            | Going -> (
-                match fill link file with
-                | Ok () -> Filled
-                | Error failure -> Failed failure));
-          serve ()
-      | Run { database; files } ->
-          Await.Await.Mpmc_queue.push reports
-            (match Portable.Atomic.get course with
-            | Stopping -> Ran
-            | Going -> (
-                match
-                  let%bind () = execute link (Use (renamed target database)) in
-                  Base.List.fold_result files ~init:() ~f:(fun () file ->
-                      let%map _ = statements ddl link file Fun.id in
-                      ())
-                with
-                | Ok () -> Ran
-                | Error failure -> Failed failure));
-          serve ()
-    in
-    serve ())
+                match going () with Ok report -> report | Error failure -> Failed failure)
+          in
+          Await.Await.Mpmc_queue.push reports report
+        in
+        let rec serve () =
+          match Await.Await.Mpmc_queue.pop Quiver_core.Blocking.await tasks with
+          | Stop -> Quiver_mysql.Link.close link
+          | Create table ->
+              report
+                (fun () -> Result.map (fun files -> Created files) (create link table))
+                (Created []);
+              serve ()
+          | Fill file ->
+              report (fun () -> Result.map (fun () -> Filled) (fill link file)) Filled;
+              serve ()
+          | Run { database; files } ->
+              report
+                (fun () ->
+                  let%bind () = Quiver_mysql.Link.run_statement link (Use (renamed target database)) in
+                  let%map () =
+                    Base.List.fold_result files ~init:() ~f:(fun () file ->
+                        let%map _ = statements ddl link file Fun.id in
+                        ())
+                  in
+                  Ran)
+                Ran;
+              serve ()
+        in
+        serve ())
   in
-  let started =
-    List.length
-      (List.filter
-         (fun (link : Quiver_mysql.Link.t Await.Capsule.Await.With_mutex.t) ->
-           match Quiver_core.Concurrent.start (fun () -> work link) with
-           | Ok _ -> true
-           | Error (`Concurrent _) ->
-               Quiver_core.Guarded.hold link (fun link ->
-                   Quiver_mysql.Link.close link);
-               false)
-         links)
+  let workers =
+    List.map
+      (fun (link : Quiver_mysql.Link.t Await.Capsule.Await.With_mutex.t) ->
+        match Quiver_core.Concurrent.start (fun () -> work link) with
+        | Ok (_ : unit Quiver_core.Concurrent.task) -> Ok ()
+        | Error (`Concurrent error) ->
+            close link;
+            Error error)
+      links
   in
+  let started = Base.List.count workers ~f:Result.is_ok in
   let phase items task =
     List.iter (fun item -> Await.Await.Mpmc_queue.push tasks (task item)) items;
     let rec collect count created first =
@@ -472,56 +499,14 @@ let run config ~dir target ~keys ~binlog ~threads =
           | Filled | Ran -> collect (count - 1) created first
           | Failed failure ->
               Portable.Atomic.set course Stopping;
-              collect (count - 1) created
-                (Option.fold ~none:(Some failure) ~some:Option.some first))
+              collect (count - 1) created (Base.Option.first_some first (Some failure)))
     in
     collect (List.length items) [] None
   in
-  let objects =
-    let entries =
-      List.sort String.compare
-        (Array.to_list (Sys.readdir (File_path.to_string dir)))
-    in
-    Base.Result.all
-      (List.map
-         (fun database ->
-           let prefix = Quiver_sink.Layout.file_name database in
-           let views =
-             List.filter_map
-               (fun entry ->
-                 Option.bind
-                   (Base.String.chop_prefix entry ~prefix:(prefix ^ "."))
-                   (fun rest ->
-                     Option.map
-                       (fun view -> prefix ^ "." ^ view)
-                       (List.find_map
-                          (fun suffix -> Base.String.chop_suffix rest ~suffix)
-                          [ "-schema-view.sql"; "-schema-view.sql.zst" ])))
-               entries
-           in
-           let files suffix =
-             Base.Result.all
-               (List.map (fun view -> schema_file (view ^ suffix)) views)
-           in
-           let%bind stubs = files "-schema" in
-           let%map views = files "-schema-view" in
-           let optional base = Result.to_list (schema_file base) in
-           ( List.map (fun stub -> Run { database; files = [ stub ] }) stubs,
-             List.filter_map
-               (function
-                 | [] -> None | files -> Some (Run { database; files }))
-               [
-                 views;
-                 optional (prefix ^ "-schema-triggers");
-                 optional (prefix ^ "-schema-post");
-               ] ))
-         databases)
-  in
   let loaded =
-    match started with
-    | 0 -> Error (`Load (Non_positive_threads 0))
-    | _ ->
-        let%bind objects = objects in
+    match (started, Base.Result.all_unit workers) with
+    | 0, Error error -> Error (`Load (Unstarted error))
+    | _, (Ok () | Error _) ->
         let%bind files =
           phase
             (List.sort (fun (_, a) (_, b) -> Int.compare (size b) (size a)) tables)
@@ -539,27 +524,25 @@ let run config ~dir target ~keys ~binlog ~threads =
         let%map _ = phase (List.concat_map snd objects) Fun.id in
         ()
   in
-  for _ = 1 to started do
-    Await.Await.Mpmc_queue.push tasks Stop
-  done;
-  let%bind () =
-    Result.map_error (function #failure as failure -> failure) loaded
-  in
-  let%bind () =
-    execute control (Forget_progress { dump; target = progress_target })
+  Base.Fn.apply_n_times ~n:started
+    (fun () -> Await.Await.Mpmc_queue.push tasks Stop)
+    ();
+  let finished =
+    let%bind () = Result.map_error (function #failure as failure -> failure) loaded in
+    Quiver_mysql.Link.run_statement control (Forget_progress { dump; target = progress_target })
   in
   Quiver_mysql.Link.close control;
-  Ok
-    (List.fold_left
-       (fun summary ((_, part) : _ * Quiver_core.Manifest.part) ->
-         match done_ (File_path.Part.to_string part.file) with
-         | true -> { summary with skipped = summary.skipped + 1 }
-         | false ->
-             {
-               summary with
-               files = summary.files + 1;
-               rows = summary.rows + part.rows;
-               bytes = summary.bytes + part.bytes;
-             })
-       { files = 0; rows = 0; bytes = 0; skipped = 0 }
-       parts)
+  let%map () = finished in
+  List.fold_left
+    (fun summary ((_, part) : _ * Quiver_core.Manifest.part) ->
+      if Base.Set.mem committed (File_path.Part.to_string part.file) then
+        { summary with skipped = summary.skipped + 1 }
+      else
+        {
+          summary with
+          files = summary.files + 1;
+          rows = summary.rows + part.rows;
+          bytes = summary.bytes + part.bytes;
+        })
+    { files = 0; rows = 0; bytes = 0; skipped = 0 }
+    parts

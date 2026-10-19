@@ -1,5 +1,5 @@
 (** Receives a dump an agent sends over quiver's wire protocol and writes it
-    with a local sink: each data connection is served on a domain of its own,
+    with a local sink: each data connection is served on a thread of its own,
     which decodes and renders its chunk's batches and answers a chunk's end once
     the sink closed the part. A collector can also pass everything on to the
     next hop as it arrives, so one read of the source reaches a chain of

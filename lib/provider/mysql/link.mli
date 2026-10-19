@@ -28,6 +28,7 @@ type capability =
   | Plugin_auth
   | Deprecate_eof
   | Ssl
+  | Lenenc_auth_data
 [@@deriving sexp_of ~portable]
 
 type error =
@@ -38,6 +39,7 @@ type error =
   | Untrusted_certificate of string  (** A remote server failed verification. *)
   | Cleartext_refused  (** Clear-text password asked without trusted TLS. *)
   | Unusable_public_key  (** The server's RSA key does not encrypt the password. *)
+  | Short_scramble  (** The server's challenge is under 20 bytes. *)
   | Refused of { code : int; sqlstate : string; message : string }
       (** An ERR packet from the server. *)
   | Unexpected_packet of int  (** First byte of a packet out of place. *)
@@ -70,6 +72,22 @@ val query :
 val execute :
   t ->
   string ->
+  ( unit,
+    [> `Link of error | `Wire of Wire.error | `Transport of Transport.error ]
+  )
+  result @@ portable
+
+val run_query :
+  t ->
+  Query.t ->
+  ( string option array list,
+    [> `Link of error | `Wire of Wire.error | `Transport of Transport.error ]
+  )
+  result @@ portable
+
+val run_statement :
+  t ->
+  Statement.t ->
   ( unit,
     [> `Link of error | `Wire of Wire.error | `Transport of Transport.error ]
   )

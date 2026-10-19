@@ -57,21 +57,12 @@ let reshape t ltypes =
            ltypes)
 
 let encode t (out : Byte_buffer.t @ local) =
-  let rows = Bytes.create 4 in
-  Bytes.set_int32_le rows 0 (Int32.of_int t.rows);
-  Byte_buffer.append_bytes out rows;
-  for j = 0 to Iarray.length t.columns - 1 do
-    match Iarray.get t.columns j with
-    | Column.Any column -> Column.encode column out
-  done
+  Byte_buffer.add_int32_le out t.rows;
+  Iarray.iter (fun (Column.Any column) -> Column.encode column out) t.columns [@nontail]
 
 let decode (t @ local) source ~stop = exclave_
   let header = 4 in
-  let rows =
-    match stop >= header with
-    | true -> Int32.to_int (Bytes.get_int32_le source 0)
-    | false -> -1
-  in
+  let rows = if stop >= header then Int32.to_int (Bytes.get_int32_le source 0) else -1 in
   let next =
     Iarray.fold_left
       (fun off (Column.Any column) ->

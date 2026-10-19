@@ -27,16 +27,18 @@ let lines text =
       if i < String.length value then
         match (value.[i], at value (i + 1)) with
         | '\\', Some escaped ->
-            (match escaped with
-            | 'b' -> Buffer.add_char buffer '\b'
-            | 't' -> Buffer.add_char buffer '\t'
-            | 'n' -> Buffer.add_char buffer '\n'
-            | 'r' -> Buffer.add_char buffer '\r'
-            | 's' -> Buffer.add_char buffer ' '
-            | '"' | '\'' | '\\' -> Buffer.add_char buffer escaped
-            | other ->
-                Buffer.add_char buffer '\\';
-                Buffer.add_char buffer other);
+            let () =
+              match escaped with
+              | 'b' -> Buffer.add_char buffer '\b'
+              | 't' -> Buffer.add_char buffer '\t'
+              | 'n' -> Buffer.add_char buffer '\n'
+              | 'r' -> Buffer.add_char buffer '\r'
+              | 's' -> Buffer.add_char buffer ' '
+              | '"' | '\'' | '\\' -> Buffer.add_char buffer escaped
+              | other ->
+                  Buffer.add_char buffer '\\';
+                  Buffer.add_char buffer other
+            in
             go (i + 2)
         | c, (Some (_ : char) | None) ->
             Buffer.add_char buffer c;
@@ -72,28 +74,12 @@ let lines text =
       | Some (_ : char) ->
           let option = uncommented line in
           let name, value =
-            match String.index_opt option '=' with
+            match Base.String.lsplit2 option ~on:'=' with
             | None -> (option, None)
-            | Some equals ->
-                ( String.sub option 0 equals,
-                  Some
-                    (unescaped
-                       (unquoted
-                          (String.trim
-                             (String.sub option (equals + 1)
-                                (String.length option - equals - 1))))) )
+            | Some (name, value) -> (name, Some (unescaped (unquoted (String.trim value))))
           in
           let name =
-            String.map
-              (function '_' -> '-' | c -> c)
-              (String.lowercase_ascii (String.trim name))
+            Base.String.tr ~target:'_' ~replacement:'-' (String.lowercase_ascii (String.trim name))
           in
-          Some
-            (Option
-               {
-                 name =
-                   Option.value ~default:name
-                     (Base.String.chop_prefix name ~prefix:"loose-");
-                 value;
-               }))
+          Some (Option { name = Base.String.chop_prefix_if_exists name ~prefix:"loose-"; value }))
     (String.split_on_char '\n' text)

@@ -1,6 +1,6 @@
 (** The sink of an agent: a dump sent over quiver's wire protocol to a
     collector, which writes it with a sink of its own. Batches travel as they
-    lie in memory, zstd-compressed on the render domains, numbered within their
+    lie in memory, zstd-compressed on the render threads, numbered within their
     chunk; whichever data connection is free sends the next one, so one chunk
     spreads over every connection. A chunk counts once the collector committed
     it, while the readers go on: at most [chunks] are begun and not answered. *)

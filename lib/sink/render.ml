@@ -20,13 +20,12 @@ let hex (out : Quiver_core.Byte_buffer.t) column row =
   and off = Quiver_core.Column.text_offset column row
   and len = Quiver_core.Column.text_length column row in
   Quiver_core.Byte_buffer.ensure_free out (2 * len);
-  for i = 0 to len - 1 do
-    let code = Char.code (Bytes.unsafe_get bytes (off + i)) in
-    Bytes.unsafe_set out.bs
-      (out.len + (2 * i))
-      (String.unsafe_get digits (code lsr 4));
-    Bytes.unsafe_set out.bs
-      (out.len + (2 * i) + 1)
-      (String.unsafe_get digits (code land 15))
-  done;
+  let rec go i =
+    if i < len then (
+      let code = Char.code (Bytes.unsafe_get bytes (off + i)) in
+      Bytes.unsafe_set out.bs (out.len + (2 * i)) (String.unsafe_get digits (code lsr 4));
+      Bytes.unsafe_set out.bs (out.len + (2 * i) + 1) (String.unsafe_get digits (code land 15));
+      go (i + 1))
+  in
+  go 0 [@nontail];
   out.len <- out.len + (2 * len)

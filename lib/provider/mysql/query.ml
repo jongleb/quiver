@@ -50,17 +50,15 @@ type t =
     }
 [@@deriving sexp_of ~portable]
 
-let quote (name : Quiver_core.Ident.t) =
-  [%string {|`%{String.concat "``" (String.split_on_char '`' (name :> string))}`|}]
 
 let qualified { Quiver_core.Schema.Name.database; table } =
-  [%string "%{quote database}.%{quote table}"]
+  [%string "%{Quiver_core.Ident.backquoted database}.%{Quiver_core.Ident.backquoted table}"]
 
 let system = "('mysql', 'sys', 'information_schema', 'performance_schema')"
 
 let columns fields =
   String.concat ", "
-    (List.map (fun { Quiver_core.Schema.Field.name; _ } -> quote name) fields)
+    (List.map (fun { Quiver_core.Schema.Field.name; _ } -> Quiver_core.Ident.backquoted name) fields)
 
 let bytes value = [%string "X'%{Hex_encode.to_hex ~case:`Lowercase value}'"]
 let text value = [%string "_utf8mb4 %{bytes value}"]
@@ -104,7 +102,7 @@ let sql = function
          NOT IN %{system} ORDER BY TABLE_SCHEMA, TABLE_NAME, INDEX_NAME, \
          SEQ_IN_INDEX"]
   | Key_bounds { table; key } ->
-      [%string "SELECT MIN(%{quote key}), MAX(%{quote key}) FROM %{qualified table}"]
+      [%string "SELECT MIN(%{Quiver_core.Ident.backquoted key}), MAX(%{Quiver_core.Ident.backquoted key}) FROM %{qualified table}"]
   | Binlog_status server -> (
       match server with
       | Mysql_8_0 _ -> "SHOW MASTER STATUS"
@@ -117,7 +115,7 @@ let sql = function
       | Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _ ->
           "SELECT @@GLOBAL.gtid_binlog_pos")
   | Show_create (Database database) ->
-      [%string "SHOW CREATE DATABASE %{quote database}"]
+      [%string "SHOW CREATE DATABASE %{Quiver_core.Ident.backquoted database}"]
   | Show_create (Table name) -> [%string "SHOW CREATE TABLE %{qualified name}"]
   | View_columns database ->
       [%string
@@ -149,7 +147,7 @@ let sql = function
         | Function -> "FUNCTION"
         | Event -> "EVENT"
       in
-      [%string "SHOW CREATE %{kind} %{quote database}.%{quote name}"]
+      [%string "SHOW CREATE %{kind} %{Quiver_core.Ident.backquoted database}.%{Quiver_core.Ident.backquoted name}"]
   | Chunk chunk ->
       let table = Quiver_core.Chunk.table chunk in
       let first, rest = table.fields in
@@ -168,7 +166,7 @@ let sql = function
                     | Greater -> ">"
                     | At_least -> ">="
                   in
-                  [%string "%{quote field.name} %{comparison} %{literal value}"]
+                  [%string "%{Quiver_core.Ident.backquoted field.name} %{comparison} %{literal value}"]
               | All (first, rest) ->
                   [%string {|(%{String.concat " AND " (List.map condition (first :: rest))})|}]
               | Any (first, rest) ->
@@ -198,21 +196,21 @@ let sql = function
         Option.fold ~none:(literal from)
           ~some:(fun { charset; collation } ->
             [%string
-              "CONVERT(%{literal from} USING %{quote charset}) COLLATE %{quote \
+              "CONVERT(%{literal from} USING %{Quiver_core.Ident.backquoted charset}) COLLATE %{Quiver_core.Ident.backquoted \
                collation}"])
           collation
       in
       [%string
         "SELECT %{columns (fst key :: snd key)} FROM %{qualified table} WHERE \
-         %{quote first.name} >= %{from} ORDER BY %{columns (fst key :: snd \
+         %{Quiver_core.Ident.backquoted first.name} >= %{from} ORDER BY %{columns (fst key :: snd \
          key)} LIMIT 1"]
   | Estimate { table; key; from; below } ->
       let where =
         match
-          List.filter_map Fun.id
+          Base.List.filter_opt
             [
-              Option.map (fun from -> [%string "%{quote key} >= %{literal from}"]) from;
-              Option.map (fun below -> [%string "%{quote key} < %{literal below}"]) below;
+              Option.map (fun from -> [%string "%{Quiver_core.Ident.backquoted key} >= %{literal from}"]) from;
+              Option.map (fun below -> [%string "%{Quiver_core.Ident.backquoted key} < %{literal below}"]) below;
             ]
         with
         | [] -> ""
@@ -233,7 +231,7 @@ let sql = function
       let candidates = String.concat ", " (List.map tuple (candidate :: others))
       and key =
         match fields with
-        | [ { name; _ } ] -> quote name
+        | [ { name; _ } ] -> Quiver_core.Ident.backquoted name
         | _ -> [%string "(%{columns fields})"]
       in
       [%string

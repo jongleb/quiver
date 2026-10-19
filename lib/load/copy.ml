@@ -24,7 +24,7 @@ type job = {
 
 type renderer = {
   scratch : Quiver_core.Buffer_pool.t;  (** The copy's text buffers. *)
-  lines : Quiver_sink.Csv.lines;
+  lines : Quiver_sink.Csv.Dialect.lines;
 }
 
 type deferred = {
@@ -81,15 +81,9 @@ let session config binlog =
     (Load.session config binlog)
 
 let retried link statement =
-  let rec attempt left =
-    match run link statement with
-    | Error (Rejected { cause = `Link (Refused { code = 1213 | 1205; _ }); _ })
-      when left > 1 ->
-        attempt (left - 1)
-    | result -> result
-  in
-  let deadlock_attempts = 5 in
-  attempt deadlock_attempts
+  Load.retried
+    (fun () -> run link statement)
+    ~cause:(function Rejected { cause; _ } -> Some cause | _ -> None)
 
 let add_keys link (into : Quiver_core.Schema.Name.t) (first, rest) =
   let%bind () = execute link (Use into.database) in
@@ -105,31 +99,15 @@ let on_idle_loader t work =
 let create config target ~keys ~binlog ~sessions =
   Result.map_error
     (fun error -> `Sink error)
-    (let connected () =
-       Quiver_core.Guarded.create (fun () -> session config binlog)
-     in
-     let loaders, control =
-       Quiver_core.Concurrent.both
-         (fun () ->
-           Quiver_core.Concurrent.spread ~workers:sessions
-             (Iarray.init sessions Fun.id)
-             (fun (_ : int) -> connected ()))
-         connected
-     in
-     let%map control, loaders =
-       match
-         Base.Result.combine control (Base.Result.all loaders)
-           ~ok:(fun control loaders -> (control, loaders))
-           ~err:(fun error _ -> error)
-       with
-       | Ok opened -> Ok opened
-       | Error error ->
-           List.iter
-             (Result.iter (fun link ->
-                  Quiver_core.Guarded.hold link (fun link ->
-                      Quiver_mysql.Link.close link)))
-             (control :: loaders);
-           Error error
+    (let%map control, loaders =
+       Result.map_error
+         (fun (#Load.cause as cause) -> Unreachable cause)
+         (Load.sessions config binlog ~count:sessions
+            ~control:(fun () ->
+              Quiver_core.Guarded.create (fun () ->
+                  (Load.session config binlog : (Quiver_mysql.Link.t, Load.cause) result)))
+            ~close:(fun control ->
+              Quiver_core.Guarded.hold control (fun link -> Quiver_mysql.Link.close link)))
      in
      let idle = Await.Await.Mpmc_queue.create () in
      List.iteri (fun index _ -> Await.Await.Mpmc_queue.push idle index) loaders;
@@ -268,7 +246,7 @@ let part t
           loader;
           job;
           renderer =
-            { scratch = t.scratch; lines = Quiver_sink.Csv.lines dialect table };
+            { scratch = t.scratch; lines = Quiver_sink.Csv.Dialect.lines dialect table };
           hash = Quiver_sink.Xxh3.create ();
           rows = 0;
           bytes = 0;
@@ -279,7 +257,7 @@ let renderer part = part.renderer
 let render (renderer : renderer) (batch : Quiver_core.Batch.sealed @ local) =
   let out = Quiver_core.Buffer_pool.take renderer.scratch in
   let rendered =
-    match Quiver_sink.Csv.add_lines renderer.lines batch (borrow_ out) with
+    match Quiver_sink.Csv.Dialect.write renderer.lines batch (borrow_ out) with
     | Ok () ->
         Ok
           {

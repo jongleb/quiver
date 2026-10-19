@@ -16,15 +16,13 @@ let path fd =
   | _ -> None
 
 let ceiling { rtt; send_buffer } =
-  match Core.Time_ns.Span.(rtt > zero) with
-  | true ->
-      Some (Float.of_int send_buffer /. Core.Time_ns.Span.to_sec rtt)
-  | false -> None
+  Base.Option.some_if (Core.Time_ns.Span.is_positive rtt)
+    (Float.of_int send_buffer /. Core.Time_ns.Span.to_sec rtt)
 
 module Class = struct
   type t = int
 
-  let of_int dscp = match dscp >= 0 && dscp < 64 with true -> Some dscp | false -> None
+  let of_int dscp = Base.Option.some_if (Base.Int.between dscp ~low:0 ~high:63) dscp
 end
 
 external mark : Unix.file_descr -> Class.t -> unit @@ portable = "quiver_tcp_mark"

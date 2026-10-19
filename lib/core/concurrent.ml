@@ -16,12 +16,10 @@ let join task = Await.Await.Ivar.read Blocking.await task
 
 let each (type (a : value mod contended portable)) count (work : int -> a) :
     a list =
-  List.map
-    (fun (index : int) ->
+  List.init count (fun (index : int) ->
       match start (fun () -> work index) with
       | Ok task -> `Started task
       | Error (`Concurrent _) -> `Done (work index))
-    (List.init count Fun.id)
   |> List.map (fun (step : [ `Started of a task | `Done of a ]) ->
          match step with `Started task -> join task | `Done value -> value)
 

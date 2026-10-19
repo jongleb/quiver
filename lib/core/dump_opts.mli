@@ -13,7 +13,7 @@ type t = private {
   batch_bytes : int;
 }
 (** How to run a dump: [threads] sessions read in parallel, [render_threads]
-    domains turn full batches into output, batches are shipped at [batch_bytes];
+    threads turn full batches into output, batches are shipped at [batch_bytes];
     all positive. *)
 
 val make :

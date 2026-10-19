@@ -28,21 +28,20 @@ let iter read f =
     else statements (from + 1)
   in
   let room from =
-    match pending.stop < Bytes.length pending.data with
-    | true -> from
-    | false ->
-        let kept = pending.stop - pending.start in
-        let target =
-          match pending.start with
-          | 0 -> Bytes.create (2 * Bytes.length pending.data)
-          | _ -> pending.data
-        in
-        let shift = pending.start in
-        Bytes.blit pending.data pending.start target 0 kept;
-        pending.data <- target;
-        pending.start <- 0;
-        pending.stop <- kept;
-        from - shift
+    if pending.stop < Bytes.length pending.data then from
+    else
+      let kept = pending.stop - pending.start in
+      let target =
+        match pending.start with
+        | 0 -> Bytes.create (2 * Bytes.length pending.data)
+        | _ -> pending.data
+      in
+      let shift = pending.start in
+      Bytes.blit pending.data pending.start target 0 kept;
+      pending.data <- target;
+      pending.start <- 0;
+      pending.stop <- kept;
+      from - shift
   in
   let rec next from =
     let from = room from in

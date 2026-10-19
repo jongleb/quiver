@@ -28,12 +28,10 @@ let of_chunk (chunk : Chunk.t) =
               let equal =
                 List.map
                   (fun pair -> compare pair Equal)
-                  (List.filteri (fun j _ -> j < i) pairs)
+                  (Base.List.take pairs i)
               in
-              let decisive =
-                compare pair
-                  (if i = List.length pairs - 1 then last else strict)
-              in
+              let kind = if i = List.length pairs - 1 then last else strict in
+              let decisive = compare pair kind in
               match equal with
               | [] -> decisive
               | first :: others -> All (first, others @ [ decisive ]))

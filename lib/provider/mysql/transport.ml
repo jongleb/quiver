@@ -34,8 +34,13 @@ let lost = "the connection closed without TLS close_notify"
 let connect ~timeout endpoint =
   Base.Portable_lazy.force Quiver_core.Blocking.sockets;
   let seconds = Core.Time_ns.Span.to_sec timeout in
+  let unreachable error =
+    Error (`Transport (Unreachable { endpoint; message = Unix.error_message error }))
+  in
   let attempt family address ~tune =
-    let fd = Unix.socket ~cloexec:true family SOCK_STREAM 0 in
+    match Unix.socket ~cloexec:true family SOCK_STREAM 0 with
+    | exception Unix.Unix_error (error, _, _) -> unreachable error
+    | fd -> (
     match
       Unix.set_nonblock fd;
       tune fd;
@@ -54,10 +59,8 @@ let connect ~timeout endpoint =
     with
     | () -> Ok { fd; timeout; channel = Plain; failure = None }
     | exception Unix.Unix_error (error, _, _) ->
-        Unix.close fd;
-        Error
-          (`Transport
-             (Unreachable { endpoint; message = Unix.error_message error }))
+        (try Unix.close fd with Unix.Unix_error _ -> ());
+        unreachable error)
   in
   match endpoint with
   | Socket path ->
@@ -153,11 +156,8 @@ let start_tls t ~host authority =
   in
   let%bind () =
     Result.map_error tls
-      (List.fold_left
-         (fun expected (expectation, name) ->
-           Result.bind expected (fun () ->
-               Quiver_openssl.Tls.expect session expectation name))
-         (Ok ()) expectations)
+      (Base.List.fold_result expectations ~init:() ~f:(fun () (expectation, name) ->
+           Quiver_openssl.Tls.expect session expectation name))
   in
   match Quiver_openssl.Tls.connect session with
   | Want_read | Want_write -> Error (`Transport (Timed_out t.timeout))
@@ -200,7 +200,9 @@ let set_timeout t timeout =
 let failure t = t.failure
 
 let close t =
-  (match t.channel with
-  | Plain -> ()
-  | Secure session -> ignore (Quiver_openssl.Tls.shutdown session));
-  Unix.close t.fd
+  let () =
+    match t.channel with
+    | Plain -> ()
+    | Secure session -> ignore (Quiver_openssl.Tls.shutdown session)
+  in
+  try Unix.close t.fd with Unix.Unix_error _ -> ()

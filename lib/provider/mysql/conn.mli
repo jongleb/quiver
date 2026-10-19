@@ -6,15 +6,15 @@ val connect :
   timeouts:Link.timeouts ->
   user:string ->
   password:string option ->
-  (t, [> `Client of Client_error.t ]) result @@ portable
+  (t, Client_error.t) result @@ portable
 
 val execute :
-  t -> Statement.t -> (unit, [> `Client of Client_error.t ]) result @@ portable
+  t -> Statement.t -> (unit, Client_error.t) result @@ portable
 
 val rows :
   t ->
   Query.t ->
-  (string option array list, [> `Client of Client_error.t ]) result
+  (string option array list, Client_error.t) result
   @@ portable
 
 val link : t -> Link.t @@ portable

@@ -60,7 +60,6 @@ type t =
 [@@deriving sexp_of ~portable]
 
 val sql : t -> string @@ portable
-val quote : Quiver_core.Ident.t -> string @@ portable
 
 val bytes : string -> string @@ portable
 (** A binary string literal: [X'…']. *)

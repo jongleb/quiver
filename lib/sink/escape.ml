@@ -13,16 +13,18 @@ let make replace =
   }
 
 let escape { flags; replacements } bytes ~off ~len out =
-  let start = ref off in
-  for i = off to off + len - 1 do
-    let code = Char.code (Bytes.unsafe_get bytes i) in
-    if String.unsafe_get flags code <> '\000' then (
-      Quiver_core.Byte_buffer.append_subbytes out bytes !start (i - !start);
-      Quiver_core.Byte_buffer.append_string out
-        (Iarray.unsafe_get replacements code);
-      start := i + 1)
-  done;
-  Quiver_core.Byte_buffer.append_subbytes out bytes !start (off + len - !start)
+  let stop = off + len in
+  let rec go i start =
+    if i = stop then Quiver_core.Byte_buffer.append_subbytes out bytes start (stop - start)
+    else
+      let code = Char.code (Bytes.unsafe_get bytes i) in
+      if String.unsafe_get flags code = '\000' then go (i + 1) start
+      else
+        let () = Quiver_core.Byte_buffer.append_subbytes out bytes start (i - start) in
+        let () = Quiver_core.Byte_buffer.append_string out (Iarray.unsafe_get replacements code) in
+        go (i + 1) (i + 1)
+  in
+  go off off [@nontail]
 
 let add t column row out =
   escape t

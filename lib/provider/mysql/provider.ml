@@ -15,11 +15,7 @@ type conn_config = {
 
 (** How the group of sessions is opened. *)
 type snapshot_mode = Ftwrl | Backup_stage | Trx_only
-[@@deriving
-  sexp_of ~portable,
-  yojson,
-  to_string ~capitalize:"kebab-case" ~portable,
-  enumerate]
+[@@deriving sexp_of ~portable, to_string ~capitalize:"kebab-case" ~portable, enumerate]
 
 type error =
   | Client of Client_error.t
@@ -106,8 +102,9 @@ type _ supports =
 
 open Base.Result.Let_syntax
 
-let client result =
-  Result.map_error (fun (`Client error) -> `Provider (Client error)) result
+let client_failure result = Result.map_error (fun error -> Client error) result
+let provider result = Result.map_error (fun error -> `Provider error) result
+let client result = provider (client_failure result)
 
 let unexpected query = Error (`Provider (Client (Unexpected_result query)))
 
@@ -150,15 +147,11 @@ let key_parser (ltype : Quiver_core.Ltype.t) =
   | Json | Geometry | Enum _ | Set _ ->
       None
 
-let client_error result =
-  Result.map_error (fun (`Client error) -> Client error) result
-
-let provider result = Result.map_error (fun error -> `Provider error) result
 let close { conn; _ } = Conn.close conn
 let hang_up session = Quiver_core.Guarded.hold session (fun session -> close session)
 
 type connections = {
-  config : conn_config;
+  zero_dates : zero_dates;
   server : Server.t;
   control : session Await.Capsule.Await.With_mutex.t;
       (** Takes the lock while the sessions open their snapshots. *)
@@ -172,16 +165,13 @@ let connect config ~n =
     Quiver_core.Guarded.create (fun () ->
         let { route; user; password; timeouts; _ } = config in
         let%bind conn =
-          client_error (Conn.connect route ~timeouts ~user ~password)
+          client_failure (Conn.connect route ~timeouts ~user ~password)
         in
-        match
-          client_error
-            (Conn.execute conn (Configure_session (Link.server (Conn.link conn))))
-        with
+        match Conn.execute conn (Configure_session (Link.server (Conn.link conn))) with
         | Ok () -> Ok { conn; database = None }
         | Error error ->
             Conn.close conn;
-            Error error)
+            Error (Client error))
   in
   match n with
   | n when n < 1 -> Error (`Provider (Non_positive_sessions n))
@@ -189,8 +179,7 @@ let connect config ~n =
       let sessions, control =
         Quiver_core.Concurrent.both
           (fun () ->
-            Quiver_core.Concurrent.spread ~workers:n (Iarray.init n Fun.id)
-              (fun (_ : int) -> opened ()))
+            Quiver_core.Concurrent.each n (fun (_ : int) -> opened ()))
           opened
       in
       match
@@ -206,7 +195,7 @@ let connect config ~n =
             (control :: sessions);
           Ok
             {
-              config;
+              zero_dates = config.zero_dates;
               server =
                 Quiver_core.Guarded.hold control (fun { conn; _ } ->
                     Link.server (Conn.link conn));
@@ -228,7 +217,7 @@ let fetch connections query =
   in
   let rows =
     Quiver_core.Guarded.hold held (fun { conn; _ } ->
-        Result.map (List.map Array.to_list) (client_error (Conn.rows conn query)))
+        Result.map (List.map Array.to_list) (client_failure (Conn.rows conn query)))
   in
   Await.Await.Mpmc_queue.push connections.idle held;
   rows
@@ -247,7 +236,6 @@ let supports : type lvl.
   | Trx_only, Snapshot -> Error (`Consistency (Unsupported (Any Snapshot)))
 
 let introspect connections (filter : Quiver_core.Filter.t) =
-  let config = connections.config in
   let tables, (columns, indexes) =
     Quiver_core.Concurrent.both
       (fun () -> fetch connections Tables)
@@ -311,16 +299,15 @@ let introspect connections (filter : Quiver_core.Filter.t) =
                     column_type)
             in
             let integer (signed : Quiver_core.Ltype.t) unsigned =
-              Ok (if List.mem "unsigned" words then unsigned else signed)
+              if Base.List.mem words "unsigned" ~equal:String.equal then Ok unsigned else Ok signed
             in
             let fsp () = Quiver_core.Ltype.Fsp.of_int (number fsp) in
             let%bind ltype, splitting =
               match String.lowercase_ascii data_type with
               | "bit" -> Ok (Quiver_core.Ltype.Uint64, `Unsplittable)
               | other ->
-                  Result.map
-                    (fun ltype -> (ltype, `Splittable))
-                    (match other with
+                  let%map ltype =
+                    match other with
                     | "tinyint" -> integer Int8 Uint8
                     | "smallint" -> integer Int16 Uint16
                     | "mediumint" | "int" -> integer Int32 Uint32
@@ -341,7 +328,7 @@ let introspect connections (filter : Quiver_core.Filter.t) =
                     | "mediumblob" | "longblob" ->
                         Ok Bytes
                     | "date" -> (
-                        match config.zero_dates with
+                        match connections.zero_dates with
                         | Reject -> Ok Date
                         | Keep -> Ok Unchecked_date)
                     | "time" ->
@@ -349,12 +336,12 @@ let introspect connections (filter : Quiver_core.Filter.t) =
                         Quiver_core.Ltype.Time fsp
                     | "datetime" -> (
                         let%map fsp = fsp () in
-                        match config.zero_dates with
+                        match connections.zero_dates with
                         | Keep -> Quiver_core.Ltype.Unchecked_datetime fsp
                         | Reject -> Quiver_core.Ltype.Datetime fsp)
                     | "timestamp" -> (
                         let%map fsp = fsp () in
-                        match config.zero_dates with
+                        match connections.zero_dates with
                         | Keep -> Quiver_core.Ltype.Unchecked_datetime fsp
                         | Reject -> Quiver_core.Ltype.Timestamp fsp)
                     | "year" -> Ok Year
@@ -372,26 +359,24 @@ let introspect connections (filter : Quiver_core.Filter.t) =
                     | _ ->
                         Error
                           (`Provider
-                             (Unknown_type { table; column; column_type })))
+                             (Unknown_type { table; column; column_type }))
+                  in
+                  (ltype, `Splittable)
             in
-            match
-              List.mem "GENERATED"
+            let generated =
+              Base.List.mem
                 (String.split_on_char ' ' (Option.value ~default:"" extra))
-            with
-            | true -> Ok fields
-            | false ->
-                Ok
-                  (( table,
-                     ( {
-                         Quiver_core.Schema.Field.name = column;
-                         ltype;
-                         nullability =
-                           (match nullable with
-                           | "YES" -> Nullable
-                           | _ -> Not_null);
-                       },
-                       splitting ) )
-                  :: fields))
+                "GENERATED" ~equal:String.equal
+            in
+            if generated then Ok fields
+            else
+              let nullability : Quiver_core.Schema.Field.nullability =
+                match nullable with "YES" -> Nullable | _ -> Not_null
+              in
+              Ok
+                (( table,
+                   ({ Quiver_core.Schema.Field.name = column; ltype; nullability }, splitting) )
+                :: fields))
         | _ -> unexpected Columns)
   in
   let fields_by_table =
@@ -498,8 +483,7 @@ let introspect connections (filter : Quiver_core.Filter.t) =
            in
            let usable columns =
              List.for_all
-               (Option.fold ~none:false ~some:(fun column ->
-                    Idents.mem column keyable))
+               (Base.Option.exists ~f:(fun column -> Idents.mem column keyable))
                columns
            in
            let candidates =
@@ -510,7 +494,7 @@ let introspect connections (filter : Quiver_core.Filter.t) =
                      let columns = List.map snd group in
                      match columns with
                      | Some first :: rest when usable columns ->
-                         Some (index, (first, List.filter_map Fun.id rest))
+                         Some (index, (first, Base.List.filter_opt rest))
                      | _ -> None)
                  | [] -> None)
                (Base.List.group
@@ -524,7 +508,7 @@ let introspect connections (filter : Quiver_core.Filter.t) =
                  (Option.fold ~none:Quiver_core.Schema.Table.No_key
                     ~some:(fun (index, fields) ->
                       Quiver_core.Schema.Table.Unique { index; fields })
-                    (List.nth_opt candidates 0))
+                    (Base.List.hd candidates))
                (let open Base.Option.Let_syntax in
                 let%map fields =
                   List.find_map
@@ -587,20 +571,16 @@ let plan connections (schema : Quiver_core.Schema.t)
                    ((table.estimate.bytes + chunk_bytes - 1) / chunk_bytes)
                in
                let value (field : Quiver_core.Schema.Field.t) text =
-                 Option.to_result
-                   ~none:
-                     (`Provider
-                        (match field.ltype with
-                        | Date | Datetime _ | Timestamp _ ->
-                            Invalid_date
-                              { table = table.name; column = field.name }
-                        | Bool | Int8 | Int16 | Int32 | Int64 | Uint8 | Uint16
-                        | Uint32 | Uint64 | Float32 | Float64 | Decimal _
-                        | String | Bytes | Year | Unchecked_date
-                        | Unchecked_datetime _ | Time _ | Json | Geometry
-                        | Enum _ | Set _ ->
-                            Unparsable_key
-                              { table = table.name; column = field.name; text }))
+                 let unparsable =
+                   match field.ltype with
+                   | Date | Datetime _ | Timestamp _ ->
+                       Invalid_date { table = table.name; column = field.name }
+                   | Bool | Int8 | Int16 | Int32 | Int64 | Uint8 | Uint16 | Uint32 | Uint64
+                   | Float32 | Float64 | Decimal _ | String | Bytes | Year | Unchecked_date
+                   | Unchecked_datetime _ | Time _ | Json | Geometry | Enum _ | Set _ ->
+                       Unparsable_key { table = table.name; column = field.name; text }
+                 in
+                 Option.to_result ~none:(`Provider unparsable)
                    (Option.bind (key_parser field.ltype) (fun parse -> parse text))
                in
                let tuple fields query row =
@@ -754,7 +734,7 @@ let plan connections (schema : Quiver_core.Schema.t)
                                  Base.List.remove_consecutive_duplicates
                                    ~equal:
                                      (List.equal Quiver_core.Key.equal_value)
-                                   (List.filter_map Fun.id found)
+                                   (Base.List.filter_opt found)
                                with
                                | [] -> whole
                                | candidate :: others ->
@@ -788,7 +768,7 @@ let snapshot (type lvl) (supports : lvl supports) connections =
   let execute statement =
     provider
       (Quiver_core.Guarded.hold control (fun { conn; _ } ->
-           client_error (Conn.execute conn statement)))
+           client_failure (Conn.execute conn statement)))
   in
   let read_position () =
     let%bind status, gtids =
@@ -796,7 +776,7 @@ let snapshot (type lvl) (supports : lvl supports) connections =
         (Quiver_core.Guarded.hold control (fun { conn; _ } ->
              let rows query =
                Result.map (List.map Array.to_list)
-                 (client_error (Conn.rows conn query))
+                 (client_failure (Conn.rows conn query))
              in
              let%bind status = rows (Binlog_status server) in
              let%map gtids = rows (Gtid_executed server) in
@@ -826,7 +806,7 @@ let snapshot (type lvl) (supports : lvl supports) connections =
       (Quiver_core.Concurrent.spread ~workers:(Iarray.length sessions) sessions
          (fun session ->
            Quiver_core.Guarded.hold session (fun { conn; _ } ->
-               client_error (Conn.execute conn Start_consistent_snapshot))))
+               client_failure (Conn.execute conn Start_consistent_snapshot))))
   in
   let opened =
     let%bind lock =
@@ -887,7 +867,7 @@ let objects { conn; _ } database =
     Base.Result.all
       (List.map
          (fun row ->
-           Option.fold ~none:(unexpected query) ~some:Fun.id (decode row))
+           Option.value ~default:(unexpected query) (decode row))
          rows)
   in
   let%bind columns =
@@ -1008,14 +988,14 @@ let read_chunk { conn; _ } (chunk : Quiver_core.Chunk.t) writer =
   let first, rest = table.fields in
   let fields = Array.of_list (first :: rest) in
   let query = Query.Chunk chunk in
-  let fetch = function
+  let failed = function
     | (`Link _ | `Wire _ | `Transport _) as failure ->
         `Provider (Client (Client_error.of_failure (Fetch query) failure))
     | `Written error -> error
     | (`Provider _ | `Column _) as other -> other
   in
   let%bind rows =
-    Result.map_error fetch (Rows.open_ (Conn.link conn) (Query.sql query))
+    Result.map_error failed (Rows.open_ (Conn.link conn) (Query.sql query))
   in
   let result =
     let changed = Error (`Provider (Schema_changed table.name)) in
@@ -1095,14 +1075,14 @@ let read_chunk { conn; _ } (chunk : Quiver_core.Chunk.t) writer =
         | Error _ as error -> error
     in
     Quiver_core.Batch_writer.fill writer (fun columns ->
-        Result.map_error fetch
+        Result.map_error failed
           (Rows.next rows ~row:(fun reader ~bitmap ->
                cells reader bitmap columns 0)))
   in
   match (result, Rows.close rows) with
   | Ok (), Ok () -> Ok ()
   | Error error, _ -> Error error
-  | Ok (), Error error -> Error (fetch error)
+  | Ok (), Error error -> Error (failed error)
 
 let source position =
   "[source]\n\
@@ -1113,14 +1093,14 @@ let source position =
   | Locked { lock; binlog; lock_held } ->
       Option.fold ~none:""
         ~some:(fun { file = { base; index }; offset; gtid } ->
+          let variable =
+            match gtid with Gtid.Mysql _ -> "executed_gtid_set" | Gtid.Mariadb _ -> "gtid_slave_pos"
+          in
           Printf.sprintf
             "# %s = \"%s\"\n\
              # SOURCE_LOG_FILE = \"%s.%06d\"\n\
              # SOURCE_LOG_POS = %Ld\n"
-            (match gtid with
-            | Gtid.Mysql _ -> "executed_gtid_set"
-            | Gtid.Mariadb _ -> "gtid_slave_pos")
-            (Gtid.to_string gtid) base index offset)
+            variable (Gtid.to_string gtid) base index offset)
         binlog
       ^ Format.asprintf "# quiver: %s held for %a\n"
           (Sexplib0.Sexp.to_string (sexp_of_lock lock))

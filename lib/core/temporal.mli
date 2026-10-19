@@ -20,9 +20,6 @@ val[@zero_alloc] datetime :
   (unit, [> `Unrepresentable_date ]) result @@ portable
 
 val[@zero_alloc] time : Byte_buffer.t @ local -> Ltype.Fsp.t -> micros:int64# -> unit @@ portable
-val micros_per_second : int @@ portable
-val micros_per_day : int @@ portable
-val max_year : int @@ portable
 val max_packed_date : int @@ portable
 val[@zero_alloc] pack_date : year:int -> month:int -> day:int -> int @@ portable
 val[@zero_alloc] pack_datetime :

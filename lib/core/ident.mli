@@ -6,6 +6,7 @@ type t = private string [@@deriving sexp_of ~portable, equal ~portable, compare 
     Provider-specific limits are checked by the provider. *)
 
 val of_string : string -> (t, [> `Ident of error ]) result @@ portable
+val backquoted : t -> string @@ portable
 val yojson_of_t : t -> Yojson.Safe.t
 val t_of_yojson : Yojson.Safe.t -> t
 val t_of_sexp : Sexplib0.Sexp.t -> t @@ portable

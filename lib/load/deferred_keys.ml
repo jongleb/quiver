@@ -59,20 +59,17 @@ let split table statement =
           let auto =
             List.find_map
               (fun line ->
-                match
-                  ( Base.String.is_prefix line ~prefix:"  `",
-                    Base.String.is_substring line ~substring:" AUTO_INCREMENT"
-                  )
-                with
-                | true, true -> identifier line 2
-                | (true | false), _ -> None)
+                if
+                  Base.String.is_prefix line ~prefix:"  `"
+                  && Base.String.is_substring line ~substring:" AUTO_INCREMENT"
+                then identifier line 2
+                else None)
               lines
           and primary =
             List.find_map
               (fun line ->
-                match Base.String.is_prefix line ~prefix:"  PRIMARY KEY " with
-                | true -> first_column line
-                | false -> None)
+                if Base.String.is_prefix line ~prefix:"  PRIMARY KEY " then first_column line
+                else None)
               lines
           in
           let needed =
@@ -92,16 +89,17 @@ let split table statement =
           let definitions =
             List.mapi
               (fun index line ->
-                ( (match needed with
+                let kind =
+                  match needed with
                   | Some kept when kept = index -> Kept
-                  | Some _ | None -> classify line),
-                  String.trim line ))
+                  | Some _ | None -> classify line
+                in
+                (kind, String.trim line))
               lines
           in
           let of_kind wanted =
             List.filter_map
-              (fun (kind, line) ->
-                match kind = wanted with true -> Some line | false -> None)
+              (fun (kind, line) -> if kind = wanted then Some line else None)
               definitions
           in
           match of_kind Kept with
@@ -109,7 +107,7 @@ let split table statement =
           | kept ->
               let alter additions =
                 "ALTER TABLE "
-                ^ Quiver_mysql.Query.quote table
+                ^ Quiver_core.Ident.backquoted table
                 ^ " "
                 ^ String.concat ", "
                     (List.map (fun added -> "ADD " ^ added) additions)

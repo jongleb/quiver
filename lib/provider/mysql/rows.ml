@@ -87,8 +87,8 @@ let open_ link sql =
               | 0 -> Signed
               | _ -> Unsigned
             in
-            Ok
-              (match field_type with
+            let kind =
+              match field_type with
               | `Tiny -> Integer { width = W1; sign }
               | `Short | `Year -> Integer { width = W2; sign }
               | `Long | `Int24 -> Integer { width = W4; sign }
@@ -99,7 +99,9 @@ let open_ link sql =
               | `Timestamp | `Datetime -> Datetime
               | `Time -> Time
               | `Bit -> Bits
-              | `Length_encoded -> Text))
+              | `Length_encoded -> Text
+            in
+            Ok kind)
       in
       definitions (count - 1) (kind :: kinds)
   in
@@ -181,15 +183,17 @@ let[@inline] [@zero_alloc] presence reader ~bitmap j :
   else Null
 
 let[@inline] [@zero_alloc] add_integer reader width sign column =
-  Quiver_core.Column.add column
-    (match (width, sign) with
+  let value =
+    match (width, sign) with
     | W1, Signed -> (Wire.Cursor.uint8 reader lxor 0x80) - 0x80
     | W1, Unsigned -> Wire.Cursor.uint8 reader
     | W2, Signed -> (Wire.Cursor.uint16 reader lxor 0x8000) - 0x8000
     | W2, Unsigned -> Wire.Cursor.uint16 reader
     | W4, Signed -> (Wire.Cursor.uint32 reader lxor 0x8000_0000) - 0x8000_0000
     | W4, Unsigned -> Wire.Cursor.uint32 reader
-    | W8, (Signed | Unsigned) -> Int64.to_int (Int64_u.to_int64 (Wire.Cursor.int64 reader)))
+    | W8, (Signed | Unsigned) -> Int64.to_int (Int64_u.to_int64 (Wire.Cursor.int64 reader))
+  in
+  Quiver_core.Column.add column value
 
 let[@inline] [@zero_alloc] add_int64 reader column =
   Quiver_core.Column.add_int64 column (Wire.Cursor.int64 reader)
@@ -241,7 +245,7 @@ let[@inline] [@zero_alloc] clock reader length =
     let minutes = Wire.Cursor.uint8 reader in
     let seconds = Wire.Cursor.uint8 reader in
     ((((hours * 60) + minutes) * 60) + seconds)
-    * Quiver_core.Temporal.micros_per_second
+    * Quiver_core.Moment.micros_per_second
     + if length = with_micros_bytes then Wire.Cursor.uint32 reader else 0
 
 let[@zero_alloc] add_datetime reader column =
@@ -255,7 +259,7 @@ let[@zero_alloc] add_datetime reader column =
       | This days ->
           Quiver_core.Column.add_int64 column
             (Int64_u.of_int
-               ((days * Quiver_core.Temporal.micros_per_day) + clock)))
+               ((days * Quiver_core.Moment.micros_per_day) + clock)))
 
 let[@zero_alloc] add_unchecked_date reader column =
   match Wire.Cursor.uint8 reader with
@@ -279,9 +283,9 @@ let[@zero_alloc] add_unchecked_datetime reader column =
       let day = Wire.Cursor.uint8 reader in
       let micros = clock reader length in
       if
-        year <= Quiver_core.Temporal.max_year
+        year <= Quiver_core.Moment.max_year
         && month <= 12 && day <= 31
-        && micros < Quiver_core.Temporal.micros_per_day
+        && micros < Quiver_core.Moment.micros_per_day
       then
         Quiver_core.Column.add_int64 column
           (Quiver_core.Temporal.pack_datetime ~year ~month ~day ~micros)
@@ -295,11 +299,11 @@ let[@zero_alloc] add_time reader column =
       let days = Wire.Cursor.uint32 reader in
       let sign_byte = 1 in
       let magnitude =
-        (days * Quiver_core.Temporal.micros_per_day)
+        (days * Quiver_core.Moment.micros_per_day)
         + clock reader (length - sign_byte)
       in
-      Quiver_core.Column.add_int64 column
-        (Int64_u.of_int (match negative with 0 -> magnitude | _ -> -magnitude))
+      let micros = if negative <> 0 then -magnitude else magnitude in
+      Quiver_core.Column.add_int64 column (Int64_u.of_int micros)
 
 let[@inline] [@zero_alloc] add_text reader column =
   let length = Wire.Cursor.lenenc_int reader in

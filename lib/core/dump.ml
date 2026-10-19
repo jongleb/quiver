@@ -21,9 +21,6 @@ module Make (P : Provider_intf.S) (S : Sink_intf.S) = struct
       }
     | Stop
 
-  (** Who closes the sessions: still the caller, or their readers. *)
-  type sessions = Held | Given
-
   let close session = Guarded.hold session (fun session -> P.close session)
 
   type 'lvl request = {
@@ -77,7 +74,6 @@ module Make (P : Provider_intf.S) (S : Sink_intf.S) = struct
           Error error
     in
     let%bind sessions, position = P.snapshot supports connections in
-    let held = ref Held in
     let dump () =
       let databases =
         Iarray.of_list
@@ -87,10 +83,10 @@ module Make (P : Provider_intf.S) (S : Sink_intf.S) = struct
                 schema.tables))
       and tables = Iarray.of_list schema.tables
       and chunks = Array.of_list chunks in
-      let database_index = Hashtbl.create 16
+      let database_index = Base.Hashtbl.create (module Ident)
       and table_index = Base.Hashtbl.create (module Schema.Name) in
       Iarray.iteri
-        (fun index database -> Hashtbl.replace database_index database index)
+        (fun index database -> Base.Hashtbl.set database_index ~key:database ~data:index)
         databases;
       Iarray.iteri
         (fun index { Schema.Table.name; _ } ->
@@ -114,7 +110,7 @@ module Make (P : Provider_intf.S) (S : Sink_intf.S) = struct
       let table_databases =
         Iarray.map
           (fun { Schema.Table.name = { database; _ }; _ } ->
-            Hashtbl.find database_index database)
+            Base.Hashtbl.find_exn database_index database)
           tables
       in
       let order =
@@ -130,14 +126,13 @@ module Make (P : Provider_intf.S) (S : Sink_intf.S) = struct
         order
       in
       let items =
-        let seen_databases = Hashtbl.create 16
-        and seen_tables = Hashtbl.create 64 in
+        let seen_databases = Base.Hash_set.create (module Base.Int)
+        and seen_tables = Base.Hash_set.create (module Base.Int) in
         let first seen key work =
-          match Hashtbl.find_opt seen key with
-          | Some () -> []
-          | None ->
-              Hashtbl.replace seen key ();
-              [ work ]
+          if Base.Hash_set.mem seen key then []
+          else
+            let () = Base.Hash_set.add seen key in
+            [ work ]
         in
         Iarray.of_list
           (List.concat_map
@@ -182,9 +177,7 @@ module Make (P : Provider_intf.S) (S : Sink_intf.S) = struct
             found = Portable.Atomic_array.create ~len:0 None;
           }
       in
-      (match Iarray.length databases with
-      | 0 -> nothing_catalogued ()
-      | _ -> ());
+      if Iarray.length databases = 0 then nothing_catalogued ();
       let (fail @ portable) error =
         ignore
           (Portable.Atomic.compare_and_set failure ~if_phys_equal_to:None
@@ -217,12 +210,14 @@ module Make (P : Provider_intf.S) (S : Sink_intf.S) = struct
           Batch_pool.create ~batches:batches_per_reader
         in
         let announce announcement (result : (unit, error) result) =
-          Await.Await.Ivar.fill_if_empty announcement
-            (match result with
+          let state =
+            match result with
             | Ok () -> Announced
             | Error error ->
                 fail error;
-                Withheld)
+                Withheld
+          in
+          Await.Await.Ivar.fill_if_empty announcement state
         in
         let announced announcement =
           Await.Await.Ivar.read Blocking.await announcement
@@ -303,20 +298,22 @@ module Make (P : Provider_intf.S) (S : Sink_intf.S) = struct
         in
         let catalog database =
           let name = Iarray.get databases database in
-          (match announced (Iarray.get database_announcements database) with
-          | Withheld -> ()
-          | Announced -> (
-              match
-                Guarded.hold session (fun session ->
-                    (P.objects session name
-                      : ((Ident.t * Definition.kind) list, error) result))
-              with
-              | Error error -> fail error
-              | Ok [] -> objects database []
-              | Ok entries ->
-                  Portable.Atomic.set (Iarray.get remaining database)
-                    (List.length entries);
-                  Portable.Atomic_array.set catalogs database entries));
+          let () =
+            match announced (Iarray.get database_announcements database) with
+            | Withheld -> ()
+            | Announced -> (
+                match
+                  Guarded.hold session (fun session ->
+                      (P.objects session name
+                        : ((Ident.t * Definition.kind) list, error) result))
+                with
+                | Error error -> fail error
+                | Ok [] -> objects database []
+                | Ok entries ->
+                    Portable.Atomic.set (Iarray.get remaining database)
+                      (List.length entries);
+                    Portable.Atomic_array.set catalogs database entries)
+          in
           match Portable.Atomic.fetch_and_add catalogs_left (-1) with
           | 1 ->
               let entries =
@@ -414,7 +411,6 @@ module Make (P : Provider_intf.S) (S : Sink_intf.S) = struct
       let renderers =
         List.init opts.render_threads (fun _ -> Concurrent.start render)
       in
-      held := Given;
       let readers =
         Array.to_list
           (Array.mapi
@@ -468,7 +464,5 @@ module Make (P : Provider_intf.S) (S : Sink_intf.S) = struct
           in
           manifest
     in
-    let result = dump () in
-    (match !held with Held -> Array.iter close sessions | Given -> ());
-    result
+    dump ()
 end

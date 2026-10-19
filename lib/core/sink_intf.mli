@@ -2,7 +2,7 @@
 
 (** What an output format implements. A part is the output of one chunk, the
     [index]-th of its table. [render] turns one batch into a self-contained
-    piece of output and may run on any domain, concurrently for the same part;
+    piece of output and may run on any thread, concurrently for the same part;
     it must not keep the batch. [append] receives a part's rendered batches in
     batch order, one at a time; a rendered batch has one owner, so its buffers
     go back to their pool only after [append]. A part ends with [close] once its chunk is read

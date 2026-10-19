@@ -1,5 +1,5 @@
 (** A lock-free stack of values with one owner each: [put] gives a value up,
-    [take] hands it to exactly one taker, on any domain. *)
+    [take] hands it to exactly one taker, on any thread. *)
 
 type 'a t : value mod contended portable
 

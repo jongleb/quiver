@@ -20,11 +20,7 @@ type conn_config = {
     only, blocks commits but not writes) give one point in time; [Trx_only]
     takes no lock and gives each session its own snapshot. *)
 type snapshot_mode = Ftwrl | Backup_stage | Trx_only
-[@@deriving
-  sexp_of ~portable,
-  yojson,
-  to_string ~portable,
-  enumerate ~portable]
+[@@deriving sexp_of ~portable, to_string ~portable, enumerate ~portable]
 
 type error =
   | Client of Client_error.t
@@ -55,15 +51,15 @@ type error =
     }  (** A key value that cannot bound a chunk, such as a zero date. *)
 [@@deriving sexp_of ~portable]
 
-type binlog_file = { base : string; index : int } [@@deriving sexp_of ~portable, yojson]
+type binlog_file = { base : string; index : int } [@@deriving sexp_of ~portable]
 (** A binlog file name, [base.index]. *)
 
 type binlog = { file : binlog_file; offset : int64; gtid : Gtid.t }
-[@@deriving sexp_of ~portable, yojson]
+[@@deriving sexp_of ~portable]
 
 (** What held the server still while the sessions opened their snapshots. *)
 type lock = Global_read_lock | Backup_stage_block_commit
-[@@deriving sexp_of ~portable, yojson]
+[@@deriving sexp_of ~portable]
 
 (** Where the sessions' common snapshot sits. *)
 type position =

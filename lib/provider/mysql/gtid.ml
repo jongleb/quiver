@@ -2,15 +2,15 @@ type error = Malformed of string | Tag_unsupported of Server.t
 [@@deriving sexp_of ~portable]
 
 module Uuid = struct
-  type t = string [@@deriving sexp_of ~portable, equal ~portable, compare ~portable]
+  type t = string [@@deriving sexp_of ~portable]
 end
 
 module Tag = struct
-  type t = string [@@deriving sexp_of ~portable, equal ~portable, compare ~portable]
+  type t = string [@@deriving sexp_of ~portable]
 end
 
 module Interval = struct
-  type t = { first : int64; last : int64 } [@@deriving sexp_of ~portable, equal ~portable]
+  type t = { first : int64; last : int64 } [@@deriving sexp_of ~portable]
 end
 
 type mysql_set = {
@@ -18,13 +18,13 @@ type mysql_set = {
   tag : Tag.t option;
   intervals : Interval.t list;
 }
-[@@deriving sexp_of ~portable, equal ~portable]
+[@@deriving sexp_of ~portable]
 
 type mariadb_position = { domain : int; server : int; sequence : int64 }
-[@@deriving sexp_of ~portable, equal ~portable]
+[@@deriving sexp_of ~portable]
 
 type t = Mysql of mysql_set list | Mariadb of mariadb_position list
-[@@deriving sexp_of ~portable, equal ~portable]
+[@@deriving sexp_of ~portable]
 
 let digits = Angstrom.take_while1 (function '0' .. '9' -> true | _ -> false)
 

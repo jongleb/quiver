@@ -26,8 +26,8 @@ type t =
 let pp out = function
   | Whole { name; _ } -> Format.fprintf out "%a, whole" Schema.Name.pp name
   | Range { table = { name; _ }; key = first, rest; range } ->
-      Format.fprintf out "%a, %s %a" Schema.Name.pp name
-        (match rest with
+      let key =
+        match rest with
         | [] -> (first.name :> string)
         | _ ->
             "("
@@ -35,8 +35,9 @@ let pp out = function
                 (List.map
                    (fun ({ name; _ } : Schema.Field.t) -> (name :> string))
                    (first :: rest))
-            ^ ")")
-        Range.pp range
+            ^ ")"
+      in
+      Format.fprintf out "%a, %s %a" Schema.Name.pp name key Range.pp range
 
 let sexp_of_t chunk = Sexplib0.Sexp.Atom (Format.asprintf "%a" pp chunk)
 let table = function Whole table | Range { table; _ } -> table

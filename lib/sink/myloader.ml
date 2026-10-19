@@ -8,16 +8,13 @@ type state =
   | Block_comment
 
 let escapes sql_mode =
-  Option.fold ~none:Backslash_escapes
-    ~some:(fun mode ->
-      match
-        List.find_opt
+  Option.fold sql_mode ~none:Backslash_escapes ~some:(fun mode ->
+      if
+        List.exists
           (String.equal "NO_BACKSLASH_ESCAPES")
           (String.split_on_char ',' (String.uppercase_ascii mode))
-      with
-      | Some _ -> No_backslash_escapes
-      | None -> Backslash_escapes)
-    sql_mode
+      then No_backslash_escapes
+      else Backslash_escapes)
 
 let statement escapes text =
   let out = Buffer.create (String.length text + 16)
@@ -25,8 +22,7 @@ let statement escapes text =
   let at i = if i < length then Some text.[i] else None in
   let rec go i state =
     match (at i, state) with
-    | None, (Code | Line_comment | Block_comment) -> Some (Buffer.contents out)
-    | None, Quoted _ -> Some (Buffer.contents out)
+    | None, _ -> Some (Buffer.contents out)
     | Some ';', (Code | Line_comment | Block_comment)
       when at (i + 1) = Some '\n' ->
         Buffer.add_string out "; ";
@@ -57,7 +53,8 @@ let statement escapes text =
         | _ -> go (i + 1) state)
     | Some c, Line_comment ->
         Buffer.add_char out c;
-        go (i + 1) (match c with '\n' -> Code | _ -> Line_comment)
+        let next = if Char.equal c '\n' then Code else Line_comment in
+        go (i + 1) next
     | Some c, Block_comment -> (
         Buffer.add_char out c;
         match (c, at (i + 1)) with

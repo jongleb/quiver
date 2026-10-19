@@ -14,23 +14,11 @@ module Fsp = struct
     else Ok n
 
   let t_of_sexp sexp =
-    match of_int (int_of_sexp sexp) with
-    | Ok fsp -> fsp
-    | Error (`Ltype error) ->
-        Sexplib0.Sexp_conv.of_sexp_error
-          (Sexplib0.Sexp.to_string (sexp_of_error error))
-          sexp
+    Codec.checked_of_sexp (fun (`Ltype e) -> sexp_of_error e) (of_int (int_of_sexp sexp)) sexp
 
-  let t_of_yojson json =
-    match json with
-    | `Int n -> (
-        match of_int n with
-        | Ok fsp -> fsp
-        | Error (`Ltype error) ->
-            Ppx_yojson_conv_lib.Yojson_conv.of_yojson_error
-              (Sexplib0.Sexp.to_string (sexp_of_error error))
-              json)
-    | _ -> Ppx_yojson_conv_lib.Yojson_conv.of_yojson_error "Ltype.Fsp" json
+  let t_of_yojson = function
+    | `Int n as json -> Codec.checked_of_yojson (fun (`Ltype e) -> sexp_of_error e) (of_int n) json
+    | json -> Ppx_yojson_conv_lib.Yojson_conv.of_yojson_error "Ltype.Fsp" json
 end
 
 module Decimal = struct
@@ -44,21 +32,11 @@ module Decimal = struct
 
   let t_of_sexp sexp =
     let { precision; scale } = t_of_sexp sexp in
-    match make ~precision ~scale with
-    | Ok decimal -> decimal
-    | Error (`Ltype error) ->
-        Sexplib0.Sexp_conv.of_sexp_error
-          (Sexplib0.Sexp.to_string (sexp_of_error error))
-          sexp
+    Codec.checked_of_sexp (fun (`Ltype e) -> sexp_of_error e) (make ~precision ~scale) sexp
 
   let t_of_yojson json =
     let { precision; scale } = t_of_yojson json in
-    match make ~precision ~scale with
-    | Ok decimal -> decimal
-    | Error (`Ltype error) ->
-        Ppx_yojson_conv_lib.Yojson_conv.of_yojson_error
-          (Sexplib0.Sexp.to_string (sexp_of_error error))
-          json
+    Codec.checked_of_yojson (fun (`Ltype e) -> sexp_of_error e) (make ~precision ~scale) json
 end
 
 type t =

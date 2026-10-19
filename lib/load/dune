@@ -5,11 +5,7 @@
   stdlib_stable
   base
   stdio
-  angstrom
-  hex_encode
   sexplib0
-  ppx_compare.runtime-lib
-  ppx_yojson_conv_lib
   file_path
   yojson
   quiver.core
@@ -19,14 +15,6 @@
   portable
   portable_lockfree_htbl)
  (preprocess
-  (pps ppx_sexp_conv ppx_compare ppx_yojson_conv ppx_let ppx_enumerate ppx_string_conv))
+  (pps ppx_sexp_conv ppx_let ppx_enumerate ppx_string_conv))
  (flags
-  (:standard
-   -open
-   Stdlib_stable
-   -open
-   Sexplib0.Sexp_conv
-   -open
-   Ppx_compare_lib.Builtin
-   -open
-   Ppx_yojson_conv_lib.Yojson_conv.Primitives)))
+  (:standard -open Stdlib_stable -open Sexplib0.Sexp_conv)))

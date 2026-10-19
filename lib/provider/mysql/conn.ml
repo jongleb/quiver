@@ -1,6 +1,6 @@
 type t = { link : Link.t }
 
-let failure request error = `Client (Client_error.of_failure request error)
+let failure request error = Client_error.of_failure request error
 
 let connect route ~timeouts ~user ~password =
   match
@@ -12,10 +12,10 @@ let connect route ~timeouts ~user ~password =
 let execute t statement =
   Result.map_error
     (failure (Statement statement))
-    (Link.execute t.link (Statement.sql statement))
+    (Link.run_statement t.link statement)
 
 let rows t query =
-  Result.map_error (failure (Query query)) (Link.query t.link (Query.sql query))
+  Result.map_error (failure (Query query)) (Link.run_query t.link query)
 
 let link t = t.link
 let close t = Link.close t.link

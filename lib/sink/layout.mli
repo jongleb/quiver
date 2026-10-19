@@ -7,7 +7,6 @@ val create :
 
 val compression : t -> Compression.t @@ portable
 val buffers : t -> Quiver_core.Buffer_pool.t @@ portable
-val quote : Quiver_core.Ident.t -> string @@ portable
 val file_name : Quiver_core.Ident.t -> string @@ portable
 val header : string @@ portable
 

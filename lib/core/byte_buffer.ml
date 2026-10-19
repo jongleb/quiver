@@ -29,8 +29,10 @@ let append_subbytes t bytes off len =
   Bytes.blit bytes off t.bs t.len len;
   t.len <- t.len + len
 
-let[@inline] append_bytes t bytes =
-  append_subbytes t bytes 0 (Bytes.length bytes)
+let[@inline] add_int32_le t n =
+  ensure_free t 4;
+  Bytes.set_int32_le t.bs t.len (Int32.of_int n);
+  t.len <- t.len + 4
 
 let[@inline] append_string t text =
   append_subbytes t (Bytes.unsafe_of_string text) 0 (String.length text)
@@ -38,4 +40,3 @@ let[@inline] append_string t text =
 let[@inline] append_buffer t source = append_subbytes t source.bs 0 source.len
 
 let[@inline] contents t = Bytes.sub_string t.bs 0 t.len
-let[@inline] to_bytes t = Bytes.sub t.bs 0 t.len

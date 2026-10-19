@@ -1,7 +1,5 @@
 @@ portable
 
-(** An object whose native DDL a provider can show. *)
-
 (** What a DBMS provider implements. It enters the core as a module argument;
     the core never sees concrete positions or sessions. *)
 module type S = sig

@@ -70,12 +70,12 @@ let yojson_of_carrying
         `List
           (List.map
              (fun (encoding, frames) ->
-               `Assoc
-                 ((match encoding with
-                  | Plain -> [ ("encoding", `String "plain") ]
-                  | Zstd level ->
-                      [ ("encoding", `String "zstd"); ("level", `Int level) ])
-                 @ [ ("frames", `Int frames) ]))
+               let codec =
+                 match encoding with
+                 | Plain -> [ ("encoding", `String "plain") ]
+                 | Zstd level -> [ ("encoding", `String "zstd"); ("level", `Int level) ]
+               in
+               `Assoc (codec @ [ ("frames", `Int frames) ]))
              encodings) );
       ("streams", `Int streams);
       ( "round_trip_ns",
@@ -207,14 +207,12 @@ let read json =
       in
       { format; parts }
 
+let replace key value fields =
+  List.map (fun (k, v) -> if String.equal k key then (k, value) else (k, v)) fields
+
 let rewriting json ~format change =
   let malformed what = Error (`Manifest (Malformed what)) in
   let counts = Hashtbl.create 16 in
-  let replace key value fields =
-    List.map
-      (fun (k, v) -> if String.equal k key then (k, value) else (k, v))
-      fields
-  in
   let entry = function
     | `Assoc fields -> (
         match
@@ -254,16 +252,9 @@ let rewriting json ~format change =
 
 let localize json ~format part =
   rewriting json ~format:(Some format) (fun table index done_ ->
-      match part table index with
-      | None -> Error (`Manifest (Unfinished table))
-      | Some part ->
-          Ok
-            (List.map
-               (fun (key, value) ->
-                 match key with
-                 | "part" -> (key, yojson_of_part part)
-                 | _ -> (key, value))
-               done_))
+      Result.map
+        (fun part -> replace "part" (yojson_of_part part) done_)
+        (Base.Result.of_option (part table index) ~error:(`Manifest (Unfinished table))))
 
 let annotate json carried =
   rewriting json ~format:None (fun table index done_ ->

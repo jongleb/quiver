@@ -1,5 +1,5 @@
-(** Loads a quiver dump into MySQL or MariaDB: databases, then each table and,
-    as soon as it exists, its data files in parallel sessions, each file
+(** Loads a quiver dump into MySQL or MariaDB: databases, then all tables, then
+    all data files in parallel sessions, each file
     streamed statement by statement in one transaction and checked against the
     manifest's checksum; views, triggers and routines last. *)
 
@@ -21,6 +21,7 @@ type error =
   | Several_databases of Quiver_core.Ident.t list
       (** [Into] asks for one target, the dump holds these. *)
   | Non_positive_threads of int
+  | Unstarted of Quiver_core.Concurrent.error  (** No loading thread could start. *)
   | Unreadable_columns of Quiver_core.Schema.Name.t
       (** The server's description of a loaded table's columns. *)
 [@@deriving sexp_of ~portable]
@@ -48,6 +49,22 @@ val session :
   (Quiver_mysql.Link.t, [> cause ]) result @@ portable
 (** A connection set up for loading: no foreign key or unique checks, UTC, the
     [sql_mode] dumps are written for, local data allowed. *)
+
+val sessions :
+  Quiver_mysql.Provider.conn_config ->
+  binlog ->
+  count:int ->
+  control:(unit -> ('c, cause) result) @ once portable ->
+  close:('c -> unit) ->
+  ('c * Quiver_mysql.Link.t Await.Capsule.Await.With_mutex.t list, [> cause ]) result
+  @@ portable
+(** [control] and [count] loading sessions, all opened at once; whatever
+    opened is closed again if any fails. *)
+
+val retried :
+  cause:('e -> cause option) -> (unit -> ('a, 'e) result) -> ('a, 'e) result @@ portable
+(** Runs again, up to 5 times in all, while the server reports a deadlock or a
+    lock wait timeout. *)
 
 val renamed : target -> Quiver_core.Ident.t -> Quiver_core.Ident.t @@ portable
 

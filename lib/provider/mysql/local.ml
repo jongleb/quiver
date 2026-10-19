@@ -28,7 +28,7 @@ let socket { getenv; read; entries; exists } =
     Option.bind (getenv name) (function "" -> None | value -> Some value)
   in
   let defaults =
-    List.filter_map Fun.id
+    Base.List.filter_opt
       [
         Some "/etc/my.cnf";
         Some "/etc/mysql/my.cnf";
@@ -57,9 +57,10 @@ let socket { getenv; read; entries; exists } =
                | Group name -> (found, Some name)
                | Option { name = "socket"; value = Some path }
                  when Base.Option.exists group ~f:(fun group ->
-                          List.mem group [ "client"; "client-server"; "client-mariadb" ])
+                          Base.List.mem [ "client"; "client-server"; "client-mariadb" ] group ~equal:String.equal)
                  ->
-                   ((match path with "" -> found | path -> Some path), group)
+                   let found = if String.equal path "" then found else Some path in
+                   (found, group)
                | Option { name = (_ : string); value = (_ : string option) } -> (found, group)
                | Include path -> (file (depth + 1) found path, group)
                | Include_dir directory ->

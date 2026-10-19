@@ -7,6 +7,7 @@ type server_auth =
   | Wants_sealed of { password : string; public_key : string }
       (** Switches to [sha256_password], hands out [public_key] when asked,
           then accepts only this password sealed under it. *)
+  | Switches_short  (** Switches plugin with a 5-byte challenge. *)
 
 (** Where the fake server listens. *)
 type place = Over_tcp | Over_socket
@@ -76,7 +77,7 @@ let serve listener auth =
       send client
         (greeting
            (match auth with
-           | Accepts -> "mysql_native_password"
+           | Accepts | Switches_short -> "mysql_native_password"
            | Wants_full _ | Wants_sealed _ -> "caching_sha2_password"));
       let heard =
         match (receive client, auth) with
@@ -84,6 +85,9 @@ let serve listener auth =
         | Ok _, Accepts ->
             send client (ok 2);
             `Accepted
+        | Ok _, Switches_short ->
+            send client (packet 2 "\254mysql_native_password\000short\000");
+            `Switched
         | Ok _, Wants_full password -> (
             send client (packet 2 "\001\004");
             match receive client with
@@ -248,6 +252,15 @@ let unreachable =
             true
         | Ok _ | Error _ -> false))
 
+let short_scramble =
+  Alcotest.test_case "a challenge under 20 bytes is an error, not an exception"
+    `Quick (fun () ->
+      Alcotest.(check bool)
+        "short scramble" true
+        (match connect Over_tcp Switches_short ~password:(Some "secret") with
+        | Error (`Link Quiver_mysql.Link.Short_scramble), `Switched -> true
+        | (Ok _ | Error _), _ -> false))
+
 let timeouts =
   Alcotest.test_case
     "the connect timeout bounds a server silent before its greeting, and an \
@@ -391,4 +404,4 @@ let discovered =
             [];
         ])
 
-let tests = [ handshake; cleartext; sealed; unreachable; timeouts; discovered ]
+let tests = [ handshake; cleartext; sealed; short_scramble; unreachable; timeouts; discovered ]

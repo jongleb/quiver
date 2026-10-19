@@ -6,13 +6,10 @@ type error =
 
 type frame : value mod portable
 (** One piece of output encoded on its own — a zstd frame or plain text — so
-    pieces can be encoded on any domain and concatenated in order. *)
+    pieces can be encoded on any thread and concatenated in order. *)
 
 type t
 (** A file being assembled from frames, hashing the bytes it stores. *)
-
-val start : Quiver_core.Buffer_pool.t -> Quiver_core.Byte_buffer.t @ unique @@ portable
-(** A buffer to render a frame's text into. *)
 
 val seal :
   Quiver_core.Buffer_pool.t ->

@@ -13,8 +13,6 @@ type _ t =
 (** A level whose index is not statically known. *)
 type any = Any : _ t -> any
 
-val pp_any : Format.formatter -> any -> unit
-val sexp_of_any : any -> Sexplib0.Sexp.t
 val yojson_of_any : any -> Yojson.Safe.t
 
 type error =

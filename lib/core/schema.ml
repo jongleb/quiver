@@ -92,25 +92,19 @@ module Table = struct
     let names (first, rest) =
       (first.Field.name, List.map (fun { Field.name; _ } -> name) rest)
     in
-    Result.map_error
-      (fun (`Schema error) -> Sexplib0.Sexp.to_string (sexp_of_error error))
-      (make ~name ~fields:(first :: rest)
-         ~key:
-           (match key with
-           | No_key -> No_key
-           | Primary fields -> Primary (names fields)
-           | Unique { index; fields } -> Unique { index; fields = names fields })
-         ~estimate)
+    let key =
+      match key with
+      | No_key -> No_key
+      | Primary fields -> Primary (names fields)
+      | Unique { index; fields } -> Unique { index; fields = names fields }
+    in
+    make ~name ~fields:(first :: rest) ~key ~estimate
 
   let t_of_sexp sexp =
-    match remade (t_of_sexp sexp) with
-    | Ok table -> table
-    | Error reason -> Sexplib0.Sexp_conv.of_sexp_error reason sexp
+    Codec.checked_of_sexp (fun (`Schema e) -> sexp_of_error e) (remade (t_of_sexp sexp)) sexp
 
   let t_of_yojson json =
-    match remade (t_of_yojson json) with
-    | Ok table -> table
-    | Error reason -> Ppx_yojson_conv_lib.Yojson_conv.of_yojson_error reason json
+    Codec.checked_of_yojson (fun (`Schema e) -> sexp_of_error e) (remade (t_of_yojson json)) json
 end
 
 type t = { tables : Table.t list } [@@deriving sexp_of ~portable, yojson_of]

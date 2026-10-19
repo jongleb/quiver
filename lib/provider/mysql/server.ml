@@ -18,15 +18,16 @@ let of_version_string raw =
     else if Base.String.is_substring raw ~substring:"MariaDB" then `Mariadb
     else `Mysql
   in
-  Option.to_result ~none:(`Unsupported raw)
-    (match String.split_on_char '.' raw with
+  let line =
+    match String.split_on_char '.' raw with
     | major :: minor :: patch :: _ -> (
         match (flavour, digits major, digits minor, digits patch) with
-        | `Mysql, Some 8, Some 0, Some patch when patch >= 11 ->
-            Some (Mysql_8_0 patch)
+        | `Mysql, Some 8, Some 0, Some patch when patch >= 11 -> Some (Mysql_8_0 patch)
         | `Mysql, Some 8, Some 4, Some patch -> Some (Mysql_8_4 patch)
         | `Mariadb, Some 10, Some 11, Some patch -> Some (Mariadb_10_11 patch)
         | `Mariadb, Some 11, Some 4, Some patch -> Some (Mariadb_11_4 patch)
         | `Mariadb, Some 11, Some 8, Some patch -> Some (Mariadb_11_8 patch)
         | (`Mysql | `Mariadb | `Tidb), _, _, _ -> None)
-    | _ -> None)
+    | _ -> None
+  in
+  Option.to_result line ~none:(`Unsupported raw)

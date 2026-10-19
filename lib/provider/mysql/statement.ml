@@ -45,7 +45,7 @@ let sql = function
   | Backup_stage_start -> "BACKUP STAGE START"
   | Backup_stage_block_commit -> "BACKUP STAGE BLOCK_COMMIT"
   | Backup_stage_end -> "BACKUP STAGE END"
-  | Use database -> [%string "USE %{Query.quote database}"]
+  | Use database -> [%string "USE %{Quiver_core.Ident.backquoted database}"]
   | Prepare_load ->
       "SET SESSION foreign_key_checks = 0, unique_checks = 0, time_zone = \
        '+00:00', sql_mode = 'NO_AUTO_VALUE_ON_ZERO,ALLOW_INVALID_DATES'"
@@ -93,9 +93,9 @@ let sql = function
                  | Hex_value -> [%string "UNHEX(%{value i})"]
                  | Number_value -> [%string "CAST(%{value i} AS UNSIGNED)"]
                in
-               [%string "%{Query.quote name} = %{value}"])
+               [%string "%{Quiver_core.Ident.backquoted name} = %{value}"])
              columns)
       in
       [%string
-        "LOAD DATA LOCAL INFILE 'quiver' INTO TABLE %{Query.quote table} \
+        "LOAD DATA LOCAL INFILE 'quiver' INTO TABLE %{Quiver_core.Ident.backquoted table} \
          CHARACTER SET utf8mb4 %{format} (%{variables}) SET %{assignments}"]

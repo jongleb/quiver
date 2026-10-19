@@ -78,9 +78,11 @@ let[@inline] test_bit (buf : buffer) i =
 let build ltype ~validity ~data ~heap =
   let make : type a. a layout -> a t =
    fun layout ->
-    (match layout with
-    | Var _ -> Base_bigstring.set_int32_le_exn data ~pos:0 0
-    | Bits | Ints _ | Int64s | Float32s | Float64s -> ());
+    let () =
+      match layout with
+      | Var _ -> Base_bigstring.set_int32_le_exn data ~pos:0 0
+      | Bits | Ints _ | Int64s | Float32s | Float64s -> ()
+    in
     { ltype; layout; length = 0; validity; data }
   in
   let ints width lo hi = Any (make (Ints { width; lo; hi })) in
@@ -90,7 +92,7 @@ let build ltype ~validity ~data ~heap =
   | Uint8 -> ints W1 0 0xFF
   | Int16 -> ints W2 (-0x8000) 0x7FFF
   | Uint16 -> ints W2 0 0xFFFF
-  | Year -> ints W2 0 Temporal.max_year
+  | Year -> ints W2 0 Moment.max_year
   | Unchecked_date -> ints W4 0 Temporal.max_packed_date
   | Int32 | Date ->
       ints W4 (Int32.to_int Int32.min_int) (Int32.to_int Int32.max_int)
@@ -148,9 +150,11 @@ let byte_size : type a. a t @ local -> int =
 let[@inline] advance t presence =
   let i = t.length in
   ensure_validity t ((i / 8) + 1);
-  (match presence with
-  | Present -> set_bit t.validity i
-  | Null -> clear_bit t.validity i);
+  let () =
+    match presence with
+    | Present -> set_bit t.validity i
+    | Null -> clear_bit t.validity i
+  in
   t.length <- i + 1
 
 let[@inline] write_int t width i v =
@@ -260,16 +264,18 @@ let[@zero_alloc] add_bigstring (t : string t @ local) src ~off ~len =
 let[@zero_alloc] add_null : type a. a t @ local -> unit =
  fun t ->
   let i = t.length in
-  (match t.layout with
-  | Bits ->
-      ensure_data t ((i / 8) + 1);
-      clear_bit t.data i
-  | Ints { width; _ } -> write_int t width i 0
-  | Int64s | Float64s -> write_int64 t i #0L
-  | Float32s -> write_float32 t i 0.
-  | Var { used; _ } ->
-      ensure_data t (4 * (i + 2));
-      Base_bigstring.set_int32_le_exn t.data ~pos:(4 * (i + 1)) used);
+  let () =
+    match t.layout with
+    | Bits ->
+        ensure_data t ((i / 8) + 1);
+        clear_bit t.data i
+    | Ints { width; _ } -> write_int t width i 0
+    | Int64s | Float64s -> write_int64 t i #0L
+    | Float32s -> write_float32 t i 0.
+    | Var { used; _ } ->
+        ensure_data t (4 * (i + 2));
+        Base_bigstring.set_int32_le_exn t.data ~pos:(4 * (i + 1)) used
+  in
   advance t Null
 
 let[@inline] presence t i = if test_bit t.validity i then Present else Null
@@ -345,33 +351,32 @@ let decode : type a.
     a t @ local -> Bytes.t -> off:int -> stop:int -> rows:int -> int option =
  fun t source ~off ~stop ~rows ->
   let validity = (rows + 7) / 8 and data = data_bytes t.layout rows in
-  match rows >= 0 && off + validity + data <= stop with
-  | false -> None
-  | true -> (
-      clear t;
-      ensure_validity t validity;
-      ensure_data t data;
-      Base_bigstring.From_bytes.blit ~src:source ~src_pos:off ~dst:t.validity
-        ~dst_pos:0 ~len:validity;
-      Base_bigstring.From_bytes.blit ~src:source ~src_pos:(off + validity)
-        ~dst:t.data ~dst_pos:0 ~len:data;
-      let next = off + validity + data in
-      match t.layout with
-      | Bits | Ints _ | Int64s | Float32s | Float64s ->
+  if rows < 0 || off + validity + data > stop then None
+  else (
+    clear t;
+    ensure_validity t validity;
+    ensure_data t data;
+    Base_bigstring.From_bytes.blit ~src:source ~src_pos:off ~dst:t.validity
+      ~dst_pos:0 ~len:validity;
+    Base_bigstring.From_bytes.blit ~src:source ~src_pos:(off + validity)
+      ~dst:t.data ~dst_pos:0 ~len:data;
+    let next = off + validity + data in
+    match t.layout with
+    | Bits | Ints _ | Int64s | Float32s | Float64s ->
+        t.length <- rows;
+        Some next
+    | Var var ->
+        let offset i = Base_bigstring.get_int32_le t.data ~pos:(4 * i) in
+        let rec monotonic i =
+          i > rows || (offset i >= offset (i - 1) && monotonic (i + 1))
+        in
+        let used = offset rows in
+        if offset 0 = 0 && monotonic 1 && next + used <= stop then (
+          if used > Bytes.length var.heap then
+            var.heap <-
+              Bytes.create (Int.max used (2 * Bytes.length var.heap));
+          Bytes.blit source next var.heap 0 used;
+          var.used <- used;
           t.length <- rows;
-          Some next
-      | Var var ->
-          let offset i = Base_bigstring.get_int32_le t.data ~pos:(4 * i) in
-          let rec monotonic i =
-            i > rows || (offset i >= offset (i - 1) && monotonic (i + 1))
-          in
-          let used = offset rows in
-          if offset 0 = 0 && monotonic 1 && next + used <= stop then (
-            if used > Bytes.length var.heap then
-              var.heap <-
-                Bytes.create (Int.max used (2 * Bytes.length var.heap));
-            Bytes.blit source next var.heap 0 used;
-            var.used <- used;
-            t.length <- rows;
-            Some (next + used))
-          else None)
+          Some (next + used))
+        else None)

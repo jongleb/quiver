@@ -8,9 +8,6 @@ type part : immutable_data = {
 [@@deriving sexp ~portable]
 (** What a sink produced for one chunk. *)
 
-val yojson_of_part : part -> Yojson.Safe.t
-val part_of_yojson : Yojson.Safe.t -> part
-
 type reading : immutable_data = {
   reader : int;  (** Which of the dump's readers. *)
   started : Core.Time_ns.Span.t;  (** Since the dump began. *)
@@ -49,15 +46,11 @@ type carrying : immutable_data = {
 [@@deriving sexp_of ~portable]
 (** How one part travelled over quiver's wire protocol. *)
 
-val yojson_of_carrying : carrying -> Yojson.Safe.t
-
 type state =
   | Pending
   | Done of { part : part; reading : reading; writing : writing }
 [@@deriving sexp_of ~portable]
 (** Stored with spans in nanoseconds, under names ending in [_ns]. *)
-
-val yojson_of_state : state -> Yojson.Safe.t
 
 type entry = {
   table : Schema.Name.t;

@@ -14,18 +14,7 @@ type value =
   | Day of Core.Date.t
   | Instant of Moment.t
   | Duration of int64
-
-let equal_value a b =
-  match (a, b) with
-  | Signed a, Signed b | Unsigned a, Unsigned b | Duration a, Duration b ->
-      Int64.equal a b
-  | Text a, Text b | Binary a, Binary b | Exact a, Exact b -> String.equal a b
-  | Day a, Day b -> Core.Date.equal a b
-  | Instant a, Instant b -> Moment.equal a b
-  | ( ( Signed _ | Unsigned _ | Text _ | Binary _ | Exact _ | Day _ | Instant _
-      | Duration _ ),
-      _ ) ->
-      false
+[@@deriving equal ~portable]
 
 let printed print value =
   let out = Byte_buffer.create () in
@@ -41,16 +30,12 @@ let yojson_of_value value =
   | Binary bytes ->
       tagged "Binary" (`String (Hex_encode.to_hex ~case:`Lowercase bytes))
   | Exact text -> tagged "Exact" (`String text)
-  | Day day -> tagged "Day" (`String (printed Temporal.day day))
+  | Day day -> tagged "Day" (`String (Core.Date.to_string day))
   | Instant moment -> tagged "Instant" (`String (printed Temporal.moment moment))
   | Duration v -> tagged "Duration" (`Intlit (Int64.to_string v))
 
 let text value =
-  let cut text =
-    match String.length text > 32 with
-    | true -> String.sub text 0 32 ^ "…"
-    | false -> text
-  in
+  let cut text = if String.length text > 32 then String.sub text 0 32 ^ "…" else text in
   match value with
   | Signed v -> Int64.to_string v
   | Unsigned v -> Printf.sprintf "%Lu" v
@@ -58,7 +43,7 @@ let text value =
   | Binary bytes ->
       "X'" ^ cut (Hex_encode.to_hex ~case:`Uppercase bytes) ^ "'"
   | Exact text -> text
-  | Day day -> printed Temporal.day day
+  | Day day -> Core.Date.to_string day
   | Instant moment -> printed Temporal.moment moment
   | Duration micros -> Int64.to_string micros ^ "µs"
 
@@ -75,7 +60,6 @@ let pp out key = Format.pp_print_string out (words key)
 let sexp_of_t key = Sexplib0.Sexp.Atom (words key)
 
 let make (first, rest) values =
-  let fields = first :: rest in
   let fits ({ name; ltype; _ } : Schema.Field.t) value =
     match ((ltype : Ltype.t), value) with
     | (Int8 | Int16 | Int32 | Int64 | Uint8 | Uint16 | Uint32), Signed _
@@ -94,17 +78,15 @@ let make (first, rest) values =
         _ ) ->
         Error (`Key (Mismatch { field = name; ltype }))
   in
+  let arity =
+    Error (`Key (Arity { expected = 1 + List.length rest; got = List.length values }))
+  in
   match values with
-  | value :: others when List.length values = List.length fields ->
-      let%bind value = fits first value
-      and others =
-        Base.Result.all
-          (List.map
-             (fun (field, value) -> fits field value)
-             (List.combine rest others))
-      in
-      Ok (value, others)
-  | _ ->
-      Error
-        (`Key
-           (Arity { expected = List.length fields; got = List.length values }))
+  | [] -> arity
+  | value :: others -> (
+      match Base.List.zip rest others with
+      | Unequal_lengths -> arity
+      | Ok pairs ->
+          let%map value = fits first value
+          and others = Base.Result.all (List.map (fun (field, value) -> fits field value) pairs) in
+          (value, others))

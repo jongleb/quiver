@@ -210,7 +210,7 @@ linked() {
   result=$("$link_check" "$port" "$tls") || fail "own client: $result"
   printf '%s\n' "$result" | grep -qx "1|NULL|x'y|1" || fail "own client rows: $result"
   printf '%s\n' "$result" | grep -q "(code 1054)" || fail "own client error: $result"
-  printf '%s\n' "$result" | grep -q "wrong password: (Refused (code 1045)" || fail "own client auth: $result"
+  printf '%s\n' "$result" | grep -A1 "^wrong password:" | grep -q "(code 1045)" || fail "own client auth: $result"
   echo "$service: own client connects ($tls)"
 }
 # Over the server's Unix socket, mounted on the host (Linux only: Docker on

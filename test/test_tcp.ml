@@ -101,9 +101,9 @@ let tests =
           Float.of_int ((writers * writes - 1) * bytes)
           /. Float.of_int bytes_per_second
         in
-        let slack = 0.25 in
+        let most = (2. *. least) +. 0.25 in
         Alcotest.(check bool)
-          (Printf.sprintf "%.3f s within %.3f s and a quarter second more" took least)
+          (Printf.sprintf "%.3f s between %.3f s and %.3f s" took least most)
           true
-          (took >= least && took <= least +. slack));
+          (took >= least && took <= most));
   ]

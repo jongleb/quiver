@@ -30,14 +30,15 @@ let () =
   and failed sexp =
     Format.eprintf "quiver: %a@." Sexplib0.Sexp.pp_hum sexp;
     1
-  and ident =
+  and ident_of_string text =
+    Result.map_error
+      (fun (`Ident error) ->
+        `Msg (Sexplib0.Sexp.to_string_hum (Quiver_core.Ident.sexp_of_error error)))
+      (Quiver_core.Ident.of_string text)
+  in
+  let ident =
     Cmdliner.Arg.conv
-      ( (fun name ->
-          Result.map_error
-            (fun (`Ident error) ->
-              `Msg (Sexplib0.Sexp.to_string_hum (Quiver_core.Ident.sexp_of_error error)))
-            (Quiver_core.Ident.of_string name)),
-        fun ppf name -> Format.pp_print_string ppf (name :> string) )
+      (ident_of_string, fun ppf name -> Format.pp_print_string ppf (name :> string))
   in
   let choices to_string all =
     Cmdliner.Arg.enum (List.map (fun value -> (to_string value, value)) all)
@@ -582,7 +583,6 @@ let () =
                snapshot; $(b,trx-only) takes no lock and is only best effort.")
     in
     let filter =
-      let name = Cmdliner.Arg.conv_parser ident in
       Term.(
         const (fun databases tables ->
             match databases @ tables with
@@ -595,7 +595,7 @@ let () =
                    ( (fun text ->
                        Result.map
                          (fun database -> Quiver_core.Filter.Database database)
-                         (name text)),
+                         (ident_of_string text)),
                      fun ppf rule ->
                        Sexplib0.Sexp.pp_hum ppf
                          (Quiver_core.Filter.sexp_of_rule rule) ))
@@ -610,8 +610,8 @@ let () =
                        match Base.String.lsplit2 text ~on:'.' with
                        | None -> Error (`Msg "expected DB.TABLE")
                        | Some (database, table) ->
-                           let%map database = name database
-                           and table = name table in
+                           let%map database = ident_of_string database
+                           and table = ident_of_string table in
                            Quiver_core.Filter.Table { database; table }),
                      fun ppf rule ->
                        Sexplib0.Sexp.pp_hum ppf

@@ -452,8 +452,8 @@ chaos() {
 }
 # TLS by authority: the server's certificate pinned by fingerprint, a wrong
 # fingerprint and a foreign CA refused; on MySQL, which reloads TLS live, a CA
-# of our own with a 127.0.0.1 certificate accepted, and refused by the name
-# localhost that the certificate lacks.
+# of our own with a 127.0.0.1 certificate accepted, and one of the same CA that
+# names another host refused.
 certificates() {
   selected "$1" || return 0
   service=$1 port=$2 client=$3
@@ -489,15 +489,19 @@ certificates() {
       printf 'subjectAltName=IP:127.0.0.1\n' > "$tls_dir/san.ext"
       openssl x509 -req -in "$tls_dir/server.csr" -CA "$tls_dir/ca.pem" -CAkey "$tls_dir/ca-key.pem" \
         -CAcreateserial -days 2 -extfile "$tls_dir/san.ext" -out "$tls_dir/server-cert.pem" 2> /dev/null
+      printf 'subjectAltName=DNS:elsewhere.invalid\n' > "$tls_dir/other.ext"
+      openssl x509 -req -in "$tls_dir/server.csr" -CA "$tls_dir/ca.pem" -CAkey "$tls_dir/ca-key.pem" \
+        -CAcreateserial -days 2 -extfile "$tls_dir/other.ext" -out "$tls_dir/other-cert.pem" 2> /dev/null
       chmod 644 "$tls_dir"/*.pem
-      for file in ca.pem server-cert.pem server-key.pem; do
+      for file in ca.pem server-cert.pem other-cert.pem server-key.pem; do
         docker compose -p quiver -f "$compose" cp "$tls_dir/$file" "$service:/tmp/quiver-$file" > /dev/null 2>&1
       done
       previous=$(sql -e "SELECT CONCAT_WS(' ', @@GLOBAL.ssl_ca, @@GLOBAL.ssl_cert, @@GLOBAL.ssl_key)")
       sql -e "SET GLOBAL ssl_ca = '/tmp/quiver-ca.pem', ssl_cert = '/tmp/quiver-server-cert.pem', ssl_key = '/tmp/quiver-server-key.pem'; ALTER INSTANCE RELOAD TLS"
       own=ok
       tls_dump own-ca --tls-ca "$tls_dir/ca.pem" || own="$(cat "$tls_dir/own-ca.log")"
-      if tls_dump own-ca-by-name -h localhost --tls-ca "$tls_dir/ca.pem"; then own="accepted the name localhost"; fi
+      sql -e "SET GLOBAL ssl_cert = '/tmp/quiver-other-cert.pem'; ALTER INSTANCE RELOAD TLS"
+      if tls_dump own-ca-by-name --tls-ca "$tls_dir/ca.pem"; then own="accepted a certificate for another host"; fi
       # shellcheck disable=SC2086
       set -- $previous
       sql -e "SET GLOBAL ssl_ca = '$1', ssl_cert = '$2', ssl_key = '$3'; ALTER INSTANCE RELOAD TLS"

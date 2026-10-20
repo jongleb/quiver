@@ -117,6 +117,11 @@ deliberately broken code.
 - **One snapshot.** `FLUSH TABLES WITH READ LOCK` or MariaDB `BACKUP STAGE`; every session opens
   its transaction in parallel under the lock, so the lock lasts one round trip. The binlog
   position and GTID set are taken before it is released.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/snapshot-dark.svg">
+  <img src="assets/snapshot.svg" alt="The lock covers one round trip in which every session opens its snapshot and the binlog position and GTID set are read, instead of one round trip per session" width="100%">
+</picture>
+
 - **Even chunks.** Key ranges are bisected by the server's `EXPLAIN` estimates and small
   neighbours are merged, so skewed tables split evenly. Data flows from the first second and the
   DDL of small tables is taken along the way.
@@ -299,6 +304,31 @@ quiver collect --listen 0.0.0.0:7300 -o ./shop --forward replica.example:7300 $W
 
 One read of the source reaches a whole chain of targets, each in its own format: files here, a
 live server there. A chunk counts once every target has committed it.
+
+### The wire protocol
+
+One control connection carries the session; S data connections carry frames of batches, every
+frame with its own two checksums.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/frame-dark.svg">
+  <img src="assets/frame.svg" alt="A frame: magic QW, version, kind, codec, chunk, frame number, length on the wire, decoded length, xxh3 of the payload, xxh3 of the header; then the payload" width="100%">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/session-dark.svg">
+  <img src="assets/session.svg" alt="Hello and Ready; data streams attach; DDL pipelined and answered in order; Begin, batch frames on any stream acknowledged per stream, End, Committed once durable at every node; Finish and Leave" width="100%">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/resilience-dark.svg">
+  <img src="assets/resilience.svg" alt="Stream 2 breaks with frames 5 and 8 unacknowledged; they are sent again on streams 1 and 3 and a new stream joins the session" width="100%">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/tuning-dark.svg">
+  <img src="assets/tuning.svg" alt="Streams: every second watch, try twice as many when rendering waited, warm up, measure two intervals, keep at plus 10 percent or close them again. Compression ladder: none, zstd -5, zstd 1, zstd 3" width="100%">
+</picture>
 
 <details>
 <summary><b>A CA for your nodes in three commands</b></summary>

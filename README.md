@@ -59,6 +59,14 @@ Global_read_lock held for 41ms
    lives only in capsules, atomics and queues, with no unsafe casts.
 7. Optimisations are checked by mutation. Fast code is compared with a simple model by property
    tests, and every test is shown to fail on deliberately broken code.
+8. No reader waits alone at the end. A chunk over an integer key is read in half-second key steps,
+   and an idle reader gets the next steps of a chunk another reader is in, so a chunk that turns
+   out far heavier than planned is read by every reader (1.2 GB of wide rows in one chunk: 3.8 s
+   to 1.3 s). Without `-t`, readers follow the machine's fast cores and the server's own sizing,
+   and spare sessions in the snapshot join while more readers read more.
+9. Schema and rows are chosen apart. `--data-table` takes rows of some tables and the schema of
+   all, `--no-data` takes the schema alone, `--objects none` leaves views, triggers, routines and
+   events out.
 
 ## Numbers
 

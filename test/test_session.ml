@@ -58,7 +58,7 @@ type scenario = {
   control : (int * breaking) option;
       (** Plaintext into the first node only: the control connection passes so
           many frames, then no more replies, and breaks at its next frame. *)
-  adjustments : Quiver_net.Streams.decision list;
+  adjustments : Quiver_core.Width.decision list;
       (** Taken by readers, one before each part. *)
   compression : Quiver_net.Remote.compression;
   place : place;  (** [Into_last] in a chain only. *)
@@ -135,6 +135,11 @@ module Recorder = struct
         Ok ()
 
   let objects _ _ _ = Ok ()
+
+  let add_part t ({ name; _ } : Schema.Table.t) =
+    match logged t (fun log -> List.mem name log.tables) with
+    | true -> Ok ()
+    | false -> Error (`Sink Unknown_part)
 
   let part t ({ name; _ } : Schema.Table.t) ~index =
     match logged t (fun log -> List.mem name log.tables) with
@@ -244,8 +249,8 @@ let scenario =
       list_size (int_range 0 6)
         (oneof
            [
-             map (fun n -> Quiver_net.Streams.Open n) (int_range 1 3);
-             map (fun n -> Quiver_net.Streams.Close n) (int_range 1 3);
+             map (fun n -> Quiver_core.Width.Open n) (int_range 1 3);
+             map (fun n -> Quiver_core.Width.Close n) (int_range 1 3);
            ])
     in
     let* compression =
@@ -614,6 +619,7 @@ let property
   let manifest =
     Manifest.yojson_of_t
       (Manifest.make ~level:(Any Best_effort) ~format:Sql ~position:`Null
+         ~threads:{ sessions = 1; readers = 1; peak = 1; renderers = 1 }
          ~schema:(Support.get_ok (Schema.make schema))
          (Base.List.concat_mapi tables ~f:(fun n parts ->
               Base.List.filter_mapi parts ~f:(fun index _ ->

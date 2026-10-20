@@ -124,32 +124,43 @@ type entry = {
 }
 [@@deriving yojson_of]
 
+type threads = {
+  sessions : int;
+  readers : int;
+  peak : int;
+  renderers : int;
+}
+[@@deriving yojson_of]
+
 type t = {
   version : int;
   level : Consistency.any;
   format : Output_format.t;
   position : Yojson.Safe.t;
+  threads : threads;
   schema : Schema.t;
   chunks : entry list;
 }
 
-let yojson_of_t { version; level; format; position; schema; chunks } =
+let yojson_of_t { version; level; format; position; threads; schema; chunks } =
   `Assoc
     [
       ("version", `Int version);
       ("level", Consistency.yojson_of_any level);
       ("format", Output_format.yojson_of_t format);
       ("position", position);
+      ("threads", yojson_of_threads threads);
       ("schema", Schema.yojson_of_t schema);
       ("chunks", `List (List.map yojson_of_entry chunks));
     ]
 
-let make ~level ~format ~position ~schema chunks =
+let make ~level ~format ~position ~threads ~schema chunks =
   {
     version = 1;
     level;
     format;
     position;
+    threads;
     schema;
     chunks =
       List.map
@@ -183,19 +194,31 @@ type chunk = { table : Schema.Name.t; state : stored }
 [@@deriving of_yojson] [@@yojson.allow_extra_fields]
 (** A chunk as stored, read only as far as loading needs. *)
 
-type stored_manifest = { format : Output_format.t; chunks : chunk list }
+type stored_table = { name : Schema.Name.t }
+[@@deriving of_yojson] [@@yojson.allow_extra_fields]
+(** A table as stored, read only for its name. *)
+
+type stored_schema = { tables : stored_table list }
+[@@deriving of_yojson] [@@yojson.allow_extra_fields]
+
+type stored_manifest = {
+  format : Output_format.t;
+  schema : stored_schema;
+  chunks : chunk list;
+}
 [@@deriving of_yojson] [@@yojson.allow_extra_fields]
 (** A manifest read only as far as loading needs. *)
 
 type contents = {
   format : Output_format.t;
+  tables : Schema.Name.t list;
   parts : (Schema.Name.t * part) list;
 }
 
 let read json =
   match Codec.decode stored_manifest_of_yojson json with
   | Error reason -> Error (`Manifest (Malformed reason))
-  | Ok { format; chunks } ->
+  | Ok { format; schema = { tables }; chunks } ->
       let%map parts =
         Base.Result.all
           (List.map
@@ -205,7 +228,7 @@ let read json =
                | Pending -> Error (`Manifest (Unfinished table)))
              chunks)
       in
-      { format; parts }
+      { format; tables = List.map (fun { name } -> name) tables; parts }
 
 let replace key value fields =
   List.map (fun (k, v) -> if String.equal k key then (k, value) else (k, v)) fields

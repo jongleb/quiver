@@ -47,6 +47,7 @@ module Make (F : Format) = struct
   let format t = F.format t.settings
   let database t database ~ddl = sink (Layout.database t.layout database ~ddl)
   let table t table ~ddl ~parts:_ = sink (Layout.table t.layout table ~ddl)
+  let add_part _ _ = Ok ()
 
   let objects t database definitions =
     Result.map_error

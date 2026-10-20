@@ -26,6 +26,7 @@ val unseal : sealed @ once unique -> t @ unique
 
 val sealed_columns : sealed @ local -> Column.any Iarray.t @ local @@ portable
 val sealed_rows : sealed @ local -> int @@ portable
+val sealed_byte_size : sealed @ local -> int @@ portable
 val reshape : t @ local -> Ltype.t list -> unit
 
 val encode : sealed @ local -> Byte_buffer.t @ local -> unit @@ portable

@@ -12,6 +12,7 @@ type control =
     }
   | Database of { name : Quiver_core.Ident.t; ddl : string }
   | Table of { table : Quiver_core.Schema.Table.t; ddl : string; parts : int }
+  | Grown of { table : Quiver_core.Schema.Name.t }
   | Objects of {
       database : Quiver_core.Ident.t;
       definitions : Quiver_core.Definition.t list;

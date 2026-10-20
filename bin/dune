@@ -13,6 +13,7 @@
   quiver.load
   quiver.net
   file_path)
+ (link_flags (:standard -ocamlrunparam d=512))
  (preprocess
   (pps ppx_let ppx_sexp_conv)))
 

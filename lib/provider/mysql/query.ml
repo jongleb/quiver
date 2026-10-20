@@ -12,6 +12,7 @@ type t =
       table : Quiver_core.Schema.Name.t;
       key : Quiver_core.Ident.t;
     }
+  | Read_threads of Server.t
   | Binlog_status of Server.t
   | Gtid_executed of Server.t
   | Show_create of Quiver_core.Ddl_target.t
@@ -25,6 +26,7 @@ type t =
       kind : Quiver_core.Definition.kind;
     }
   | Chunk of Quiver_core.Chunk.t
+  | Key_span of { chunk : Quiver_core.Chunk.t; key : Quiver_core.Ident.t }
   | Collation of {
       table : Quiver_core.Schema.Name.t;
       column : Quiver_core.Ident.t;
@@ -82,6 +84,29 @@ let literal (value : Quiver_core.Key.value) =
           Quiver_core.Temporal.time out Quiver_core.Ltype.Fsp.microseconds
             ~micros:(Int64_u.of_int64 micros))
 
+let where (chunk : Quiver_core.Chunk.t) =
+  match chunk with
+  | Whole _ -> ""
+  | Range _ ->
+      let rec condition (predicate : Quiver_core.Predicate.t) =
+        match predicate with
+        | Always -> "TRUE"
+        | Compare { field; comparison; value } ->
+            let comparison =
+              match comparison with
+              | Less -> "<"
+              | Equal -> "="
+              | Greater -> ">"
+              | At_least -> ">="
+            in
+            [%string "%{Quiver_core.Ident.backquoted field.name} %{comparison} %{literal value}"]
+        | All (first, rest) ->
+            [%string {|(%{String.concat " AND " (List.map condition (first :: rest))})|}]
+        | Any (first, rest) ->
+            [%string {|(%{String.concat " OR " (List.map condition (first :: rest))})|}]
+      in
+      [%string " WHERE %{condition (Quiver_core.Predicate.of_chunk chunk)}"]
+
 let sql = function
   | Tables ->
       [%string
@@ -103,6 +128,11 @@ let sql = function
          SEQ_IN_INDEX"]
   | Key_bounds { table; key } ->
       [%string "SELECT MIN(%{Quiver_core.Ident.backquoted key}), MAX(%{Quiver_core.Ident.backquoted key}) FROM %{qualified table}"]
+  | Read_threads server -> (
+      match server with
+      | Mysql_8_0 _ | Mysql_8_4 _ -> "SELECT @@innodb_read_io_threads"
+      | Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _ ->
+          "SELECT @@thread_pool_size")
   | Binlog_status server -> (
       match server with
       | Mysql_8_0 _ -> "SHOW MASTER STATUS"
@@ -151,30 +181,13 @@ let sql = function
   | Chunk chunk ->
       let table = Quiver_core.Chunk.table chunk in
       let first, rest = table.fields in
-      let where =
-        match chunk with
-        | Whole _ -> ""
-        | Range _ ->
-            let rec condition (predicate : Quiver_core.Predicate.t) =
-              match predicate with
-              | Always -> "TRUE"
-              | Compare { field; comparison; value } ->
-                  let comparison =
-                    match comparison with
-                    | Less -> "<"
-                    | Equal -> "="
-                    | Greater -> ">"
-                    | At_least -> ">="
-                  in
-                  [%string "%{Quiver_core.Ident.backquoted field.name} %{comparison} %{literal value}"]
-              | All (first, rest) ->
-                  [%string {|(%{String.concat " AND " (List.map condition (first :: rest))})|}]
-              | Any (first, rest) ->
-                  [%string {|(%{String.concat " OR " (List.map condition (first :: rest))})|}]
-            in
-            [%string " WHERE %{condition (Quiver_core.Predicate.of_chunk chunk)}"]
-      in
-      [%string "SELECT %{columns (first :: rest)} FROM %{qualified table.name}%{where}"]
+      [%string
+        "SELECT %{columns (first :: rest)} FROM %{qualified table.name}%{where chunk}"]
+  | Key_span { chunk; key } ->
+      let key = Quiver_core.Ident.backquoted key in
+      [%string
+        "SELECT MIN(%{key}), MAX(%{key}) FROM %{qualified (Quiver_core.Chunk.table \
+         chunk).name}%{where chunk}"]
   | Collation { table = { database; table }; column } ->
       [%string
         "SELECT CHARACTER_SET_NAME, COLLATION_NAME FROM \

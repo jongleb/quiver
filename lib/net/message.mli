@@ -10,7 +10,7 @@ val byte_order : byte_order
 (** This machine's. *)
 
 (** What an agent sends on its control connection. [Hello], [Database], [Table],
-    [Objects] and [Finish] are answered in order with [Ready], [Done], [Refused]
+    [Grown], [Objects] and [Finish] are answered in order with [Ready], [Done], [Refused]
     or [Skipped], and may be sent before earlier ones are answered; a chunk's
     [End] is answered with [Committed] or [Rejected] whenever it is durable.
     Every message after [Hello] but [Heartbeat] and [Leave] is counted, and so
@@ -25,6 +25,8 @@ type control =
     }
   | Database of { name : Quiver_core.Ident.t; ddl : string }
   | Table of { table : Quiver_core.Schema.Table.t; ddl : string; parts : int }
+  | Grown of { table : Quiver_core.Schema.Name.t }
+      (** The table has one part more than announced. *)
   | Objects of {
       database : Quiver_core.Ident.t;
       definitions : Quiver_core.Definition.t list;

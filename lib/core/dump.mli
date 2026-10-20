@@ -10,6 +10,8 @@ module Make (P : Provider_intf.S) (S : Sink_intf.S) : sig
     mode : P.snapshot_mode;
     level : 'lvl Consistency.t;
     filter : Filter.t;
+    rows : Filter.rows;
+    objects : Filter.objects;
     opts : Dump_opts.t;
   }
   (** What to dump and how. *)

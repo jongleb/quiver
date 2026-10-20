@@ -72,10 +72,16 @@ let tests =
              ^ String.concat ",\n" definitions
              ^ "\n) ENGINE=InnoDB"
            in
-           let { Quiver_load.Deferred_keys.create; later } =
-             Quiver_load.Deferred_keys.split table text
+           let { Quiver_load.Deferred_keys.create; later; foreign } =
+             Quiver_load.Deferred_keys.split All_keys table text
+           and {
+             Quiver_load.Deferred_keys.create = with_keys;
+             later = none_later;
+             foreign = only_foreign;
+           } =
+             Quiver_load.Deferred_keys.split Foreign_keys table text
            in
-           let kept = lines create and back = added later in
+           let kept = lines create and back = added (later @ foreign) in
            let sorted list = List.sort String.compare list in
            let auto_key =
              match (auto, primary) with
@@ -98,16 +104,26 @@ let tests =
                 kept
            && Option.fold ~none:true
                 ~some:(fun key -> List.mem key kept)
-                auto_key));
+                auto_key
+           && none_later = [] && only_foreign = foreign
+           && List.for_all
+                (fun line -> Base.String.is_substring line ~substring:" FOREIGN KEY ")
+                (added foreign)
+           && sorted (lines with_keys @ added only_foreign)
+              = sorted (List.map String.trim definitions)
+           && List.for_all
+                (fun line -> not (Base.String.is_substring line ~substring:" FOREIGN KEY "))
+                (lines with_keys)));
     Alcotest.test_case "text that is not a CREATE TABLE stays whole" `Quick
       (fun () ->
         List.iter
           (fun text ->
-            let { Quiver_load.Deferred_keys.create; later } =
-              Quiver_load.Deferred_keys.split table text
+            let { Quiver_load.Deferred_keys.create; later; foreign } =
+              Quiver_load.Deferred_keys.split All_keys table text
             in
             Alcotest.(check string) "create" text create;
-            Alcotest.(check (list string)) "later" [] later)
+            Alcotest.(check (list string)) "later" [] later;
+            Alcotest.(check (list string)) "foreign" [] foreign)
           [
             "SET NAMES utf8mb4";
             "CREATE TABLE `t` (`a` int)";

@@ -17,6 +17,7 @@ module Sleeper = struct
   let format _ = Output_format.Sql
   let database _ _ ~ddl:_ = Ok ()
   let table _ _ ~ddl:_ ~parts:_ = Ok ()
+  let add_part _ _ = Ok ()
   let objects _ _ _ = Ok ()
   let part delays _ ~index:_ = Ok { delays }
   let renderer { delays } = { taking = delays }

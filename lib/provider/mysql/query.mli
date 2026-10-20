@@ -15,6 +15,9 @@ type t =
       table : Quiver_core.Schema.Name.t;
       key : Quiver_core.Ident.t;
     }
+  | Read_threads of Server.t
+      (** The server's sizing hint for parallel reads: InnoDB read I/O
+          threads on MySQL, the thread pool's groups on MariaDB. *)
   | Binlog_status of Server.t
   | Gtid_executed of Server.t
   | Show_create of Quiver_core.Ddl_target.t
@@ -28,6 +31,8 @@ type t =
       kind : Quiver_core.Definition.kind;
     }
   | Chunk of Quiver_core.Chunk.t
+  | Key_span of { chunk : Quiver_core.Chunk.t; key : Quiver_core.Ident.t }
+      (** The smallest and the largest [key] of the chunk's rows. *)
   | Collation of {
       table : Quiver_core.Schema.Name.t;
       column : Quiver_core.Ident.t;

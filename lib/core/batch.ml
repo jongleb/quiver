@@ -34,6 +34,7 @@ let seal (t : t @ unique) : (sealed, _) result @ unique =
 let unseal t = t
 let sealed_columns t = t.columns
 let sealed_rows t = t.rows
+let sealed_byte_size t = byte_size t
 
 let reshape t ltypes =
   let columns = t.columns in

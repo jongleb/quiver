@@ -26,6 +26,22 @@ val pp : Format.formatter -> t -> unit @@ portable
 (** The table and the key range, for people. *)
 
 val table : t -> Schema.Table.t @@ portable
+
+val bounds : t -> (int64 * int64) option @@ portable
+(** [lo] and [hi] of a chunk over one integer key column bounded on both sides:
+    its rows have [lo <= key < hi] in the key's order, signed or unsigned. *)
+
+val integer_key : t -> Schema.Field.t option @@ portable
+(** The key column of a chunk over one integer column, which {!closed} bounds. *)
+
+val closed : t -> Key.value -> Key.value -> t option @@ portable
+(** A chunk over its {!integer_key} whose rows' keys all lie from [lo] to [hi],
+    both included, as the same rows bounded on both sides; [None] when [hi] is
+    the largest value of the key, so nothing above it exists to bound by. *)
+
+val divide : t -> int64 -> (t * t) option @@ portable
+(** A chunk with {!bounds} [lo] and [hi] cut at [at], strictly between them in
+    the key's order: its rows below [at] and its rows from [at]. *)
 val whole : Schema.Table.t -> t @@ portable
 
 val of_bounds :

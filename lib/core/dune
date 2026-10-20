@@ -44,5 +44,5 @@
    Ppx_yojson_conv_lib.Yojson_conv.Primitives))
  (foreign_stubs
   (language c)
-  (names poll_stubs tcp_stubs))
+  (names poll_stubs tcp_stubs cores_stubs))
  (modules_without_implementation provider_intf sink_intf))

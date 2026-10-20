@@ -61,11 +61,21 @@ type entry = {
 [@@deriving yojson_of]
 (** One planned chunk and how far it got. *)
 
+type threads = {
+  sessions : int;  (** Opened in the snapshot. *)
+  readers : int;  (** Reading at the start. *)
+  peak : int;  (** Reading at once at most. *)
+  renderers : int;
+}
+[@@deriving yojson_of]
+(** How many threads read and rendered. *)
+
 type t = private {
   version : int;
   level : Consistency.any;
   format : Output_format.t;
   position : Yojson.Safe.t;
+  threads : threads;
   schema : Schema.t;
   chunks : entry list;
 }
@@ -77,6 +87,7 @@ val make :
   level:Consistency.any ->
   format:Output_format.t ->
   position:Yojson.Safe.t ->
+  threads:threads ->
   schema:Schema.t ->
   (Chunk.t * state) list ->
   t
@@ -89,6 +100,8 @@ type error =
 
 type contents = {
   format : Output_format.t;
+  tables : Schema.Name.t list;
+      (** Every table of the dump; one without parts was dumped without rows. *)
   parts : (Schema.Name.t * part) list;  (** Every chunk's part, in plan order. *)
 }
 (** What loading needs from a manifest. *)

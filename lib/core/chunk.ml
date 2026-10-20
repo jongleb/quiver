@@ -43,6 +43,79 @@ let sexp_of_t chunk = Sexplib0.Sexp.Atom (Format.asprintf "%a" pp chunk)
 let table = function Whole table | Range { table; _ } -> table
 let whole table = Whole table
 
+type order = Signed_order | Unsigned_order
+
+let ordered = function
+  | Range { key = _, []; range = Between (lo, hi); _ } -> (
+      match
+        ((lo :> Key.value * Key.value list), (hi :> Key.value * Key.value list))
+      with
+      | (Signed lo, []), (Signed hi, []) -> Some (Signed_order, lo, hi)
+      | (Unsigned lo, []), (Unsigned hi, []) -> Some (Unsigned_order, lo, hi)
+      | _ -> None)
+  | Whole _ | Range _ -> None
+
+let integer_key chunk =
+  let integer (field : Schema.Field.t) =
+    match field.ltype with
+    | Int8 | Int16 | Int32 | Int64 | Uint8 | Uint16 | Uint32 | Uint64 -> Some field
+    | _ -> None
+  in
+  match chunk with
+  | Range { key = field, []; _ }
+  | Whole { key = Primary (field, []) | Unique { fields = field, []; _ }; _ } ->
+      integer field
+  | Range _ | Whole _ -> None
+
+let closed chunk (lo : Key.value) (hi : Key.value) =
+  let above =
+    match hi with
+    | Signed hi when not (Int64.equal hi Int64.max_int) -> Some (Key.Signed (Int64.succ hi))
+    | Unsigned hi when not (Int64.equal hi (-1L)) -> Some (Key.Unsigned (Int64.succ hi))
+    | _ -> None
+  in
+  let between table field (low : Key.value) (high : Key.value) =
+    let make () =
+      Result.to_option
+        (let%map low = Key.make (field, []) [ low ]
+         and high = Key.make (field, []) [ high ] in
+         Range { table; key = (field, []); range = Between (low, high) })
+    in
+    match (low, high) with
+    | Signed l, Signed h when Int64.compare l h < 0 -> make ()
+    | Unsigned l, Unsigned h when Int64.unsigned_compare l h < 0 -> make ()
+    | _ -> None
+  in
+  match (chunk, integer_key chunk) with
+  | Range { range = Between _; _ }, Some _ -> Some chunk
+  | Range { table; range = Below below; _ }, Some field ->
+      between table field lo (fst (below :> Key.value * Key.value list))
+  | Range { table; range = From from; _ }, Some field ->
+      Option.bind above (fun above ->
+          between table field (fst (from :> Key.value * Key.value list)) above)
+  | Whole table, Some field ->
+      Option.bind above (fun above -> between table field lo above)
+  | (Range _ | Whole _), None -> None
+
+let bounds chunk = Option.map (fun (_, lo, hi) -> (lo, hi)) (ordered chunk)
+
+let divide chunk at =
+  match (chunk, ordered chunk) with
+  | Range ({ range = Between (lo, hi); _ } as range), Some (order, low, high) ->
+      let compare, value =
+        match order with
+        | Signed_order -> (Int64.compare, Key.Signed at)
+        | Unsigned_order -> (Int64.unsigned_compare, Key.Unsigned at)
+      in
+      if compare low at < 0 && compare at high < 0 then
+        Option.map
+          (fun at ->
+            ( Range { range with range = Between (lo, at) },
+              Range { range with range = Between (at, hi) } ))
+          (Result.to_option (Key.make range.key [ value ]))
+      else None
+  | (Whole _ | Range _), _ -> None
+
 let of_bounds (table : Schema.Table.t) values =
   match table.key with
   | No_key -> Error (`Chunk (Unsplittable_key table.name))

@@ -1,10 +1,11 @@
-type t = { create : string; later : string list }
+type deferral = All_keys | Foreign_keys
+type t = { create : string; later : string list; foreign : string list }
 
 (** What one line of a table definition declares, as far as loading cares. *)
 type definition = Kept | Plain_key | Full_text_key | Foreign_key
 
-let split table statement =
-  let whole = { create = statement; later = [] } in
+let split deferral table statement =
+  let whole = { create = statement; later = []; foreign = [] } in
   let identifier text from =
     let length = String.length text in
     let buffer = Buffer.create 16 in
@@ -42,7 +43,7 @@ let split table statement =
               (fun line -> Base.String.rstrip ~drop:(Char.equal ',') line)
               body
           in
-          let classify line =
+          let declared line =
             if
               List.exists
                 (fun prefix -> Base.String.is_prefix line ~prefix)
@@ -55,6 +56,11 @@ let split table statement =
               && Base.String.is_substring line ~substring:" FOREIGN KEY "
             then Foreign_key
             else Kept
+          in
+          let classify line =
+            match (deferral, declared line) with
+            | Foreign_keys, (Plain_key | Full_text_key) -> Kept
+            | (All_keys | Foreign_keys), kind -> kind
           in
           let auto =
             List.find_map
@@ -123,7 +129,7 @@ let split table statement =
                   ^ "\n" ^ String.concat "\n" tail;
                 later =
                   group (of_kind Plain_key)
-                  @ List.map (fun key -> alter [ key ]) (of_kind Full_text_key)
-                  @ group (of_kind Foreign_key);
+                  @ List.map (fun key -> alter [ key ]) (of_kind Full_text_key);
+                foreign = group (of_kind Foreign_key);
               }))
   | _ -> whole

@@ -427,7 +427,7 @@ and acknowledgements (t : t) line =
   Await.Await.Ivar.read Quiver_core.Blocking.await line.written;
   Channel.close line.channel
 
-let adjust (t : t) (decision : Streams.decision) =
+let adjust (t : t) (decision : Quiver_core.Width.decision) =
   match decision with
   | Keep -> ()
   | Open count ->
@@ -842,7 +842,7 @@ let create protection peer
                in
                let streamed streams_tuning =
                  let streams_tuning, decision =
-                   Streams.step streams_tuning
+                   Quiver_core.Width.step streams_tuning
                      {
                        delivered;
                        waiting =
@@ -856,7 +856,7 @@ let create protection peer
                  (streams_tuning, decision)
                in
                match
-                 (Streams.activity streams_tuning, Encoding.activity encoding)
+                 (Quiver_core.Width.activity streams_tuning, Encoding.activity encoding)
                with
                | Trying, (Watching | Trying) ->
                    tune (fst (streamed streams_tuning)) encoding
@@ -869,7 +869,7 @@ let create protection peer
          launch t
            (fun () ->
              tune
-               (Streams.start ~streams ~limit:most_streams)
+               (Quiver_core.Width.start ~width:streams ~limit:most_streams)
                (Encoding.start
                   ~rungs:(List.length t.ladder)
                   ~at:(Portable.Atomic.get t.rung)))
@@ -905,6 +905,9 @@ let request t message =
     | Table { table; _ } ->
         "table "
         ^ Sexplib0.Sexp.to_string_hum (Quiver_core.Schema.Name.sexp_of_t table.name)
+    | Grown { table } ->
+        "a part of table "
+        ^ Sexplib0.Sexp.to_string_hum (Quiver_core.Schema.Name.sexp_of_t table)
     | Objects { database; _ } -> "objects of " ^ (database :> string)
     | Finish _ -> "finish"
     | Hello _ | Begin _ | End _ | Abort _ | Heartbeat _ | Leave -> "control"
@@ -945,6 +948,9 @@ let database t name ~ddl = sent t (Database { name; ddl })
 
 let table t (table : Quiver_core.Schema.Table.t) ~ddl ~parts =
   sent t (Table { table; ddl; parts })
+
+let add_part t (table : Quiver_core.Schema.Table.t) =
+  sent t (Grown { table = table.name })
 
 let objects t database definitions = sent t (Objects { database; definitions })
 

@@ -160,7 +160,7 @@ type connections = {
       (** Every connection no query holds, for introspection and planning. *)
 }
 
-let connect config ~n =
+let connect config (wanted : Quiver_core.Provider_intf.sessions) =
   let opened () =
     Quiver_core.Guarded.create (fun () ->
         let { route; user; password; timeouts; _ } = config in
@@ -173,39 +173,74 @@ let connect config ~n =
             Conn.close conn;
             Error (Client error))
   in
-  match n with
-  | n when n < 1 -> Error (`Provider (Non_positive_sessions n))
-  | n -> (
-      let sessions, control =
-        Quiver_core.Concurrent.both
-          (fun () ->
-            Quiver_core.Concurrent.each n (fun (_ : int) -> opened ()))
-          opened
-      in
-      match
-        Base.Result.combine control (Base.Result.all sessions)
-          ~ok:(fun control sessions -> (control, sessions))
-          ~err:(fun error _ -> error)
-      with
-      | Ok (control, sessions) ->
-          let idle = Await.Await.Mpmc_queue.create () in
-          List.iter
-            (fun (connection : session Await.Capsule.Await.With_mutex.t) ->
-              Await.Await.Mpmc_queue.push idle connection)
-            (control :: sessions);
-          Ok
-            {
-              zero_dates = config.zero_dates;
-              server =
-                Quiver_core.Guarded.hold control (fun { conn; _ } ->
-                    Link.server (Conn.link conn));
-              control;
-              sessions = Iarray.of_list sessions;
-              idle;
-            }
-      | Error error ->
-          List.iter (Result.iter hang_up) (control :: sessions);
-          Error (`Provider error))
+  let most = match wanted with Exactly n | At_most n -> n in
+  if most < 1 then Error (`Provider (Non_positive_sessions most))
+  else
+    let sessions, control =
+      Quiver_core.Concurrent.both
+        (fun () -> Quiver_core.Concurrent.each most (fun (_ : int) -> opened ()))
+        opened
+    in
+    match
+      Base.Result.combine control (Base.Result.all sessions)
+        ~ok:(fun control sessions -> (control, sessions))
+        ~err:(fun error _ -> error)
+    with
+    | Error error ->
+        List.iter (Result.iter hang_up) (control :: sessions);
+        Error (`Provider error)
+    | Ok (control, sessions) -> (
+        let server =
+          Quiver_core.Guarded.hold control (fun { conn; _ } ->
+              Link.server (Conn.link conn))
+        in
+        let suggested () =
+          Quiver_core.Guarded.hold control (fun { conn; _ } ->
+              Result.map
+                (fun rows ->
+                  match (server, rows) with
+                  | Mysql_8_4 _, [ [| Some threads |] ] ->
+                      Option.map (fun threads -> 2 * threads)
+                        (int_of_string_opt threads)
+                  | ( (Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _),
+                      [ [| Some threads |] ] ) ->
+                      int_of_string_opt threads
+                  | _ -> None)
+                (client_failure (Conn.rows conn (Read_threads server))))
+        in
+        let kept =
+          match (wanted, server) with
+          | Exactly _, _ | At_most _, Mysql_8_0 _ -> Ok most
+          | At_most _, (Mysql_8_4 _ | Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _)
+            ->
+              Result.map
+                (fun suggestion ->
+                  Option.fold ~none:most ~some:(Int.min most)
+                    (Base.Option.filter suggestion ~f:(fun threads -> threads > 0)))
+                (suggested ())
+        in
+        match kept with
+        | Error error ->
+            List.iter hang_up (control :: sessions);
+            Error (`Provider error)
+        | Ok kept ->
+            let #(sessions, surplus) = Base.List.split_n sessions kept in
+            List.iter hang_up surplus;
+            let idle = Await.Await.Mpmc_queue.create () in
+            List.iter
+              (fun (connection : session Await.Capsule.Await.With_mutex.t) ->
+                Await.Await.Mpmc_queue.push idle connection)
+              (control :: sessions);
+            Ok
+              {
+                zero_dates = config.zero_dates;
+                server;
+                control;
+                sessions = Iarray.of_list sessions;
+                idle;
+              })
+
+let opened { sessions; _ } = Iarray.length sessions
 
 let disconnect { control; sessions; _ } =
   hang_up control;
@@ -982,6 +1017,20 @@ type decoder =
   | Unchecked_instant
   | Duration
   | Text
+
+let key_span { conn; _ } chunk =
+  match Quiver_core.Chunk.integer_key chunk with
+  | None -> Ok None
+  | Some (field : Quiver_core.Schema.Field.t) -> (
+      let query = Query.Key_span { chunk; key = field.name } in
+      let%bind rows = client (Conn.rows conn query) in
+      match (rows, key_parser field.ltype) with
+      | [ [| None; None |] ], _ -> Ok None
+      | [ [| Some lo; Some hi |] ], Some parse -> (
+          match (parse lo, parse hi) with
+          | Some lo, Some hi -> Ok (Some (lo, hi))
+          | _ -> unexpected query)
+      | _ -> unexpected query)
 
 let read_chunk { conn; _ } (chunk : Quiver_core.Chunk.t) writer =
   let table = Quiver_core.Chunk.table chunk in

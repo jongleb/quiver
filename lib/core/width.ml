@@ -5,30 +5,30 @@ type decision = Keep | Open of int | Close of int [@@deriving sexp_of ~portable]
 type phase =
   | Watching of { quiet : int }  (** Intervals before a trial may start. *)
   | Trying of {
-      before : int;  (** Connections open before the trial. *)
+      before : int;  (** Workers running before the trial. *)
       rate : float;  (** Bytes per interval before the trial. *)
       warming : int;  (** Intervals left before the trial is measured. *)
       measured : int list;  (** Bytes of the trial's intervals so far. *)
     }
 
 type t = {
-  streams : int;
+  width : int;
   limit : int;
-  growth : float;  (** How many times the connections a trial asks for. *)
+  growth : float;  (** How many times the workers a trial asks for. *)
   recent : int list;  (** Bytes of the last intervals, latest first. *)
   phase : phase;
 }
 
-let start ~streams ~limit =
+let start ~width ~limit =
   {
-    streams = Int.max 1 (Int.min streams limit);
+    width = Int.max 1 (Int.min width limit);
     limit = Int.max 1 limit;
     growth = 2.;
     recent = [];
     phase = Watching { quiet = 0 };
   }
 
-let streams t = t.streams
+let width t = t.width
 
 type activity = Watching | Trying
 
@@ -54,29 +54,29 @@ let step t { delivered; waiting } =
   | Watching { quiet = _ } -> (
       match
         ( waiting >= held_back,
-          t.streams < t.limit,
+          t.width < t.limit,
           List.length recent = 2 && List.for_all (fun bytes -> bytes > 0) recent )
       with
       | true, true, true ->
           let wanted =
             Int.min t.limit
-              (Int.max (t.streams + 1)
-                 (Float.to_int (Float.of_int t.streams *. t.growth)))
+              (Int.max (t.width + 1)
+                 (Float.to_int (Float.of_int t.width *. t.growth)))
           in
           ( {
               t with
-              streams = wanted;
+              width = wanted;
               recent;
               phase =
                 Trying
                   {
-                    before = t.streams;
+                    before = t.width;
                     rate = average recent;
                     warming = 1;
                     measured = [];
                   };
             },
-            Open (wanted - t.streams) )
+            Open (wanted - t.width) )
       | _ -> ({ t with recent; phase = Watching { quiet = 0 } }, Keep))
   | Trying ({ warming; _ } as trial) when warming > 0 ->
       ({ t with recent; phase = Trying { trial with warming = warming - 1 } }, Keep)
@@ -91,9 +91,9 @@ let step t { delivered; waiting } =
           let settle = 30 in
           ( {
               t with
-              streams = before;
+              width = before;
               growth = 1.25;
               recent;
               phase = Watching { quiet = settle };
             },
-            Close (t.streams - before) ))
+            Close (t.width - before) ))

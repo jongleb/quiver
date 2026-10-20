@@ -23,6 +23,7 @@ module Anything = struct
   let format () = Output_format.Sql
   let database () _ ~ddl:_ = Ok ()
   let table () _ ~ddl:_ ~parts:_ = Ok ()
+  let add_part () _ = Ok ()
   let objects () _ _ = Ok ()
   let part () _ ~index:_ = Ok ()
   let renderer () = ()

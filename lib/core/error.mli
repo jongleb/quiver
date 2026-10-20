@@ -11,6 +11,7 @@ type t =
   | `Batch of Batch.error
   | `Plan_opts of Plan_opts.error
   | `Dump_opts of Dump_opts.error
-  | `Concurrent of Concurrent.error ]
+  | `Concurrent of Concurrent.error
+  | `Filter of Filter.error ]
 [@@deriving sexp_of]
 (** Every error the core can produce, tagged by the module that raised it. *)

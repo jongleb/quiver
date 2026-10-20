@@ -1,5 +1,11 @@
 @@ portable
 
+(** How many sessions a dump reads on. *)
+type sessions =
+  | Exactly of int
+  | At_most of int
+      (** As many as the server suggests for its cores, up to this many. *)
+
 (** What a DBMS provider implements. It enters the core as a module argument;
     the core never sees concrete positions or sessions. *)
 module type S = sig
@@ -33,8 +39,11 @@ module type S = sig
       share a snapshot. *)
 
   val connect :
-    conn_config -> n:int -> (connections, [> `Provider of error ]) result
-  (** Opens [n] sessions, all at once. *)
+    conn_config -> sessions -> (connections, [> `Provider of error ]) result
+  (** Opens the sessions, all at once. *)
+
+  val opened : connections -> int
+  (** The sessions [connect] left open. *)
 
   val disconnect : connections -> unit
 
@@ -72,6 +81,15 @@ module type S = sig
   val ddl :
     session -> Ddl_target.t -> (string, [> `Provider of error ]) result
     @@ portable
+
+  val key_span :
+    session ->
+    Chunk.t ->
+    ((Key.value * Key.value) option, [> `Provider of error ]) result
+    @@ portable
+  (** The smallest and the largest key of a chunk's rows in the snapshot, for a
+      chunk with a {!Chunk.integer_key}; [None] for any other chunk or one with
+      no rows. *)
 
   val read_chunk :
     session ->

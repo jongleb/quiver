@@ -220,10 +220,16 @@ let run config ~dir target ~keys ~binlog ~threads =
   and progress_target =
     match target with Same_names -> "" | Into renamed -> (renamed :> string)
   in
-  let%bind { format; parts } = Quiver_core.Manifest.read manifest in
+  let%bind { format; tables; parts } = Quiver_core.Manifest.read manifest in
   let tables =
-    Base.List.Assoc.sort_and_group parts
-      ~compare:Quiver_core.Schema.Name.compare
+    let grouped = Base.Hashtbl.create (module Quiver_core.Schema.Name) in
+    List.iter
+      (fun (table, part) -> Base.Hashtbl.add_multi grouped ~key:table ~data:part)
+      (List.rev parts);
+    List.map
+      (fun table ->
+        (table, Option.value (Base.Hashtbl.find grouped table) ~default:[]))
+      tables
   in
   let databases =
     Base.List.stable_dedup ~compare:Quiver_core.Ident.compare
@@ -352,13 +358,13 @@ let run config ~dir target ~keys ~binlog ~threads =
               match keys with
               | With_table -> statement
               | After_data -> (
-                  let { Deferred_keys.create; later } =
-                    Deferred_keys.split table statement
+                  let { Deferred_keys.create; later; foreign } =
+                    Deferred_keys.split All_keys table statement
                   in
-                  match later with
+                  match later @ foreign with
                   | [] -> create
-                  | _ ->
-                      deferred := later;
+                  | keys ->
+                      deferred := keys;
                       create)))
     in
     let%bind delivery =

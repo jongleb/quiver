@@ -27,7 +27,7 @@ let () =
     exit 1
   in
   let connections =
-    match Quiver_mysql.Provider.connect conn ~n:1 with
+    match Quiver_mysql.Provider.connect conn (Exactly 1) with
     | Ok connections -> connections
     | Error _ -> fail Format.pp_print_string "connect failed"
   in

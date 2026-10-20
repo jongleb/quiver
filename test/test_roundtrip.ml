@@ -438,7 +438,7 @@ let unchecked_json =
 let localized =
   property "a localized manifest holds the other sink's format and parts"
     ~print:(fun counts -> String.concat "," (List.map string_of_int counts))
-    QCheck2.Gen.(list_size (int_range 1 4) (int_range 1 5))
+    QCheck2.Gen.(list_size (int_range 1 4) (int_range 0 5))
     (fun counts ->
       let table n =
         Support.get_ok
@@ -487,7 +487,7 @@ let localized =
       in
       let manifest =
         Quiver_core.Manifest.make ~level:(Any Snapshot) ~format:Sql
-          ~position:`Null
+          ~position:`Null ~threads:{ sessions = 1; readers = 1; peak = 1; renderers = 1 }
           ~schema:(Support.get_ok (Quiver_core.Schema.make tables))
           interleaved
       in
@@ -500,9 +500,13 @@ let localized =
       | Ok json -> (
           match Quiver_core.Manifest.read json with
           | Error _ -> false
-          | Ok { format; parts } ->
+          | Ok { format; tables = read; parts } ->
               let seen = Hashtbl.create 8 in
               format = Csv Rfc4180
+              && List.equal Quiver_core.Schema.Name.equal read
+                   (List.map
+                      (fun ({ name; _ } : Quiver_core.Schema.Table.t) -> name)
+                      tables)
               && List.for_all
                    (fun ( (name : Quiver_core.Schema.Name.t),
                           (got : Quiver_core.Manifest.part) ) ->
@@ -608,6 +612,7 @@ let messages =
             (let* table = table and* ddl = text in
              let+ parts = count in
              Quiver_net.Message.Table { table; ddl; parts });
+            map (fun table -> Quiver_net.Message.Grown { table }) table_name;
             map2
               (fun database definitions -> Quiver_net.Message.Objects { database; definitions })
               name (list_small definition);

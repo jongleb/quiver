@@ -338,6 +338,52 @@ objects() {
   creates sakila_c > "$dir.creates-sent"
   diff "$dir.creates" "$dir.creates-sent" > /dev/null || fail "sakila table definitions differ through the wire"
   echo "$service sakila: tables, data and objects sent by an agent to a collector"
+  sql -e "DROP DATABASE sakila_c"
+  watched 600 "$quiver" collect $wire --listen 127.0.0.1:7392 --to-tls "$tls" --to-port "$port" \
+    --to-password quiver --to-database sakila_c > "$dir.collect-keys.log" 2>&1
+  collector=$last
+  sleep 1
+  watched 600 "$quiver" agent $wire --tls "$tls" -P "$port" -p quiver -B sakila -t 4 \
+    --collector 127.0.0.1:7392 > "$dir.agent-keys.log" 2>&1
+  wait "$last" || fail "quiver agent, keys with the tables: $(cat "$dir.agent-keys.log") collector: $(cat "$dir.collect-keys.log")"
+  wait $collector || fail "quiver collect, keys with the tables: $(cat "$dir.collect-keys.log")"
+  [ "$(sums sakila)" = "$(sums sakila_c)" ] || fail "sakila table checksums differ through the wire, keys with the tables"
+  creates sakila_c > "$dir.creates-sent-keys"
+  diff "$dir.creates" "$dir.creates-sent-keys" > /dev/null || fail "sakila table definitions differ through the wire, keys with the tables"
+  echo "$service sakila: a collector creating child tables while their parents load does not stall"
+  rows_of() { for table in $(echo "$sakila_tables" | tr ',' ' '); do printf '%s %s\n' "$table" "$(sql -N -e "SELECT COUNT(*) FROM $1.$table")"; done; }
+  sql -e "DROP DATABASE IF EXISTS sakila_s; DROP DATABASE IF EXISTS sakila_o; DROP DATABASE IF EXISTS sakila_n"
+  "$quiver" copy --tls "$tls" -P "$port" -p quiver -B sakila --data-table sakila.actor --data-table sakila.film -t 4 \
+    --to-tls "$tls" --to-port "$port" --to-password quiver --to-database sakila_s > "$dir.rows.log" 2>&1 \
+    || fail "quiver copy --data-table: $(cat "$dir.rows.log")"
+  creates sakila_s > "$dir.creates-rows"
+  diff "$dir.creates" "$dir.creates-rows" > /dev/null || fail "--data-table: table definitions differ"
+  [ "$(definitions sakila)" = "$(definitions sakila_s)" ] || fail "--data-table: object definitions differ"
+  [ "$(sql -N -e "CHECKSUM TABLE sakila.actor, sakila.film" | sed 's/^sakila\.//')" = "$(sql -N -e "CHECKSUM TABLE sakila_s.actor, sakila_s.film" | sed 's/^sakila_s\.//')" ] \
+    || fail "--data-table: checksums of the chosen tables differ"
+  [ "$(rows_of sakila_s | grep -v -e '^actor ' -e '^film ' | awk '$2 != 0' | wc -l | tr -d ' ')" = 0 ] \
+    || fail "--data-table: tables outside it got rows: $(rows_of sakila_s | awk '$2 != 0')"
+  echo "$service sakila: every table's schema and objects, rows of the two chosen tables only"
+  "$quiver" copy --tls "$tls" -P "$port" -p quiver -T sakila.actor -T sakila.film --objects none -t 4 \
+    --to-tls "$tls" --to-port "$port" --to-password quiver --to-database sakila_o > "$dir.none.log" 2>&1 \
+    || fail "quiver copy --objects none: $(cat "$dir.none.log")"
+  [ "$(sql -N -e "SELECT GROUP_CONCAT(table_name ORDER BY table_name) FROM information_schema.tables WHERE table_schema = 'sakila_o'")" = "actor,film" ] \
+    || fail "--objects none: other tables or views were copied"
+  [ -z "$(definitions sakila_o)" ] || fail "--objects none: objects were copied: $(definitions sakila_o | head -3)"
+  [ "$(sql -N -e "CHECKSUM TABLE sakila.actor, sakila.film" | sed 's/^sakila\.//')" = "$(sql -N -e "CHECKSUM TABLE sakila_o.actor, sakila_o.film" | sed 's/^sakila_o\.//')" ] \
+    || fail "--objects none: checksums differ"
+  echo "$service sakila: two tables copied without the database's objects"
+  rm -rf "$dir-schema"
+  "$quiver" dump --tls "$tls" -P "$port" -p quiver -B sakila --no-data -t 4 -o "$dir-schema" > "$dir-schema.log" 2>&1 \
+    || fail "quiver dump --no-data: $(cat "$dir-schema.log")"
+  ! ls "$dir-schema"/sakila.*.[0-9]*.sql > /dev/null 2>&1 || fail "--no-data: data files were written"
+  "$quiver" load --tls "$tls" -P "$port" -p quiver -d "$dir-schema" -B sakila_n -t 4 > "$dir-schema.load.log" 2>&1 \
+    || fail "quiver load of --no-data: $(cat "$dir-schema.load.log")"
+  creates sakila_n > "$dir.creates-schema"
+  diff "$dir.creates" "$dir.creates-schema" > /dev/null || fail "--no-data: table definitions differ after quiver load"
+  [ "$(definitions sakila)" = "$(definitions sakila_n)" ] || fail "--no-data: object definitions differ after quiver load"
+  [ "$(rows_of sakila_n | awk '$2 != 0' | wc -l | tr -d ' ')" = 0 ] || fail "--no-data: rows were loaded"
+  echo "$service sakila: --no-data dumps and loads every table's schema and objects, no rows"
 }
 # Faults in the middle of a dump through toxiproxy (downstream slowed to
 # 256 KB/s so the dump lasts): a reset connection, a silent one, sessions

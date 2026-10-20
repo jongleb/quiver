@@ -51,7 +51,7 @@ let accept listening protection ~reconnect =
         Error (`Collector (Foreign_byte_order byte_order))
     | Hello { session; streams; chunks; _ } ->
         Ok { control; id = session; streams; chunks; protection; reconnect }
-    | Database _ | Table _ | Objects _ | Begin _ | End _ | Abort _ | Finish _
+    | Database _ | Table _ | Grown _ | Objects _ | Begin _ | End _ | Abort _ | Finish _
     | Heartbeat _ | Leave ->
         out_of_place "before hello"
   in
@@ -241,7 +241,7 @@ let relay listening (session : session) (downstream : downstream) =
                 | Ok message -> (
                     (match message with
                     | Leave -> Portable.Atomic.set left `Left
-                    | Hello _ | Database _ | Table _ | Objects _ | Begin _ | End _
+                    | Hello _ | Database _ | Table _ | Grown _ | Objects _ | Begin _ | End _
                     | Abort _ | Finish _ | Heartbeat _ ->
                         ());
                     match Channel.send into (Message.sexp_of_control message) with
@@ -800,14 +800,14 @@ module Make (S : Quiver_core.Sink_intf.S) = struct
             | Error _, `Finished -> Ok ()
             | (Error _ as error), `Unfinished -> error)
         | Ok
-            ( Hello _ | Database _ | Table _ | Objects _ | Begin _ | End _
+            ( Hello _ | Database _ | Table _ | Grown _ | Objects _ | Begin _ | End _
             | Abort _ | Finish _ )
           when stage = `Concluded ->
             out_of_place "a message after finish"
         | Ok message ->
         (match message with
         | Hello _ | Heartbeat _ | Leave -> ()
-        | Database _ | Table _ | Objects _ | Begin _ | End _ | Abort _ | Finish _
+        | Database _ | Table _ | Grown _ | Objects _ | Begin _ | End _ | Abort _ | Finish _
           ->
             Portable.Atomic.incr messages);
         let answered local =
@@ -835,6 +835,12 @@ module Make (S : Quiver_core.Sink_intf.S) = struct
                   S.table sink table ~ddl ~parts)
             in
             next stage channel
+        | Grown { table = name } -> (
+            match Hashtbl.find_opt tables name with
+            | None -> out_of_place "a part of a table never announced"
+            | Some table ->
+                let%bind () = answered (fun () -> S.add_part sink table) in
+                next stage channel)
         | Objects { database; definitions } ->
             let%bind () =
               answered (fun () -> S.objects sink database definitions)

@@ -38,6 +38,11 @@ module type S = sig
     (unit, [> `Sink of error ]) result
     @@ portable
 
+  val add_part :
+    t -> Schema.Table.t -> (unit, [> `Sink of error ]) result @@ portable
+  (** The table gets one part more than [table] announced: called while
+      another of its parts is open, so before its last part closes. *)
+
   val objects :
     t -> Ident.t -> Definition.t list -> (unit, [> `Sink of error ]) result
     @@ portable

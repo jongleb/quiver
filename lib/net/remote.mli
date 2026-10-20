@@ -63,7 +63,7 @@ val create :
     session opens more data connections, up to [most_streams], and keeps them
     only when they carry more ({!Streams}). *)
 
-val adjust : t -> Streams.decision -> unit
+val adjust : t -> Quiver_core.Width.decision -> unit
 (** Opens or closes so many data connections now, as the session does on its
     own while [most_streams] allows; the last one is never closed. *)
 

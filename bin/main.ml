@@ -12,6 +12,8 @@ type reading = {
   conn : Quiver_mysql.Provider.conn_config;
   mode : Quiver_mysql.Provider.snapshot_mode;
   filter : Quiver_core.Filter.t;
+  rows : Quiver_core.Filter.rows;
+  objects : Quiver_core.Filter.objects;
   opts : Quiver_core.Dump_opts.t;
 }
 (** What a dump reads and how. *)
@@ -55,17 +57,17 @@ let () =
   in
   let read (type (sink : value mod contended portable))
       (module Sink : Quiver_core.Sink_intf.S with type t = sink) (sink : sink)
-      { conn; mode; filter; opts } ~report =
+      { conn; mode; filter; rows; objects; opts } ~report =
     let module Dump = Quiver_core.Dump.Make (Quiver_mysql.Provider) (Sink) in
     let result =
       match mode with
       | Ftwrl | Backup_stage ->
           Dump.run
-            { conn; mode; level = Snapshot; filter; opts }
+            { conn; mode; level = Snapshot; filter; rows; objects; opts }
             sink
       | Trx_only ->
           Dump.run
-            { conn; mode; level = Best_effort; filter; opts }
+            { conn; mode; level = Best_effort; filter; rows; objects; opts }
             sink
     in
     match result with
@@ -80,6 +82,11 @@ let () =
                  | Done { part = { rows; _ }; _ } -> rows
                  | Pending -> 0))
           ~chunks:(List.length manifest.chunks);
+        Format.printf
+          "%d readers at the start, %d at most, %d sessions, %d renderers, %d \
+           cores to use@."
+          manifest.threads.readers manifest.threads.peak manifest.threads.sessions
+          manifest.threads.renderers opts.cores;
         Result.iter
           (function
             | Quiver_mysql.Provider.Locked { lock; lock_held; _ } ->
@@ -173,7 +180,7 @@ let () =
                       (Quiver_sink.Compression.Level.of_int level)
               in
               let streams =
-                Option.value streams ~default:reading.opts.threads
+                Option.value streams ~default:(Quiver_core.Dump_opts.most_readers reading.opts)
               in
               let%map sink =
                 Quiver_net.Remote.create protection peer
@@ -181,7 +188,7 @@ let () =
                     streams;
                     most_streams;
                     chunks =
-                      Option.value chunks ~default:(2 * reading.opts.threads);
+                      Option.value chunks ~default:(2 * Quiver_core.Dump_opts.most_readers reading.opts);
                     compression;
                     pace =
                       Option.map
@@ -311,7 +318,7 @@ let () =
             match
               Quiver_load.Copy.create to_server (target into) ~keys ~binlog
                 ~sessions:
-                  (Option.value target_threads ~default:reading.opts.threads)
+                  (Option.value target_threads ~default:(Quiver_core.Dump_opts.most_readers reading.opts))
             with
             | Error (`Sink error) -> failed (Quiver_load.Copy.sexp_of_error error)
             | Ok sink ->
@@ -582,6 +589,26 @@ let () =
               "$(b,ftwrl) and $(b,backup-stage) (MariaDB) give one consistent \
                snapshot; $(b,trx-only) takes no lock and is only best effort.")
     in
+    let rule parse =
+      Arg.conv
+        ( parse,
+          fun ppf rule ->
+            Sexplib0.Sexp.pp_hum ppf (Quiver_core.Filter.sexp_of_rule rule) )
+    in
+    let database_rule =
+      rule (fun text ->
+          Result.map
+            (fun database -> Quiver_core.Filter.Database database)
+            (ident_of_string text))
+    and table_rule =
+      rule (fun text ->
+          match Base.String.lsplit2 text ~on:'.' with
+          | None -> Error (`Msg "expected DB.TABLE")
+          | Some (database, table) ->
+              let%map database = ident_of_string database
+              and table = ident_of_string table in
+              Quiver_core.Filter.Table { database; table })
+    in
     let filter =
       Term.(
         const (fun databases tables ->
@@ -589,42 +616,73 @@ let () =
             | [] -> Quiver_core.Filter.Everything
             | first :: rest -> Only (first, rest))
         $ Arg.(
-            value
-            & opt_all
-                (conv
-                   ( (fun text ->
-                       Result.map
-                         (fun database -> Quiver_core.Filter.Database database)
-                         (ident_of_string text)),
-                     fun ppf rule ->
-                       Sexplib0.Sexp.pp_hum ppf
-                         (Quiver_core.Filter.sexp_of_rule rule) ))
-                []
+            value & opt_all database_rule []
             & info [ "B"; "database" ] ~docv:"DB"
                 ~doc:"Dump only $(docv); repeatable.")
         $ Arg.(
-            value
-            & opt_all
-                (conv
-                   ( (fun text ->
-                       match Base.String.lsplit2 text ~on:'.' with
-                       | None -> Error (`Msg "expected DB.TABLE")
-                       | Some (database, table) ->
-                           let%map database = ident_of_string database
-                           and table = ident_of_string table in
-                           Quiver_core.Filter.Table { database; table }),
-                     fun ppf rule ->
-                       Sexplib0.Sexp.pp_hum ppf
-                         (Quiver_core.Filter.sexp_of_rule rule) ))
-                []
+            value & opt_all table_rule []
             & info [ "T"; "table" ] ~docv:"DB.TABLE"
-                ~doc:"Dump only $(docv); repeatable."))
+                ~doc:
+                  "Dump only $(docv); repeatable. Its database's views, \
+                   triggers, routines and events still come along unless \
+                   $(b,--objects none)."))
+    in
+    let rows =
+      Term.(
+        term_result'
+          (const (fun data databases tables ->
+               match (data, databases @ tables) with
+               | `Rows, [] -> Ok Quiver_core.Filter.All_rows
+               | `Rows, first :: rest -> Ok (Rows_of (first, rest))
+               | `No_data, [] -> Ok No_rows
+               | `No_data, _ :: _ ->
+                   Error "--no-data takes no --data-database or --data-table")
+          $ Arg.(
+              value
+              & vflag `Rows
+                  [
+                    ( `No_data,
+                      info [ "no-data" ]
+                        ~doc:"Take every table's schema and no rows." );
+                  ])
+          $ Arg.(
+              value & opt_all database_rule []
+              & info [ "data-database" ] ~docv:"DB"
+                  ~doc:
+                    "Take rows only of $(docv)'s tables, repeatable; the other \
+                     tables of the dump give only their schema.")
+          $ Arg.(
+              value & opt_all table_rule []
+              & info [ "data-table" ] ~docv:"DB.TABLE"
+                  ~doc:
+                    "Take rows only of $(docv), repeatable; the other tables of \
+                     the dump give only their schema.")))
+    and objects =
+      Arg.(
+        value
+        & opt
+            (enum
+               [
+                 ("all", Quiver_core.Filter.With_objects);
+                 ("none", Without_objects);
+               ])
+            With_objects
+        & info [ "objects" ] ~docv:"WHICH"
+            ~doc:
+              "$(b,all) takes the dumped databases' views, triggers, routines \
+               and events; $(b,none) takes none of them.")
     in
     let threads =
       Arg.(
-        value & opt int 4
+        value
+        & opt (some int) None
         & info [ "t"; "threads" ] ~docv:"N"
-            ~doc:"Database sessions reading in parallel, one domain each.")
+            ~doc:
+              "Database sessions reading in parallel, one domain each; by \
+               default half the cores quiver may use (at least 4), fewer when \
+               the server suggests fewer. quiver uses this machine's fast \
+               physical cores within its CPU quota, half of them when the \
+               server is on this machine.")
     in
     let render_threads =
       Arg.(
@@ -632,8 +690,8 @@ let () =
         & opt (some int) None
         & info [ "render-threads" ] ~docv:"N"
             ~doc:
-              "Domains turning batches into output; defaults to half the \
-               readers, within the cores left after them.")
+              "Domains turning batches into output; by default half the \
+               readers, within the cores quiver may use.")
     in
     let chunk_bytes =
       Arg.(
@@ -648,23 +706,30 @@ let () =
       term_result
         (const
            (fun
-             conn mode filter threads render_threads chunk_bytes batch_bytes ->
+             conn mode filter rows objects threads render_threads chunk_bytes
+             batch_bytes ->
              Result.map_error
                (fun error ->
                  `Msg (Sexplib0.Sexp.to_string_hum (Quiver_core.Error.sexp_of_t error)))
                (let%bind plan = Quiver_core.Plan_opts.make ~chunk_bytes in
                 let%map opts =
-                  Quiver_core.Dump_opts.make ~plan ~threads
-                    ~render_threads:
-                      (Option.value render_threads
-                         ~default:
-                           (Int.max 1
-                              (Int.min (threads / 2)
-                                 (Domain.recommended_domain_count () - threads))))
+                  Quiver_core.Dump_opts.make ~plan
+                    ~readers:
+                      (Option.fold ~none:Quiver_core.Dump_opts.Fitting
+                         ~some:(fun threads -> Quiver_core.Dump_opts.Readers threads)
+                         threads)
+                    ~renderers:
+                      (Option.fold ~none:Quiver_core.Dump_opts.Spare
+                         ~some:(fun threads -> Quiver_core.Dump_opts.Renderers threads)
+                         render_threads)
+                    ~cores:
+                      (Quiver_core.Cores.budget
+                         (Quiver_mysql.Local.machine conn.Quiver_mysql.Provider.route))
                     ~batch_bytes
                 in
-                { conn; mode; filter; opts }))
-        $ server `Source $ mode $ filter $ threads $ render_threads $ chunk_bytes
+                { conn; mode; filter; rows; objects; opts }))
+        $ server `Source $ mode $ filter $ rows $ objects $ threads $ render_threads
+        $ chunk_bytes
         $ batch_bytes))
   in
   let output =

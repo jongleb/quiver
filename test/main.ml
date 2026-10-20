@@ -25,10 +25,11 @@ let () =
       ("statements", Test_statements.tests);
       ("compression", Test_compression.tests);
       ("tcp", Test_tcp.tests);
-      ("streams", Test_streams.tests);
+      ("width", Test_width.tests);
       ("encoding", Test_encoding.tests);
       ("deferred keys", Test_deferred_keys.tests);
       ("moment", Test_moment.tests);
       ("assembly", Test_assembly.tests);
       ("concurrency", Test_concurrency.tests);
+      ("cores", Test_cores.tests);
     ]

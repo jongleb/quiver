@@ -17,7 +17,7 @@ let carried { flow; capacity; demand } streams noise =
   let rate = Int.min demand (Int.min capacity (streams * flow)) in
   let delivered = rate + (rate * noise / 1000) in
   {
-    Quiver_net.Streams.delivered;
+    Quiver_core.Width.delivered;
     waiting = (match rate < demand with true -> 1. | false -> 0.);
   }
 
@@ -28,11 +28,11 @@ let run path ~streams ~limit noises =
     match noises with
     | [] -> List.rev trace
     | noise :: rest ->
-        let sample = carried path (Quiver_net.Streams.streams t) noise in
-        let next, decision = Quiver_net.Streams.step t sample in
-        go next rest ((Quiver_net.Streams.streams t, decision, next) :: trace)
+        let sample = carried path (Quiver_core.Width.width t) noise in
+        let next, decision = Quiver_core.Width.step t sample in
+        go next rest ((Quiver_core.Width.width t, decision, next) :: trace)
   in
-  go (Quiver_net.Streams.start ~streams ~limit) noises []
+  go (Quiver_core.Width.start ~width:streams ~limit) noises []
 
 let scenario =
   QCheck2.Gen.(
@@ -55,11 +55,11 @@ let tests =
         ~print scenario (fun (path, streams, limit, noises) ->
           List.for_all
             (fun (before, decision, next) ->
-              let after = Quiver_net.Streams.streams next in
+              let after = Quiver_core.Width.width next in
               after >= 1
               && after <= Int.max 1 limit
               &&
-              match (decision : Quiver_net.Streams.decision) with
+              match (decision : Quiver_core.Width.decision) with
               | Keep -> after = before
               | Open n -> n > 0 && after = before + n
               | Close n -> n > 0 && after = before - n)
@@ -70,7 +70,7 @@ let tests =
           let roomy = { path with capacity = path.demand; flow = path.demand } in
           List.for_all
             (fun (_, decision, _) ->
-              match (decision : Quiver_net.Streams.decision) with
+              match (decision : Quiver_core.Width.decision) with
               | Keep -> true
               | Open _ | Close _ -> false)
             (run roomy ~streams ~limit noises));
@@ -83,7 +83,7 @@ let tests =
             Int.min path.demand (Int.min path.capacity (streams * path.flow))
           in
           let _, _, last = List.nth (run path ~streams ~limit noises) 59 in
-          rate (Quiver_net.Streams.streams last) * 5 >= rate limit * 4);
+          rate (Quiver_core.Width.width last) * 5 >= rate limit * 4);
       QCheck2.Test.make ~count:500
         ~name:"on a path that more connections do not widen, every trial closes"
         ~print scenario (fun (path, streams, limit, noises) ->
@@ -104,14 +104,14 @@ let tests =
               (fun at ->
                 at >= Array.length decisions
                 ||
-                match (decisions.(at) : Quiver_net.Streams.decision) with
+                match (decisions.(at) : Quiver_core.Width.decision) with
                 | Close closed -> closed = opened
                 | Keep | Open _ -> false)
               (List.init trial (fun step -> from + 1 + step))
           in
           Array.for_all Fun.id
             (Array.mapi
-               (fun at (decision : Quiver_net.Streams.decision) ->
+               (fun at (decision : Quiver_core.Width.decision) ->
                  match decision with
                  | Open opened -> closes_within opened at
                  | Keep | Close _ -> true)

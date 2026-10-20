@@ -22,3 +22,7 @@ val send_space : unit -> int option
 (** Bytes a server's Unix socket holds unread before its writes block, where
     the system sets it for every socket (macOS: [net.local.stream.sendspace],
     8 KiB unless raised, which makes a socket several times slower than TCP). *)
+
+val machine : Link.route -> Quiver_core.Cores.server
+(** Whether a route leads to a server on this machine: a Unix socket or a
+    loopback address. *)

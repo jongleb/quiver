@@ -87,3 +87,12 @@ let socket { getenv; read; entries; exists } =
 external send_space : unit -> int = "quiver_local_send_space" [@@noalloc]
 
 let send_space () = match send_space () with -1 -> None | space -> Some space
+
+let machine (route : Link.route) : Quiver_core.Cores.server =
+  match route with
+  | Socket _ -> Same_machine
+  | Tcp { host; _ }
+    when String.equal host "localhost" || String.equal host "::1"
+         || Base.String.is_prefix host ~prefix:"127." ->
+      Same_machine
+  | Tcp _ -> Other_machine

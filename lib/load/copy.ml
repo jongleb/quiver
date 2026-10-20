@@ -46,6 +46,10 @@ type t = {
     (Quiver_core.Schema.Name.t, deferred) Portable_lockfree_htbl.t;
   building : (unit, error) result Await.Await.Ivar.t list Portable.Atomic.t;
       (** Keys being added, one thread per table. *)
+  foreign :
+    (Quiver_core.Schema.Name.t * (string * string list)) list Portable.Atomic.t;
+      (** Foreign keys of each table, added once all the data is in: adding one
+          waits for its parent's open loads. *)
   databases : Quiver_core.Ident.t list Portable.Atomic.t;
   objects :
     (Quiver_core.Ident.t * Quiver_sink.Layout.script list) list
@@ -121,6 +125,7 @@ let create config target ~keys ~binlog ~sessions =
        idle;
        deferred = Portable_lockfree_htbl.create (module Quiver_core.Schema.Name);
        building = Portable.Atomic.make [];
+       foreign = Portable.Atomic.make [];
        databases = Portable.Atomic.make [];
        objects = Portable.Atomic.make [];
        scratch = Quiver_core.Buffer_pool.create ();
@@ -155,10 +160,11 @@ let table t ({ name; _ } : Quiver_core.Schema.Table.t) ~ddl ~parts =
   Result.map_error
     (fun error -> `Sink error)
     (let into = { name with database = Load.renamed t.target name.database } in
-     let { Deferred_keys.create; later } =
-       match t.keys with
-       | With_table -> { Deferred_keys.create = ddl; later = [] }
-       | After_data -> Deferred_keys.split name.table ddl
+     let deferral : Deferred_keys.deferral =
+       match t.keys with With_table -> Foreign_keys | After_data -> All_keys
+     in
+     let { Deferred_keys.create; later; foreign } =
+       Deferred_keys.split deferral name.table ddl
      in
      let%map () =
        on_idle_loader t (fun link ->
@@ -167,6 +173,13 @@ let table t ({ name; _ } : Quiver_core.Schema.Table.t) ~ddl ~parts =
            match (later, parts) with
            | first :: rest, 0 -> add_keys link into (first, rest)
            | [], _ | _ :: _, _ -> Ok ())
+     in
+     let () =
+       match foreign with
+       | [] -> ()
+       | first :: rest ->
+           Portable.Atomic.update t.foreign ~pure_f:(fun foreign ->
+               (into, (first, rest)) :: foreign)
      in
      match later with
      | first :: rest when parts > 0 ->
@@ -186,6 +199,11 @@ let objects t database definitions =
     (let%map scripts = Quiver_sink.Layout.scripts database definitions in
      Portable.Atomic.update t.objects ~pure_f:(fun objects ->
          (database, scripts) :: objects))
+
+let add_part t ({ name; _ } : Quiver_core.Schema.Table.t) =
+  match Portable_lockfree_htbl.find t.deferred name with
+  | Null -> Ok ()
+  | This { remaining; _ } -> Ok (Portable.Atomic.incr remaining)
 
 let part t
     ({ name; fields = first, rest; _ } as table : Quiver_core.Schema.Table.t)
@@ -354,6 +372,13 @@ let finish t ~source:_ ~tables:_ ~manifest:_ =
          ~init:()
          ~f:(fun () added ->
            Await.Await.Ivar.read Quiver_core.Blocking.await added)
+     in
+     let%bind () =
+       Base.Result.all_unit
+         (Quiver_core.Concurrent.spread ~workers:(Iarray.length t.loaders)
+            (Iarray.of_list (List.rev (Portable.Atomic.get t.foreign)))
+            (fun (into, keys) ->
+              on_idle_loader t (fun link -> add_keys link into keys)))
      in
      let target = t.target and objects = Portable.Atomic.get t.objects in
      Base.Result.all_unit

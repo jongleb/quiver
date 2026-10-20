@@ -208,8 +208,11 @@ opam exec --switch=quiver-ox -- dune build
 
 ```sh
 quiver dump -h db.example -u backup -p secret -t 8 -o ./dump      # whole server
-quiver dump -B shop --compress zstd -o ./shop                      # one database
+quiver dump -B shop --compress zstd -o ./shop                      # one database; threads from the cores and the server
 quiver dump -T shop.orders --format csv --csv-dialect mysql-load-data -o ./csv
+quiver dump -B shop --data-table shop.orders -o ./shop             # every table's schema, rows of orders only
+quiver dump -B shop --no-data -o ./schema                          # schema and objects, no rows
+quiver dump -T shop.orders --objects none -o ./orders              # without the database's views, triggers, routines, events
 quiver dump --snapshot backup-stage -o ./dump                      # MariaDB: block commits only
 quiver dump -S /var/run/mysqld/mysqld.sock -o ./dump              # over a Unix socket (skip_networking)
 quiver dump -o ./dump                                              # no -h: the local socket, as mysql (my.cnf [client], MYSQL_UNIX_PORT)

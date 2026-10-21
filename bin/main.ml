@@ -164,7 +164,7 @@ let () =
     listener
   in
   let agent reading protection collector level streams most_streams chunks
-      rate traffic reconnect =
+      rate traffic reconnect stall =
     (
         (
             let started = Quiver_core.Stopwatch.start () in
@@ -196,6 +196,7 @@ let () =
                         rate;
                     traffic;
                     reconnect = Core.Time_ns.Span.of_sec reconnect;
+                    stall = Core.Time_ns.Span.of_sec stall;
                   }
               in
               (sink, streams)
@@ -229,10 +230,12 @@ let () =
                     ~report:(fun ~rows ~chunks ->
                       Format.printf
                         "sent %d rows in %d chunks to %s in %a, %d streams at \
-                         the end@."
+                         the end, waiting for acks %a in all@."
                         rows chunks collector Core.Time_ns.Span.pp
                         (Quiver_core.Stopwatch.elapsed started)
-                        (Quiver_net.Remote.streams sink))
+                        (Quiver_net.Remote.streams sink)
+                        Core.Time_ns.Span.pp
+                        (Quiver_net.Remote.waited_for_acks sink))
                 in
                 Quiver_net.Remote.shutdown sink;
                 code))
@@ -1010,7 +1013,15 @@ let () =
                 ~doc:
                   "The DSCP every packet of the dump carries; 8 (CS1) asks \
                    routers to let other traffic go first.")
-        $ reconnect)
+        $ reconnect
+        $ Arg.(
+            value & opt float 2.
+            & info [ "stall" ] ~docv:"SECONDS"
+                ~doc:
+                  "A data connection whose oldest frame waits this long for its \
+                   acknowledgement, while another connection waits for none or \
+                   eight times less, is taken for a dead path: its frames go to \
+                   the other connections and a new one replaces it."))
   in
   let listen =
     Cmdliner.Arg.(

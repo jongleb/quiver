@@ -357,11 +357,7 @@ let relay listening (session : session) (downstream : downstream) =
             replaced ()
       in
       let outcome = watch first in
-      Result.iter_error
-        (fun (_ : Channel.error) ->
-          Quiver_core.Guarded.hold pairs (fun pairs ->
-              List.iter Channel.abort pairs.opened))
-        outcome;
+      Quiver_core.Guarded.hold pairs (fun pairs -> List.iter Channel.abort pairs.opened);
       Channel.stop listening;
       List.iter (Option.iter Quiver_core.Concurrent.join) (late :: tasks);
       Quiver_core.Guarded.hold pairs (fun pairs ->
@@ -1160,6 +1156,9 @@ module Make (S : Quiver_core.Sink_intf.S) = struct
            in
            S.finish sink ~source ~tables ~manifest))
       (Await.Await.Ivar.read Quiver_core.Blocking.await finishing);
+    List.iter Channel.sever
+      (List.map Channel.handle channels
+      @ Quiver_core.Guarded.hold late (fun late -> late.handles));
     List.iter (Option.iter Quiver_core.Concurrent.join) threads;
     Channel.stop listening;
     Option.iter Quiver_core.Concurrent.join replacing;

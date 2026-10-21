@@ -67,12 +67,20 @@ type report = Created of data_file list | Filled | Ran | Failed of failure
 (** Whether the loading threads still work, or only answer after a failure. *)
 type course = Going | Stopping
 
-let session (config : Quiver_mysql.Provider.conn_config) binlog =
+type uniqueness = Unchecked | Checked_on_mariadb
+
+let session (config : Quiver_mysql.Provider.conn_config) binlog uniqueness =
   let%bind link =
     Quiver_mysql.Link.connect ~local_data:With_local_data config.route
       ~timeouts:config.timeouts ~user:config.user ~password:config.password
   in
   let%bind () = Quiver_mysql.Link.run_statement link Prepare_load in
+  let%bind () =
+    match (uniqueness, Quiver_mysql.Link.server link) with
+    | Checked_on_mariadb, (Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _) ->
+        Quiver_mysql.Link.run_statement link Check_unique
+    | Unchecked, _ | Checked_on_mariadb, (Mysql_8_0 _ | Mysql_8_4 _) -> Ok ()
+  in
   let%map () =
     match binlog with
     | Write_binlog -> Ok ()
@@ -80,13 +88,13 @@ let session (config : Quiver_mysql.Provider.conn_config) binlog =
   in
   link
 
-let sessions config binlog ~count ~control ~close =
+let sessions config binlog uniqueness ~count ~control ~close =
   let loaders, control =
     Quiver_core.Concurrent.both
       (fun () ->
         Quiver_core.Concurrent.spread ~workers:count (Iarray.init count Fun.id) (fun (_ : int) ->
             Quiver_core.Guarded.create (fun () ->
-                (session config binlog : (Quiver_mysql.Link.t, cause) result))))
+                (session config binlog uniqueness : (Quiver_mysql.Link.t, cause) result))))
       control
   in
   match
@@ -279,9 +287,9 @@ let run config ~dir target ~keys ~binlog ~threads =
          databases)
   in
   let%bind (control, loaded), links =
-    sessions config binlog ~count:threads
+    sessions config binlog Unchecked ~count:threads
       ~control:(fun () ->
-        let%bind control = session config binlog in
+        let%bind control = session config binlog Unchecked in
         match
           let%bind () = Quiver_mysql.Link.run_statement control Create_progress_schema in
           let%bind () = Quiver_mysql.Link.run_statement control Create_progress_table in

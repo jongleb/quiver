@@ -9,6 +9,7 @@ type error =
   | Codec of string @@ aliased
   | Manifest of Quiver_core.Manifest.error
   | Unstarted of Quiver_core.Concurrent.error
+  | Stalled
 [@@deriving sexp_of ~portable]
 
 type compression = Fixed of Quiver_sink.Compression.t | Adaptive
@@ -22,6 +23,7 @@ type settings = {
   pace : int option;
   traffic : Quiver_core.Tcp.Class.t option;
   reconnect : Core.Time_ns.Span.t;
+  stall : Core.Time_ns.Span.t;
 }
 
 (** A frame in the first [length] bytes of a framing buffer, which the sender
@@ -40,6 +42,10 @@ type framed = { text : string; length : int; raw : int }
 (** What a data connection's sender receives. *)
 type outgoing = Frame of framed | Stop
 
+(** Whether a data connection's sender found its window full since the last
+    ack. *)
+type pressure = Pressed | Free
+
 (** Whether a data connection still carries frames. *)
 type link =
   | Alive
@@ -50,6 +56,12 @@ type sent = {
   unacknowledged : framed Queue.t;  (** Written, oldest first. *)
   mutable acknowledged : int;  (** Frames the collector has, from the first. *)
   mutable link : link;
+  mutable waiting : Quiver_core.Stopwatch.t;
+      (** Since the oldest unacknowledged frame waits: its writing or the last
+          ack, whichever came later. *)
+  mutable allowed : int;  (** Frames the window holds now. *)
+  mutable unacknowledged_bytes : int;
+  mutable pressure : pressure;
 }
 (** What one data connection carried. *)
 
@@ -67,6 +79,9 @@ type line = {
 type phase = Running | Stopping
 
 type senders = { mutable started : unit Await.Await.Ivar.t list }
+
+type lines = { mutable lines : line list }
+(** The data connections that may still carry frames. *)
 (** Filled when each data sender ended, with a TLS [close_notify]: [shutdown]
     waits for them, and for the control writer. *)
 
@@ -127,6 +142,7 @@ type t = {
   path : Quiver_core.Tcp.path option;  (** Of the first control connection. *)
   reconnect : Core.Time_ns.Span.t;
       (** How long replacing a broken control connection may take. *)
+  lines : lines Await.Capsule.Await.With_mutex.t;
   outbox : outbound Await.Await.Mpmc_queue.t;  (** To the control writer. *)
   replies : int Portable.Atomic.t;  (** Counted replies that arrived. *)
   silent : int Portable.Atomic.t;
@@ -156,6 +172,8 @@ type t = {
           looked. *)
   waited : int Portable.Atomic.t;
       (** Nanoseconds rendering waited for room since the tuner last looked. *)
+  unacknowledged_wait : int Portable.Atomic.t;
+      (** Nanoseconds data connections waited for acks to write more, in all. *)
   control_written : unit Await.Await.Ivar.t;
   senders : senders Await.Capsule.Await.With_mutex.t;
 }
@@ -297,15 +315,22 @@ and replace (t : t) pauses error =
           replace t rest error)
 
 and carry (t : t) channel =
+  let first_window = 128 in
   let line =
     {
       channel;
       sent =
         Await.Capsule.Await.With_mutex.create (fun () ->
-            { unacknowledged = Queue.create (); acknowledged = 0; link = Alive });
-      window =
-        (let unacknowledged_frames = 32 in
-         Await.Await.Semaphore.create unacknowledged_frames);
+            {
+              unacknowledged = Queue.create ();
+              acknowledged = 0;
+              link = Alive;
+              waiting = Quiver_core.Stopwatch.start ();
+              allowed = first_window;
+              unacknowledged_bytes = 0;
+              pressure = Free;
+            });
+      window = Await.Await.Semaphore.create first_window;
       written = Await.Await.Ivar.create ();
     }
   and phase = t.phase in
@@ -315,6 +340,8 @@ and carry (t : t) channel =
         | Stopping -> Stopping
         | Running ->
             senders.started <- line.written :: senders.started;
+            Quiver_core.Guarded.hold t.lines (fun lines ->
+                lines.lines <- line :: lines.lines);
             Running)
   with
   | Stopping -> Channel.close channel
@@ -365,12 +392,27 @@ and send (t : t) line =
             give t frame;
             go ()
         | None -> (
-            Await.Await.Semaphore.acquire Quiver_core.Blocking.await line.window;
+            let () =
+              match Await.Await.Semaphore.try_acquire line.window with
+              | Acquired -> ()
+              | Would_block ->
+                  Quiver_core.Guarded.hold line.sent (fun sent ->
+                      sent.pressure <- Pressed);
+                  let started = Quiver_core.Stopwatch.start () in
+                  Await.Await.Semaphore.acquire Quiver_core.Blocking.await line.window;
+                  ignore
+                    (Portable.Atomic.fetch_and_add t.unacknowledged_wait
+                       (Core.Time_ns.Span.to_int_ns
+                          (Quiver_core.Stopwatch.elapsed started)))
+            in
             match
               Quiver_core.Guarded.hold line.sent (fun sent ->
                   match sent.link with
                   | Broken | Retiring -> `Elsewhere
                   | Alive ->
+                      if Queue.is_empty sent.unacknowledged then
+                        sent.waiting <- Quiver_core.Stopwatch.start ();
+                      sent.unacknowledged_bytes <- sent.unacknowledged_bytes + frame.length;
                       Queue.push frame sent.unacknowledged;
                       `Here)
             with
@@ -401,15 +443,34 @@ and acknowledgements (t : t) line =
         match
           Quiver_core.Guarded.hold line.sent (fun sent ->
               match (sent.link, received - sent.acknowledged) with
-              | Broken, _ -> Some []
+              | Broken, _ -> Some ([], 0)
               | (Alive | Retiring), count
                 when count < 0 || count > Queue.length sent.unacknowledged ->
                   None
               | (Alive | Retiring), count ->
                   sent.acknowledged <- received;
-                  Some (List.init count (fun _ -> Queue.pop sent.unacknowledged)))
+                  sent.waiting <- Quiver_core.Stopwatch.start ();
+                  let frames =
+                    List.init count (fun _ -> Queue.pop sent.unacknowledged)
+                  in
+                  sent.unacknowledged_bytes <-
+                    sent.unacknowledged_bytes
+                    - Base.List.sum (module Base.Int) frames ~f:(fun frame -> frame.length);
+                  let grown =
+                    let most_frames = 4096 and most_bytes = 32 * 1024 * 1024 in
+                    match sent.pressure with
+                    | Pressed when sent.unacknowledged_bytes < most_bytes ->
+                        Int.min count (most_frames - sent.allowed)
+                    | Pressed | Free -> 0
+                  in
+                  sent.allowed <- sent.allowed + grown;
+                  sent.pressure <- Free;
+                  Some (frames, grown))
         with
-        | Some frames ->
+        | Some (frames, grown) ->
+            Base.Fn.apply_n_times ~n:grown
+              (fun () -> Await.Await.Semaphore.release line.window)
+              ();
             List.iter
               (fun ({ length; raw; _ } as frame) ->
                 ignore (Portable.Atomic.fetch_and_add t.delivered length);
@@ -445,7 +506,7 @@ let adjust (t : t) (decision : Quiver_core.Width.decision) =
         (List.init count Fun.id)
 
 let create protection peer
-    { streams; most_streams; chunks; compression; pace; traffic; reconnect } =
+    { streams; most_streams; chunks; compression; pace; traffic; reconnect; stall } =
   let connect () = failed (Channel.connect protection peer) in
   Result.map_error
     (fun error -> `Sink error)
@@ -528,6 +589,7 @@ let create protection peer
              (match compression with Fixed _ -> 0 | Adaptive -> 2);
          path = Channel.path control;
          reconnect;
+         lines = Await.Capsule.Await.With_mutex.create (fun () -> { lines = [] });
          outbox = Await.Await.Mpmc_queue.create ();
          replies = Portable.Atomic.make 0;
          silent = Portable.Atomic.make 0;
@@ -553,6 +615,7 @@ let create protection peer
          starved = Portable.Atomic.make 0;
          paced = Portable.Atomic.make 0;
          waited = Portable.Atomic.make 0;
+         unacknowledged_wait = Portable.Atomic.make 0;
          control_written;
          senders =
            Await.Capsule.Await.With_mutex.create (fun () -> { started = [] });
@@ -768,6 +831,57 @@ let create protection peer
      in
      launch t
        (fun () ->
+         let stall_ns = Core.Time_ns.Span.to_int_ns stall in
+         let rec watch rested =
+           Unix.sleepf (Float.max 0.02 (Core.Time_ns.Span.to_sec stall /. 4.));
+           match (Portable.Atomic.get t.phase, Portable.Atomic.get t.failure) with
+           | Stopping, _ | Running, Some _ -> ()
+           | Running, None ->
+               let lines =
+                 Quiver_core.Guarded.hold t.lines (fun lines ->
+                     lines.lines <-
+                       List.filter
+                         (fun line ->
+                           Quiver_core.Guarded.hold line.sent (fun sent ->
+                               match sent.link with
+                               | Alive -> true
+                               | Retiring | Broken -> false))
+                         lines.lines;
+                     lines.lines)
+               in
+               let states =
+                 List.mapi
+                   (fun at line ->
+                     Quiver_core.Guarded.hold line.sent (fun sent ->
+                         ( at,
+                           Queue.length sent.unacknowledged,
+                           Core.Time_ns.Span.to_int_ns
+                             (Quiver_core.Stopwatch.elapsed sent.waiting) )))
+                   lines
+               in
+               let stalled =
+                 Option.map
+                   (fun (at, _, _) -> List.nth lines at)
+                   (List.find_opt
+                      (fun (at, unacknowledged, waiting) ->
+                        unacknowledged > 0 && waiting >= stall_ns
+                        && List.exists
+                             (fun (other, others, waited) ->
+                               other <> at && (others = 0 || 8 * waited <= waiting))
+                             states)
+                      states)
+               in
+               match stalled with
+               | Some line when rested >= stall_ns ->
+                   break t line Stalled;
+                   watch 0
+               | Some _ | None ->
+                   watch (rested + Core.Time_ns.Span.to_int_ns stall / 4)
+         in
+         watch stall_ns)
+       ~unstarted:ignore;
+     launch t
+       (fun () ->
          write (reading control 0);
          Await.Await.Ivar.fill_if_empty control_written ())
        ~unstarted:(fun () -> Await.Await.Ivar.fill_if_empty control_written ());
@@ -944,6 +1058,9 @@ let sent t message =
 let format t = t.format
 let path t = t.path
 let streams t = Portable.Atomic.get t.alive
+
+let waited_for_acks t =
+  Core.Time_ns.Span.of_int_ns (Portable.Atomic.get t.unacknowledged_wait)
 let database t name ~ddl = sent t (Database { name; ddl })
 
 let table t (table : Quiver_core.Schema.Table.t) ~ddl ~parts =

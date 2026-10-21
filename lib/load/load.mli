@@ -43,16 +43,26 @@ type keys = After_data | With_table
 type binlog = Write_binlog [@rename "write"] | Skip_binlog [@rename "skip"]
 [@@deriving to_string ~portable, enumerate ~portable]
 
+(** Whether loading sessions check unique keys. *)
+type uniqueness =
+  | Unchecked
+  | Checked_on_mariadb
+      (** On MariaDB, where without them the first transaction inserting into
+          an empty table locks it until commit: parts of one table loading at
+          once would wait for each other. *)
+
 val session :
   Quiver_mysql.Provider.conn_config ->
   binlog ->
+  uniqueness ->
   (Quiver_mysql.Link.t, [> cause ]) result @@ portable
-(** A connection set up for loading: no foreign key or unique checks, UTC, the
-    [sql_mode] dumps are written for, local data allowed. *)
+(** A connection set up for loading: no foreign key checks, unique checks as
+    asked, UTC, the [sql_mode] dumps are written for, local data allowed. *)
 
 val sessions :
   Quiver_mysql.Provider.conn_config ->
   binlog ->
+  uniqueness ->
   count:int ->
   control:(unit -> ('c, cause) result) @ once portable ->
   close:('c -> unit) ->

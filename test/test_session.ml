@@ -34,7 +34,12 @@ type ending =
 type place = Into_first | Into_last [@@deriving sexp_of]
 
 (** How the frame a connection breaks at arrives. *)
-type breaking = Truncated | Damaged | Reset [@@deriving sexp_of]
+type breaking =
+  | Truncated
+  | Damaged
+  | Reset
+  | Silent  (** Takes every byte, passes and acknowledges none, never closes. *)
+[@@deriving sexp_of]
 
 type cut = {
   connection : int;  (** A data connection, in the order they are accepted. *)
@@ -229,10 +234,20 @@ let scenario =
       | Plain ->
           let+ broken =
             list_size (int_range 0 streams)
-              (pair (int_range 0 6) (oneof_list [ Truncated; Damaged; Reset ]))
+              (pair (int_range 0 6)
+                 (oneof_list [ Truncated; Damaged; Reset; Silent ]))
+          in
+          let silent =
+            List.length (List.filter (fun (_, breaking) -> breaking = Silent) broken)
           in
           List.mapi
-            (fun connection (after, breaking) -> { connection; after; breaking })
+            (fun connection (after, breaking) ->
+              let breaking =
+                match breaking with
+                | Silent when silent >= streams -> Reset
+                | Truncated | Damaged | Reset | Silent -> breaking
+              in
+              { connection; after; breaking })
             broken
     and* control =
       match wire with
@@ -334,7 +349,16 @@ let breaking ~target ~control cuts =
                   Unix.setsockopt_optint into SO_LINGER (Some 0);
                   Atomic.set reset true;
                   shutdown from SHUTDOWN_ALL;
-                  shutdown into SHUTDOWN_RECEIVE)
+                  shutdown into SHUTDOWN_RECEIVE
+              | Silent ->
+                  let drain = Bytes.create 65536 in
+                  let rec swallow () =
+                    match Unix.read from drain 0 (Bytes.length drain) with
+                    | 0 -> ()
+                    | _ -> swallow ()
+                    | exception Unix.Unix_error _ -> ()
+                  in
+                  swallow ())
           | `Read, (Some _ | None) ->
               ignore (Unix.write into header 0 (Bytes.length header));
               ignore (Unix.write into payload 0 length);
@@ -859,6 +883,39 @@ let resumed_through_relays =
        })
     property
 
+let replaced_when_silent =
+  QCheck2.Test.make ~count:8
+    ~name:
+      "a data connection that takes frames and acknowledges none is replaced, \
+       and the session goes on"
+    ~print
+    (QCheck2.Gen.map
+       (fun topology ->
+       {
+         tables =
+           [ [ ([], Kept) ]; [ ([], Kept) ]; [ ([ 12; 0 ], Kept); ([ 6; 14; 25; 27; 38 ], Kept) ] ];
+         streams = 4;
+         chunks = 2;
+         readers = 3;
+         topology;
+         refusal = Nobody;
+         wire = Plain;
+         cuts =
+           [
+             { connection = 0; after = 0; breaking = Truncated };
+             { connection = 1; after = 0; breaking = Truncated };
+             { connection = 2; after = 0; breaking = Truncated };
+             { connection = 3; after = 0; breaking = Silent };
+           ];
+         control = None;
+         place = Into_first;
+         adjustments = [];
+         compression = Fixed Plain;
+         linger = 0.;
+       })
+       (QCheck2.Gen.oneof_list [ Direct; Relayed 1; Relayed 2; Chained ]))
+    property
+
 let resumed_after_heartbeats =
   QCheck2.Test.make ~count:5
     ~name:
@@ -914,6 +971,7 @@ let tests =
          session;
          refused_downstream;
          resumed_through_relays;
+         replaced_when_silent;
          resumed_after_heartbeats;
          refused_while_cut;
        ]

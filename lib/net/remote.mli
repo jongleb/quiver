@@ -25,6 +25,9 @@ type error =
       (** The dump's manifest could not take how its parts travelled. *)
   | Unstarted of Quiver_core.Concurrent.error
       (** No thread for a data connection's sender. *)
+  | Stalled
+      (** A data connection's frames went unacknowledged while the others'
+          were acknowledged. *)
 [@@deriving sexp_of ~portable]
 
 (** How batches are encoded on the wire. *)
@@ -49,6 +52,12 @@ type settings = {
   reconnect : Core.Time_ns.Span.t;
       (** How long replacing a broken control connection may take before the
           session fails. *)
+  stall : Core.Time_ns.Span.t;
+      (** A data connection whose oldest frame waits this long for its ack,
+          while another connection waits for none or eight times less, is
+          taken for a dead path: its frames go to the others and a new
+          connection replaces it. Frames waiting on every connection are a
+          slow collector, and nothing is replaced. *)
 }
 
 val create :
@@ -68,6 +77,10 @@ val adjust : t -> Quiver_core.Width.decision -> unit
     own while [most_streams] allows; the last one is never closed. *)
 
 val streams : t -> int
+
+val waited_for_acks : t -> Core.Time_ns.Span.t
+(** How long data connections waited, all together, with as many frames
+    unacknowledged as they may hold. *)
 (** Data connections open now. *)
 
 val path : t -> Quiver_core.Tcp.path option

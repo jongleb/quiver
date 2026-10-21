@@ -12,6 +12,9 @@ type t =
   | Use of Quiver_core.Ident.t
       (** Default database, so [SHOW CREATE VIEW] leaves names unqualified. *)
   | Prepare_load
+  | Check_unique
+      (** Unique checks back on: MariaDB 10.6+ locks an empty table until commit
+          for the first transaction inserting into it without them. *)
       (** A loading session: no foreign key or unique checks, UTC time zone, the
           [sql_mode] dump files are written for. *)
   | Skip_binlog

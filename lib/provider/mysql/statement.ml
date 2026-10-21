@@ -8,6 +8,7 @@ type t =
   | Backup_stage_end
   | Use of Quiver_core.Ident.t
   | Prepare_load
+  | Check_unique
   | Skip_binlog
   | Create_progress_schema
   | Create_progress_table
@@ -49,6 +50,7 @@ let sql = function
   | Prepare_load ->
       "SET SESSION foreign_key_checks = 0, unique_checks = 0, time_zone = \
        '+00:00', sql_mode = 'NO_AUTO_VALUE_ON_ZERO,ALLOW_INVALID_DATES'"
+  | Check_unique -> "SET SESSION unique_checks = 1"
   | Skip_binlog -> "SET SESSION sql_log_bin = 0"
   | Create_progress_schema -> "CREATE DATABASE IF NOT EXISTS quiver_load"
   | Create_progress_table ->

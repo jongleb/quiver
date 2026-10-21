@@ -148,4 +148,5 @@ let settings ?(compression =
     pace = None;
     traffic = None;
     reconnect;
+    stall = Core.Time_ns.Span.of_sec 0.3;
   }

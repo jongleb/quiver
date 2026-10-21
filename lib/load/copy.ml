@@ -82,7 +82,7 @@ let execute link statement = run link (Quiver_mysql.Statement.sql statement)
 let session config binlog =
   Result.map_error
     (fun (#Load.cause as cause) -> Unreachable cause)
-    (Load.session config binlog)
+    (Load.session config binlog Checked_on_mariadb)
 
 let retried link statement =
   Load.retried
@@ -106,10 +106,11 @@ let create config target ~keys ~binlog ~sessions =
     (let%map control, loaders =
        Result.map_error
          (fun (#Load.cause as cause) -> Unreachable cause)
-         (Load.sessions config binlog ~count:sessions
+         (Load.sessions config binlog Checked_on_mariadb ~count:sessions
             ~control:(fun () ->
               Quiver_core.Guarded.create (fun () ->
-                  (Load.session config binlog : (Quiver_mysql.Link.t, Load.cause) result)))
+                  (Load.session config binlog Checked_on_mariadb
+                    : (Quiver_mysql.Link.t, Load.cause) result)))
             ~close:(fun control ->
               Quiver_core.Guarded.hold control (fun link -> Quiver_mysql.Link.close link)))
      in

@@ -56,8 +56,9 @@ type settings = {
       (** A data connection whose oldest frame waits this long for its ack,
           while another connection waits for none or eight times less, is
           taken for a dead path: its frames go to the others and a new
-          connection replaces it. Frames waiting on every connection are a
-          slow collector, and nothing is replaced. *)
+          connection replaces it (none when it was being closed anyway).
+          Frames waiting on every connection are a slow collector, and nothing
+          is replaced until they wait five times this long. *)
 }
 
 val create :

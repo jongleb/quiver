@@ -844,8 +844,8 @@ let create protection peer
                          (fun line ->
                            Quiver_core.Guarded.hold line.sent (fun sent ->
                                match sent.link with
-                               | Alive -> true
-                               | Retiring | Broken -> false))
+                               | Alive | Retiring -> true
+                               | Broken -> false))
                          lines.lines;
                      lines.lines)
                in
@@ -865,10 +865,11 @@ let create protection peer
                    (List.find_opt
                       (fun (at, unacknowledged, waiting) ->
                         unacknowledged > 0 && waiting >= stall_ns
-                        && List.exists
-                             (fun (other, others, waited) ->
-                               other <> at && (others = 0 || 8 * waited <= waiting))
-                             states)
+                        && (waiting >= 5 * stall_ns
+                           || List.exists
+                                (fun (other, others, waited) ->
+                                  other <> at && (others = 0 || 8 * waited <= waiting))
+                                states))
                       states)
                in
                match stalled with

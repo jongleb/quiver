@@ -479,7 +479,14 @@ let property
   in
   let listeners = ref [] in
   let session_seconds =
-    linger +. match control with None -> 2. | Some (_ : int * breaking) -> 4.
+    let silent =
+      List.exists (fun { breaking; _ } -> breaking = Silent) cuts
+    in
+    linger
+    +.
+    match (control, silent) with
+    | None, false -> 2.
+    | Some (_ : int * breaking), _ | None, true -> 4.
   in
   let outcome =
   Support.within session_seconds

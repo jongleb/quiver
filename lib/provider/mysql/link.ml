@@ -198,7 +198,6 @@ let connect ~local_data route ~timeouts ~user ~password =
              (secure_connection, Secure_connection);
              (plugin_auth, Plugin_auth);
              (deprecate_eof, Deprecate_eof);
-             (lenenc_auth_data, Lenenc_auth_data);
            ])
     in
     let fixed flags =
@@ -236,15 +235,18 @@ let connect ~local_data route ~timeouts ~user ~password =
     Buffer.add_string response user;
     Buffer.add_char response '\000';
     let length = String.length auth in
-    let () =
-      if length < 0xFB then Buffer.add_uint8 response length
-      else if length < 0x10000 then (
-        Buffer.add_uint8 response 0xFC;
-        Buffer.add_uint16_le response length)
-      else (
-        Buffer.add_uint8 response 0xFD;
-        Buffer.add_uint16_le response (length land 0xFFFF);
-        Buffer.add_uint8 response (length lsr 16))
+    let%bind () =
+      match capabilities land lenenc_auth_data with
+      | 0 when length > 0xFF -> Error (`Link (Missing_capability Lenenc_auth_data))
+      | 0 -> Ok (Buffer.add_uint8 response length)
+      | _ when length < 0xFB -> Ok (Buffer.add_uint8 response length)
+      | _ when length < 0x10000 ->
+          Buffer.add_uint8 response 0xFC;
+          Ok (Buffer.add_uint16_le response length)
+      | _ ->
+          Buffer.add_uint8 response 0xFD;
+          Buffer.add_uint16_le response (length land 0xFFFF);
+          Ok (Buffer.add_uint8 response (length lsr 16))
     in
     Buffer.add_string response auth;
     Buffer.add_string response greeting.plugin;

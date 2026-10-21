@@ -8,6 +8,9 @@ type server_auth =
       (** Switches to [sha256_password], hands out [public_key] when asked,
           then accepts only this password sealed under it. *)
   | Switches_short  (** Switches plugin with a 5-byte challenge. *)
+  | Accepts_without_lenenc
+      (** Greets as ProxySQL, without [CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA],
+          and accepts a response whose auth data has a one-byte length. *)
 
 (** Where the fake server listens. *)
 type place = Over_tcp | Over_socket
@@ -21,10 +24,11 @@ let packet sequence payload =
   Bytes.set_uint8 header 3 sequence;
   Bytes.to_string header ^ payload
 
-let greeting plugin =
+let greeting ?(without = 0) plugin =
   let capabilities =
-    0x1 lor 0x4 lor 0x200 lor 0x2000 lor 0x8000 lor 0x20000 lor 0x40000
-    lor 0x80000 lor 0x200000 lor 0x1000000
+    (0x1 lor 0x4 lor 0x200 lor 0x2000 lor 0x8000 lor 0x20000 lor 0x40000
+    lor 0x80000 lor 0x200000 lor 0x1000000)
+    land lnot without
   in
   let buffer = Buffer.create 128 in
   Buffer.add_uint8 buffer 10;
@@ -75,16 +79,30 @@ let serve listener auth =
   | Ready ->
       let client, _ = Unix.accept listener in
       send client
-        (greeting
-           (match auth with
-           | Accepts | Switches_short -> "mysql_native_password"
-           | Wants_full _ | Wants_sealed _ -> "caching_sha2_password"));
+        (match auth with
+        | Accepts | Switches_short -> greeting "mysql_native_password"
+        | Accepts_without_lenenc ->
+            greeting ~without:0x200000 "mysql_native_password"
+        | Wants_full _ | Wants_sealed _ -> greeting "caching_sha2_password");
       let heard =
         match (receive client, auth) with
         | Error (), _ -> `Nothing
         | Ok _, Accepts ->
             send client (ok 2);
             `Accepted
+        | Ok response, Accepts_without_lenenc -> (
+            let fixed = 4 + 4 + 1 + 23 in
+            let user_end = String.index_from response fixed '\000' in
+            let length = Char.code response.[user_end + 1] in
+            let plugin_at = user_end + 2 + length in
+            match
+              String.sub response plugin_at
+                (String.length response - plugin_at)
+            with
+            | "mysql_native_password\000" when length = 20 ->
+                send client (ok 2);
+                `Accepted
+            | _ | (exception Invalid_argument _) -> `Wrong_password)
         | Ok _, Switches_short ->
             send client (packet 2 "\254mysql_native_password\000short\000");
             `Switched
@@ -189,6 +207,16 @@ let handshake =
                 | _ -> false)
           | (Ok _ | Error _), _ -> Alcotest.fail "no session")
         [ Over_tcp; Over_socket ])
+
+let proxysql =
+  Alcotest.test_case
+    "a server without lenenc auth data, as ProxySQL, gets a one-byte length"
+    `Quick (fun () ->
+      Alcotest.(check bool)
+        "accepted" true
+        (match connect Over_tcp Accepts_without_lenenc ~password:(Some "secret") with
+        | Ok _, `Accepted -> true
+        | (Ok _ | Error _), _ -> false))
 
 let cleartext =
   Alcotest.test_case
@@ -404,4 +432,4 @@ let discovered =
             [];
         ])
 
-let tests = [ handshake; cleartext; sealed; short_scramble; unreachable; timeouts; discovered ]
+let tests = [ handshake; proxysql; cleartext; sealed; short_scramble; unreachable; timeouts; discovered ]

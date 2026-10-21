@@ -1041,7 +1041,7 @@ module Make (S : Quiver_core.Sink_intf.S) = struct
           unstarted ();
           None
     in
-    let threads =
+    let steering_threads =
       [
         launch
           (fun () ->
@@ -1079,7 +1079,8 @@ module Make (S : Quiver_core.Sink_intf.S) = struct
           ~some:(fun (downstream : downstream) ->
             [ launch (fun () -> listen_downstream downstream) ~unstarted:ignore ])
           forward
-      @ List.mapi
+    and data_threads =
+      List.mapi
           (fun index (channel : Channel.t) ->
             let next =
               Option.map
@@ -1156,10 +1157,11 @@ module Make (S : Quiver_core.Sink_intf.S) = struct
            in
            S.finish sink ~source ~tables ~manifest))
       (Await.Await.Ivar.read Quiver_core.Blocking.await finishing);
+    List.iter (Option.iter Quiver_core.Concurrent.join) steering_threads;
     List.iter Channel.sever
       (List.map Channel.handle channels
       @ Quiver_core.Guarded.hold late (fun late -> late.handles));
-    List.iter (Option.iter Quiver_core.Concurrent.join) threads;
+    List.iter (Option.iter Quiver_core.Concurrent.join) data_threads;
     Channel.stop listening;
     Option.iter Quiver_core.Concurrent.join replacing;
     let outcome =

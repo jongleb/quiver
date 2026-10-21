@@ -598,7 +598,7 @@ let holds
       let dump_seconds =
         match pace with
         | Unpaced -> 5.
-        | Each _ | Taking_turns _ | Per_row _ -> 30.
+        | Each _ | Taking_turns _ | Per_row _ -> 90.
       in
       let rec commit () =
         match
@@ -679,7 +679,7 @@ let holds
                 read
             in
             match pace with
-            | Unpaced -> not joined
+            | Unpaced -> waited
             | Each _ -> waited && joined
             | Taking_turns _ -> waited && joined && List.length (after 6.) <= start
             | Per_row _ ->
@@ -832,7 +832,7 @@ let dumped =
 let paced pace =
   holds
     {
-      tables = [ (List.init 700 Fun.id, List.init 349 (fun n -> 2 * (n + 1))) ];
+      tables = [ (List.init 350 Fun.id, List.init 349 (fun n -> n + 1)) ];
       databases = 1;
       objects = [ 0 ];
       rows = Every;

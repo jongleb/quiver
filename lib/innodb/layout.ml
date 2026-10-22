@@ -6,7 +6,6 @@ type error =
   | Mismatch of { column : string; ltype : Quiver_core.Ltype.t }
   | Prefix_key of string
   | Secondary_indexes
-  | Hidden_key
   | Row_format of { table_flags : int; space_flags : int }
   | Key_type of string
   | Descending_key of string
@@ -20,7 +19,7 @@ type number = Plain | Year | Days | Member of string list | Members of string li
 
 type clock = Microseconds | Fields [@@deriving sexp_of ~portable]
 
-type charset = Utf8mb4 | Utf8mb3 [@@deriving sexp_of ~portable]
+type charset = Utf8mb4 | Utf8mb3 | Latin1 [@@deriving sexp_of ~portable]
 
 type storage =
   | Integer of { bytes : int; sign : sign; number : number }
@@ -28,13 +27,14 @@ type storage =
   | Double
   | Decimal of { precision : int; scale : int }
   | Datetime of { fsp : int; clock : clock }
-  | Timestamp of int
+  | Timestamp of { fsp : int; clock : clock }
   | Time of int
   | Binary of int
   | Char of { least : int; big : bool; charset : charset }
   | Text of { big : bool; charset : charset }
   | Variable of { big : bool }
   | Json
+  | Row_id
   | Trx_id
   | Roll_ptr
 [@@deriving sexp_of ~portable]
@@ -44,7 +44,9 @@ type length = Fixed of int | Varying of { big : bool } [@@deriving sexp_of ~port
 type nullability = Not_null | Null_bit of int [@@deriving sexp_of ~portable]
 type field = { source : int; storage : storage; nullability : nullability } [@@deriving sexp_of ~portable]
 
-type t = { fields : field list; key : int; null_bytes : int; index : int; root : int }
+type order = Bytes_order | Source_order [@@deriving sexp_of ~portable]
+
+type t = { fields : field list; key : int; order : order; null_bytes : int; index : int; root : int }
 [@@deriving sexp_of ~portable]
 
 let decimal_bytes ~precision ~scale =
@@ -58,16 +60,13 @@ let length storage =
   | Double -> Fixed 8
   | Decimal { precision; scale } -> Fixed (decimal_bytes ~precision ~scale)
   | Datetime { fsp; _ } -> Fixed (5 + ((fsp + 1) / 2))
-  | Timestamp fsp -> Fixed (4 + ((fsp + 1) / 2))
+  | Timestamp { fsp; _ } -> Fixed (4 + ((fsp + 1) / 2))
   | Time fsp -> Fixed (3 + ((fsp + 1) / 2))
-  | Trx_id -> Fixed 6
+  | Row_id | Trx_id -> Fixed 6
   | Roll_ptr -> Fixed 7
+  | Char { least; charset = Latin1; _ } -> Fixed least
   | Char { big; _ } | Text { big; _ } | Variable { big } -> Varying { big }
   | Json -> Varying { big = true }
-
-let key_length t =
-  Base.List.sum (module Base.Int) (Base.List.take t.fields t.key) ~f:(fun field ->
-      match length field.storage with Fixed n -> n | Varying _ -> 0)
 
 let of_cfg (cfg : Cfg.t) ~collations dumped =
   let%bind () =
@@ -77,11 +76,6 @@ let of_cfg (cfg : Cfg.t) ~collations dumped =
   in
   let%bind () =
     match cfg.secondary with [] -> Ok () | _ :: _ -> Error (`Layout Secondary_indexes)
-  in
-  let%bind () =
-    match cfg.clustered.fields with
-    | { column = "DB_ROW_ID"; _ } :: _ -> Error (`Layout Hidden_key)
-    | _ -> Ok ()
   in
   let storage (field : Cfg.Index.field) =
     let%bind (column : Cfg.Column.t) =
@@ -96,6 +90,7 @@ let of_cfg (cfg : Cfg.t) ~collations dumped =
     in
     let%bind () = if field.prefix = 0 then Ok () else Error (`Layout (Prefix_key column.name)) in
     match (column.name, column.mtype, found) with
+    | "DB_ROW_ID", 8, _ -> Ok (-1, Row_id, nullable)
     | "DB_TRX_ID", 8, _ -> Ok (-1, Trx_id, nullable)
     | "DB_ROLL_PTR", 8, _ -> Ok (-1, Roll_ptr, nullable)
     | _, _, None -> Error (`Layout (Missing_column column.name))
@@ -127,33 +122,33 @@ let of_cfg (cfg : Cfg.t) ~collations dumped =
           when mysql = 12 && column.len = 5 + fraction (fsp :> int) ->
             let clock = match ltype with Unchecked_datetime _ -> Fields | _ -> Microseconds in
             Ok (i, Datetime { fsp = (fsp :> int); clock }, nullable)
-        | 3, Timestamp fsp, _ when mysql = 7 && column.len = 4 + fraction (fsp :> int) ->
-            Ok (i, Timestamp (fsp :> int), nullable)
+        | 3, (Timestamp fsp | Unchecked_datetime fsp), _ when mysql = 7 && column.len = 4 + fraction (fsp :> int) ->
+            let clock = match ltype with Unchecked_datetime _ -> Fields | _ -> Microseconds in
+            Ok (i, Timestamp { fsp = (fsp :> int); clock }, nullable)
         | 3, Time fsp, _ when mysql = 11 && column.len = 3 + fraction (fsp :> int) ->
             Ok (i, Time (fsp :> int), nullable)
         | 9, Float32, _ -> Ok (i, Float, nullable)
         | 10, Float64, _ -> Ok (i, Double, nullable)
-        | (12 | 5), String, _ -> text (fun charset -> Text { big = column.len > 255 || mtype = 5; charset })
-        | 13, String, _ ->
+        | (1 | 12 | 5), String, _ -> text (fun charset -> Text { big = column.len > 255 || mtype = 5; charset })
+        | (2 | 13), String, _ ->
             text (fun charset ->
-                let widest = match charset with Utf8mb4 -> 4 | Utf8mb3 -> 3 in
+                let widest = match charset with Utf8mb4 -> 4 | Utf8mb3 -> 3 | Latin1 -> 1 in
                 Char { least = column.len / widest; big = column.len > 255; charset })
         | (4 | 5), Bytes, _ when collation = 63 -> Ok (i, Variable { big = column.len > 255 || mtype = 5 }, nullable)
         | 14, Geometry, _ -> Ok (i, Variable { big = true }, nullable)
         | 5, Json, _ when mysql = 245 -> Ok (i, Json, nullable)
-        | (1 | 2), String, _ -> Error (`Layout (Charset { column = column.name; collation }))
         | (1 | 2 | 3 | 4 | 5 | 6 | 9 | 10 | 12 | 13 | 14), _, _ -> mismatch
         | _ -> Error (`Layout (Unsupported { column = column.name; mtype; prtype = column.prtype })))
   in
   let%bind stored = Base.Result.all (List.map storage cfg.clustered.fields) in
-  let%bind () =
+  let%bind order =
     Base.List.fold_result (Base.List.take (List.combine cfg.clustered.fields stored) cfg.clustered.n_uniq)
-      ~init:() ~f:(fun () ((field : Cfg.Index.field), (_, storage, _)) ->
+      ~init:Bytes_order ~f:(fun order ((field : Cfg.Index.field), (_, storage, _)) ->
         match (storage, field.order) with
-        | (Integer _ | Decimal _ | Datetime _ | Timestamp _ | Time _ | Binary _), Ascending -> Ok ()
-        | (Integer _ | Decimal _ | Datetime _ | Timestamp _ | Time _ | Binary _), Descending ->
-            Error (`Layout (Descending_key field.column))
-        | (Float | Double | Char _ | Text _ | Variable _ | Json | Trx_id | Roll_ptr), _ -> Error (`Layout (Key_type field.column)))
+        | _, Descending -> Error (`Layout (Descending_key field.column))
+        | (Integer _ | Decimal _ | Datetime _ | Timestamp _ | Time _ | Binary _ | Row_id), Ascending -> Ok order
+        | (Float | Double | Char _ | Text _ | Variable _), Ascending -> Ok Source_order
+        | (Json | Trx_id | Roll_ptr), Ascending -> Error (`Layout (Key_type field.column)))
   in
   let fields, _ =
     List.fold_left
@@ -166,6 +161,7 @@ let of_cfg (cfg : Cfg.t) ~collations dumped =
     {
       fields = List.rev fields;
       key = cfg.clustered.n_uniq;
+      order;
       null_bytes = (cfg.clustered.n_nullable + 7) / 8;
       index = cfg.clustered.id;
       root = cfg.clustered.root;

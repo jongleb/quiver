@@ -10,14 +10,13 @@ type error =
       (** The dump's type cannot be the one stored. *)
   | Prefix_key of string  (** The key indexes a column's prefix. *)
   | Secondary_indexes  (** Only a table with its primary key alone is built. *)
-  | Hidden_key  (** No primary key: InnoDB orders rows by a hidden row id. *)
   | Row_format of { table_flags : int; space_flags : int }
       (** Not [DYNAMIC] in a plain 16 KiB tablespace: compressed, encrypted, … *)
   | Key_type of string
-      (** A key column whose order is not its bytes': text by a collation, floats. *)
+      (** A key column the writer cannot store a key of. *)
   | Descending_key of string  (** Rows of such a key are stored backwards. *)
   | Charset of { column : string; collation : int }
-      (** Text in a character set other than [utf8mb4] and [utf8mb3]. *)
+      (** Text in a character set other than [utf8mb4], [utf8mb3] and [latin1]. *)
 [@@deriving sexp_of ~portable]
 
 (** Whether a stored integer has a sign, kept sortable by flipping its top bit. *)
@@ -32,7 +31,7 @@ type number : immutable_data =
   | Members of string list  (** [SET]: a bit per member. *)
 [@@deriving sexp_of ~portable]
 
-(** Where a [DATETIME] value comes from. *)
+(** Where a [DATETIME] or [TIMESTAMP] value comes from. *)
 type clock : immutable_data =
   | Microseconds  (** Since 1970. *)
   | Fields  (** [Unchecked_datetime]'s packed fields. *)
@@ -42,6 +41,7 @@ type clock : immutable_data =
 type charset : immutable_data =
   | Utf8mb4  (** Stored as read. *)
   | Utf8mb3  (** Stored as read, with no character of four bytes. *)
+  | Latin1  (** One byte a character, MySQL's [cp1252]: [CHAR] has a fixed length. *)
 [@@deriving sexp_of ~portable]
 
 (** How one field is stored. *)
@@ -51,7 +51,8 @@ type storage : immutable_data =
   | Double  (** Eight bytes, little-endian. *)
   | Decimal of { precision : int; scale : int }  (** Nine digits per four bytes. *)
   | Datetime of { fsp : int; clock : clock }
-  | Timestamp of int  (** Seconds since 1970 and [fsp] fractional digits. *)
+  | Timestamp of { fsp : int; clock : clock }
+      (** Seconds since 1970 and [fsp] fractional digits; the zero value 0. *)
   | Time of int  (** A signed duration with this many fractional digits. *)
   | Binary of int  (** [BINARY]: raw bytes padded with zeros. *)
   | Char of { least : int; big : bool; charset : charset }
@@ -61,6 +62,7 @@ type storage : immutable_data =
   | Variable of { big : bool }
       (** Raw bytes; a length of 128 or more takes two bytes when [big]. *)
   | Json  (** The text's binary form, like a [BLOB]. *)
+  | Row_id  (** Six bytes the writer numbers: the key of a table without a primary key. *)
   | Trx_id  (** Six bytes the import overwrites. *)
   | Roll_ptr  (** Seven bytes the import overwrites. *)
 [@@deriving sexp_of ~portable]
@@ -80,9 +82,18 @@ type field : immutable_data = {
 }
 [@@deriving sexp_of ~portable]
 
+(** How a table's records are ordered by their key. *)
+type order : immutable_data =
+  | Bytes_order  (** By the key's bytes: integers, dates and times, decimals, [BINARY]. *)
+  | Source_order
+      (** By a collation or a float's value: as the source reads them; the server checks
+          the order in the target's collation on import. *)
+[@@deriving sexp_of ~portable]
+
 type t : immutable_data = private {
   fields : field list;  (** In record order: the key first. *)
   key : int;  (** How many leading fields make the key. *)
+  order : order;
   null_bytes : int;  (** Of every record, node pointers included. *)
   index : int;  (** The clustered index's id. *)
   root : int;  (** Its root page. *)
@@ -99,6 +110,3 @@ val of_cfg :
     are the server's collations of the character sets stored, by id. *)
 
 val length : storage -> length @@ portable
-
-val key_length : t -> int @@ portable
-(** Bytes of a record's key, which is fixed. *)

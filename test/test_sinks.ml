@@ -89,6 +89,7 @@ let write (type (a : value mod contended portable))
   let table =
     Result.get_ok
       (Schema.Table.make
+         ~generated:[ { Schema.Field.name = ident "g"; ltype = String; nullability = Nullable } ]
          ~name:{ database = ident "db"; table = ident "t" }
          ~fields:
            (List.mapi
@@ -101,9 +102,13 @@ let write (type (a : value mod contended portable))
               kinds)
          ~key:No_key ~estimate:{ rows = 0; bytes = 0 })
   in
-  let batch = Batch.create (List.map ltype kinds) in
+  let batch = Batch.create (List.map ltype kinds @ [ String ]) in
   let rec cells (columns : Column.any Iarray.t @ local) j = function
-    | [] -> ()
+    | [] -> (
+        let (Column.Any column) = Iarray.get columns j in
+        match Column.repr column with
+        | Text -> Support.get_ok (Column.add column "generated, never written")
+        | _ -> Alcotest.fail "the generated column")
     | cell :: rest ->
         (let (Column.Any column) = Iarray.get columns j in
          match (Column.repr column, cell) with
@@ -339,7 +344,7 @@ let tests =
 
 let json_table =
   Result.get_ok
-    (Schema.Table.make
+    (Schema.Table.make ~generated:[]
        ~name:{ database = ident "db"; table = ident "t" }
        ~fields:
          [

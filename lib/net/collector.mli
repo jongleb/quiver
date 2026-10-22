@@ -63,9 +63,11 @@ module Make (S : Quiver_core.Sink_intf.S) : sig
     Channel.listener ->
     session ->
     S.t ->
+    columns:Message.columns ->
     (unit, [> `Collector of error | `Sink of S.error ]) result
   (** Answers the hello, accepts the data connections and writes everything sent
-      until the agent finishes, passing it on to [forward] too; the first
+      until the agent finishes, passing it on to [forward] too; the agent reads
+      [columns] of each table, or [Stored_too] when [forward] takes them; the first
       failure of the sink, the protocol or the next hop, or [Ok] once the sink
       finished and the agent left. Data and control connections that replace
       broken ones are accepted until then, when the listener stops; the next

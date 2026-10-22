@@ -29,7 +29,6 @@ let tablespace (layout : Layout.t) ~pages ~read =
   let u8 bytes at = Bytes.get_uint8 bytes at in
   let u16 bytes at = Bytes.get_uint16_be bytes at in
   let u32 bytes at = Int32.to_int (Bytes.get_int32_be bytes at) land 0xFFFF_FFFF in
-  let key_length = Layout.key_length layout in
   let fields = Array.of_list layout.fields in
   let page n =
     if n < 0 || n >= pages then fail (Number n)
@@ -82,9 +81,32 @@ let tablespace (layout : Layout.t) ~pages ~read =
     in
     go 0 (origin - 6 - layout.null_bytes) 0
   in
+  let key_span bytes n origin =
+    let header = origin - 5 - layout.null_bytes in
+    let rec go j at data =
+      if j = layout.key then Ok (header - at, data)
+      else
+        match Layout.length fields.(j).storage with
+        | Fixed size -> go (j + 1) at (data + size)
+        | Varying _ when at <= 120 -> fail (Records n)
+        | Varying { big } ->
+            let first = u8 bytes (at - 1) in
+            if big && first land 0x80 <> 0 then
+              if first land 0x40 <> 0 || at <= 121 then fail (Records n)
+              else go (j + 1) (at - 2) (data + (((first land 0x3F) lsl 8) lor u8 bytes (at - 2)))
+            else go (j + 1) (at - 1) (data + first)
+    in
+    go 0 header 0
+  in
+  let key_at bytes n origin =
+    let%map lengths, data = key_span bytes n origin in
+    (Bytes.sub_string bytes (origin - 5 - layout.null_bytes - lengths) lengths, Bytes.sub_string bytes origin data)
+  in
   let node_sizes bytes n origin =
     let rec zero k =
-      if k = layout.null_bytes then Ok (layout.null_bytes, key_length + 4)
+      if k = layout.null_bytes then
+        let%map lengths, data = key_span bytes n origin in
+        (layout.null_bytes + lengths, data + 4)
       else if u8 bytes (origin - 6 - k) = 0 then zero (k + 1)
       else fail (Records n)
     in
@@ -274,7 +296,7 @@ let tablespace (layout : Layout.t) ~pages ~read =
             | [], _, _ -> fail (Empty n)
             | _ -> Ok ()
           in
-          let keys = List.map (fun origin -> Bytes.sub_string bytes origin key_length) origins in
+          let%bind keys = Base.Result.all (List.map (fun origin -> key_at bytes n origin) origins) in
           let%bind () =
             match (expected, keys) with
             | Some expected, first :: _ when expected.(j) <> first -> fail (Pointer n)
@@ -283,14 +305,15 @@ let tablespace (layout : Layout.t) ~pages ~read =
           let%bind last =
             Base.List.fold_result keys ~init:last ~f:(fun last key ->
                 match last with
-                | Some previous when String.compare previous key >= 0 -> fail (Order n)
+                | Some (_, previous) when layout.order = Bytes_order && String.compare previous (snd key) >= 0 ->
+                    fail (Order n)
                 | _ -> Ok (Some key))
           in
           let children =
             if height = 0 then children
             else
               List.rev_append
-                (List.map2 (fun origin key -> (u32 bytes (origin + key_length), key)) origins keys)
+                (List.map2 (fun origin ((_, data) as key) -> (u32 bytes (origin + String.length data), key)) origins keys)
                 children
           in
           let rows = if height = 0 then rows + List.length origins else rows in

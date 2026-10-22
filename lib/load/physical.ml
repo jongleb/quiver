@@ -78,7 +78,7 @@ let prepare link ~datadir ~collations ~(into : Quiver_core.Schema.Name.t) (table
             let dumped =
               List.map
                 (fun ({ name; ltype; _ } : Quiver_core.Schema.Field.t) -> ((name :> string), ltype))
-                (fst table.fields :: snd table.fields)
+                (Quiver_core.Schema.Table.columns table)
             in
             match Quiver_innodb.Cfg.parse cfg with
             | Error (`Cfg error) -> drop (Cfg error)

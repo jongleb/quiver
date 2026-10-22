@@ -54,10 +54,17 @@ type attach =
           replies arrived. *)
 [@@deriving sexp ~portable]
 
+(** Which columns of a table the collector's sink takes. *)
+type columns =
+  | Written  (** Those [LOAD DATA] or [INSERT] writes back. *)
+  | Stored_too  (** And the [STORED] generated ones after them, as the source holds them. *)
+[@@deriving sexp ~portable]
+
 (** What a collector answers. *)
 type reply =
-  | Ready of Quiver_core.Output_format.t
-      (** To [Hello]: the format the collector writes. *)
+  | Ready of { format : Quiver_core.Output_format.t; columns : columns }
+      (** To [Hello]: the format the collector writes, and the columns of a table it,
+          or a node after it, takes. *)
   | Done
   | Refused of string  (** The collector's own description of its failure. *)
   | Skipped

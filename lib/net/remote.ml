@@ -147,6 +147,7 @@ type t = {
   pacer : Pacer.t option;  (** Shared by every data connection. *)
   traffic : Quiver_core.Tcp.Class.t option;
   format : Quiver_core.Output_format.t;
+  columns : Message.columns;
   ladder : Quiver_sink.Compression.t list;
       (** Encodings of batches, from the cheapest to the most compact. *)
   rung : int Portable.Atomic.t;  (** The encoding batches get now. *)
@@ -564,18 +565,18 @@ let create protection peer
      let%bind ready =
        failed (Channel.receive control Message.reply_of_sexp)
      in
-     let%bind format =
+     let%bind format, columns =
        match ready with
-       | Ready format -> Ok format
+       | Ready { format; columns } -> Ok (format, columns)
        | Refused reason | Failed reason ->
            Error (Refused { request = "hello"; reason })
        | Done | Skipped | Committed _ | Rejected _ | Heard _ -> unexpected ready
      in
      let%map channels = Channel.all streams ~close:Channel.close attach in
-     (format, channels)
+     (format, columns, channels)
      in
      Result.iter_error (fun _ -> Channel.close control) greeted;
-     let%map format, channels = greeted in
+     let%map format, columns, channels = greeted in
      let control_written = Await.Await.Ivar.create () in
      let t =
        {
@@ -598,6 +599,7 @@ let create protection peer
              pace;
          traffic;
          format;
+         columns;
          ladder =
            (match compression with
            | Fixed fixed -> [ fixed ]
@@ -1094,6 +1096,7 @@ let sent t message =
            (Portable.Atomic.get t.failure)))
 
 let format t = t.format
+let columns t = t.columns
 let path t = t.path
 let streams t = Portable.Atomic.get t.alive
 

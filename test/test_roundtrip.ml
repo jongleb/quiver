@@ -366,22 +366,24 @@ let table =
         ]
     in
     let* ltypes = list_size (int_range 1 6) ltype in
-    let+ key = int_range 0 2 in
+    let* written = int_range 1 (List.length ltypes) in
+    let+ key = int_range 0 3 in
+    let last = List.length ltypes - 1 in
     let fields =
       List.mapi
         (fun j ltype ->
           ( "c" ^ string_of_int j,
             ltype,
-            match j with
-            | 0 -> Quiver_core.Schema.Field.Not_null
-            | _ -> Nullable ))
+            if j = 0 || j = last then Quiver_core.Schema.Field.Not_null else Nullable ))
         ltypes
     in
-    Support.table
+    let #(fields, generated) = Base.List.split_n fields written in
+    Support.table ~generated
       ~key:
         (match key with
         | 0 -> Primary ("c0", [])
         | 1 -> Unique { index = Support.ident "u"; fields = ("c0", []) }
+        | 2 -> Primary ("c" ^ string_of_int last, [])
         | _ -> No_key)
       fields)
 
@@ -442,7 +444,7 @@ let localized =
     (fun counts ->
       let table n =
         Support.get_ok
-          (Quiver_core.Schema.Table.make
+          (Quiver_core.Schema.Table.make ~generated:[]
              ~name:
                {
                  database = Support.ident "db";
@@ -631,10 +633,11 @@ let messages =
       let reply : Quiver_net.Message.reply t =
         oneof
           [
-            map
-              (fun format -> Quiver_net.Message.Ready format)
+            map2
+              (fun format columns -> Quiver_net.Message.Ready { format; columns })
               (oneof_list
-                 [ Quiver_core.Output_format.Sql; Csv Rfc4180; Csv Mysql_load_data ]);
+                 [ Quiver_core.Output_format.Sql; Csv Rfc4180; Csv Mysql_load_data ])
+              (oneof_list [ Quiver_net.Message.Written; Stored_too ]);
             oneof_list [ Quiver_net.Message.Done; Skipped ];
             map (fun reason -> Quiver_net.Message.Refused reason) text;
             (let* chunk = count

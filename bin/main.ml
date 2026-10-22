@@ -72,7 +72,7 @@ let () =
     in
     match result with
     | Ok (manifest : Quiver_core.Manifest.t) ->
-        report
+        report ~entries:manifest.chunks
           ~rows:
             (Base.List.sum
                (module Base.Int)
@@ -155,7 +155,7 @@ let () =
             consume =
               (fun sink_module sink ->
                 read sink_module sink reading ~sink:"the files"
-                  ~report:(fun ~rows ~chunks ->
+                  ~report:(fun ~entries:_ ~rows ~chunks ->
                     Format.printf "dumped %d rows in %d chunks into %a@." rows
                       chunks File_path.pp output.dir));
           })
@@ -182,15 +182,88 @@ let () =
     Format.printf "listening on %s@." text;
     listener
   in
-  let tablespaces sink =
+  let tablespaces sink (entries : Quiver_core.Manifest.entry list) =
+    let parts name =
+      List.filter_map
+        (fun ({ table; state; _ } : Quiver_core.Manifest.entry) ->
+          if Quiver_core.Schema.Name.equal table name then Some state else None)
+        entries
+    in
+    let sizes states =
+      List.fold_left
+        (fun (rows, bytes) (state : Quiver_core.Manifest.state) ->
+          match state with
+          | Done { part; _ } -> (rows + part.rows, bytes + part.bytes)
+          | Pending -> (rows, bytes))
+        (0, 0) states
+    in
+    let amount (rows, bytes) =
+      match entries with
+      | [] -> ""
+      | _ :: _ -> Printf.sprintf ": %d rows, %.1f MB sent" rows (Float.of_int bytes /. 1e6)
+    in
+    let reason why =
+      match Quiver_load.Physical.sexp_of_unsuitable why with
+      | List (Atom outer :: (Atom inner | List (Atom inner :: _)) :: _) -> outer ^ " " ^ inner
+      | List (Atom outer :: _) | Atom outer -> outer
+      | List _ -> "other"
+    in
+    let ways =
+      List.map (fun (name, way) -> (name, way, sizes (parts name))) (Quiver_load.Copy.ways sink)
+      |> List.stable_sort (fun (_, _, (a, _)) (_, _, (b, _)) -> Int.compare b a)
+    in
     List.iter
-      (fun name -> Format.printf "imported %a as a built tablespace@." Quiver_core.Schema.Name.pp name)
-      (Quiver_load.Copy.imported sink);
-    List.iter
-      (fun (name, why) ->
-        Format.printf "loaded %a with LOAD DATA: %s@." Quiver_core.Schema.Name.pp name
-          (Sexplib0.Sexp.to_string (Quiver_load.Physical.sexp_of_unsuitable why)))
-      (Quiver_load.Copy.fallbacks sink)
+      (fun (name, (way : Quiver_load.Copy.way), size) ->
+        match way with
+        | Imported { importing; keys } ->
+            Format.printf "imported %a as a built tablespace%s; import %a, secondary keys %a@."
+              Quiver_core.Schema.Name.pp name (amount size) Core.Time_ns.Span.pp importing
+              Core.Time_ns.Span.pp keys
+        | Loaded why ->
+            Format.printf "loaded %a with LOAD DATA%s: %s@." Quiver_core.Schema.Name.pp name (amount size)
+              (Sexplib0.Sexp.to_string (Quiver_load.Physical.sexp_of_unsuitable why)))
+      ways;
+    let count group = match group with [ _ ] -> "1 table" | _ -> Printf.sprintf "%d tables" (List.length group) in
+    let total group = List.fold_left (fun (r, b) (_, _, (r', b')) -> (r + r', b + b')) (0, 0) group in
+    let spent group =
+      let { Quiver_core.Spent.rendering; writing; committing; _ } =
+        Quiver_core.Spent.of_states (List.concat_map (fun (name, _, _) -> parts name) group)
+      in
+      Format.asprintf "rendering %a, writing %a, committing %a" Core.Time_ns.Span.pp rendering
+        Core.Time_ns.Span.pp writing Core.Time_ns.Span.pp committing
+    in
+    let built, loaded =
+      List.partition_map
+        (fun ((_, (way : Quiver_load.Copy.way), _) as table) ->
+          match way with Imported { importing; keys } -> Left (table, importing, keys) | Loaded why -> Right (table, why))
+        ways
+    in
+    let () =
+      match built with
+      | [] -> ()
+      | _ :: _ ->
+          let sum f = List.fold_left (fun acc x -> Core.Time_ns.Span.( + ) acc (f x)) Core.Time_ns.Span.zero built in
+          let tables = List.map (fun (table, _, _) -> table) built in
+          Format.printf
+            "built tablespaces: %s%s; parts: %s; after the last part, over all tables: import %a, \
+             secondary keys %a@."
+            (count built) (amount (total tables)) (spent tables) Core.Time_ns.Span.pp
+            (sum (fun (_, importing, _) -> importing))
+            Core.Time_ns.Span.pp
+            (sum (fun (_, _, keys) -> keys))
+    in
+    match loaded with
+    | [] -> ()
+    | _ :: _ ->
+        let tables = List.map fst loaded in
+        Format.printf "LOAD DATA instead: %s%s; parts: %s@." (count loaded) (amount (total tables))
+          (spent tables);
+        let reasons = Base.List.dedup_and_sort ~compare:String.compare (List.map (fun (_, why) -> reason why) loaded) in
+        List.iter
+          (fun tag ->
+            let group = List.filter_map (fun (table, why) -> if reason why = tag then Some table else None) loaded in
+            Format.printf "  %s: %s%s@." tag (count group) (amount (total group)))
+          reasons
   in
   let advise advice =
     let evidence (evidence : Quiver_core.Advice.evidence) =
@@ -297,11 +370,16 @@ let () =
                              (Float.of_int streams *. ceiling /. 1e6))
                          (Quiver_core.Tcp.ceiling path)))
                   (Quiver_net.Remote.path sink);
+                let generated : Quiver_mysql.Provider.generated =
+                  match Quiver_net.Remote.columns sink with Written -> Left_out | Stored_too -> Read
+                in
                 let code =
                   read
                     (module Quiver_net.Remote)
-                    sink reading ~sink:"the network"
-                    ~report:(fun ~rows ~chunks ->
+                    sink
+                    { reading with conn = { reading.conn with generated } }
+                    ~sink:"the network"
+                    ~report:(fun ~entries:_ ~rows ~chunks ->
                       Format.printf
                         "sent %d rows in %d chunks to %s in %a, %d streams at \
                          the end, waiting for acks %a in all@."
@@ -361,12 +439,12 @@ let () =
             | Error (`Collector error) -> failed (Quiver_net.Collector.sexp_of_error error)
             | Ok (listening, session, downstream) -> (
                 let started = Quiver_core.Stopwatch.start () in
-                let collected (type (s : value mod contended portable))
+                let collected columns (type (s : value mod contended portable))
                     (module S : Quiver_core.Sink_intf.S with type t = s)
                     (sink : s) =
                   let module Collector = Quiver_net.Collector.Make (S) in
                   match
-                    Collector.run ?forward:downstream listening session sink
+                    Collector.run ?forward:downstream listening session sink ~columns
                   with
                   | Ok () ->
                       Format.printf "collected in %a@." Core.Time_ns.Span.pp
@@ -377,7 +455,14 @@ let () =
                   | Error (`Sink error) -> failed (S.sexp_of_error error)
                 in
                 match destination with
-                | `Files output -> files output { consume = collected }
+                | `Files output ->
+                    files output
+                      {
+                        consume =
+                          (fun (type (s : value mod contended portable))
+                               (module S : Quiver_core.Sink_intf.S with type t = s) (sink : s) ->
+                            collected Written (module S) sink);
+                      }
                 | `Server to_server -> (
                     match
                       Quiver_load.Copy.create to_server (target into) ~keys ~binlog ~ingest
@@ -385,13 +470,19 @@ let () =
                     with
                     | Error (`Sink error) -> failed (Quiver_load.Copy.sexp_of_error error)
                     | Ok sink ->
-                        let code = collected (module Quiver_load.Copy) sink in
+                        let columns : Quiver_net.Message.columns =
+                          match ingest with Load_data -> Written | Tablespaces _ -> Stored_too
+                        in
+                        let code = collected columns (module Quiver_load.Copy) sink in
                         Quiver_load.Copy.shutdown sink;
-                        tablespaces sink;
+                        tablespaces sink [];
                         advise (Quiver_load.Copy.advice sink);
                         code)))
   in
   let copy reading to_server into keys binlog ingest target_threads =
+    let generated : Quiver_mysql.Provider.generated =
+      match ingest with Quiver_load.Copy.Load_data -> Left_out | Tablespaces _ -> Read
+    in
     (
         (
             let started = Quiver_core.Stopwatch.start () in
@@ -405,14 +496,16 @@ let () =
                 let code =
                   read
                     (module Quiver_load.Copy)
-                    sink reading ~sink:"the target"
-                    ~report:(fun ~rows ~chunks ->
+                    sink
+                    { reading with conn = { reading.conn with generated } }
+                    ~sink:"the target"
+                    ~report:(fun ~entries ~rows ~chunks ->
                       Format.printf "copied %d rows in %d chunks in %a@." rows
                         chunks Core.Time_ns.Span.pp
-                        (Quiver_core.Stopwatch.elapsed started))
+                        (Quiver_core.Stopwatch.elapsed started);
+                      tablespaces sink entries)
                 in
                 Quiver_load.Copy.shutdown sink;
-                tablespaces sink;
                 advise (Quiver_load.Copy.advice sink);
                 code))
   in
@@ -651,7 +744,14 @@ let () =
       const (fun route user password timeouts zero_dates ->
           Result.map
             (fun route ->
-              { Quiver_mysql.Provider.route; user; password; timeouts; zero_dates })
+              {
+                Quiver_mysql.Provider.route;
+                user;
+                password;
+                timeouts;
+                zero_dates;
+                generated = Left_out;
+              })
             route)
       $ route $ user $ password $ timeouts $ zero_dates)
   in

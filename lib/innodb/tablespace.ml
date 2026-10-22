@@ -9,6 +9,7 @@ type error =
   | Out_of_order
   | Overlapping_runs
   | Too_many_extents
+  | Too_many_rows
 [@@deriving sexp_of ~portable]
 
 let group = 16384
@@ -20,10 +21,19 @@ let largest_record = 8125
 (** Bytes of a reference to a column stored off the record. *)
 let reference = 20
 
+(** A record's key as a node pointer holds it: the lengths of its variable fields as they
+    precede the record, then the fields' bytes. *)
+type key = { lengths : string; data : string }
+
+(** Where a record's key comes from. *)
+type keys = Stored  (** The record's own fields. *) | Numbered  (** The run numbers its rows. *)
+
 type t = {
   layout : Layout.t;
   fields : Layout.field iarray;
-  key_length : int;
+  key_fields : Layout.storage list;
+  keys : keys;
+  runs : int Portable.Atomic.t;  (** Runs started, numbering their rows apart. *)
   file : File.t;
   template : string;
   space : int;
@@ -59,7 +69,9 @@ let create ~template (layout : Layout.t) file =
     {
       layout;
       fields = Iarray.of_list layout.fields;
-      key_length = Layout.key_length layout;
+      key_fields = Base.List.take (List.map (fun (field : Layout.field) -> field.storage) layout.fields) layout.key;
+      keys = (match layout.fields with { storage = Row_id; _ } :: _ -> Numbered | _ -> Stored);
+      runs = Portable.Atomic.make 0;
       file;
       template;
       space = u32 34;
@@ -196,9 +208,86 @@ let date_number days =
   let date = Quiver_core.Moment.date_of_days days in
   (Core.Date.year date lsl 9) lor (Core.Month.to_int (Core.Date.month date) lsl 5) lor Core.Date.day date
 
+let stamp fields =
+  let date = fields lsr 37 and time = fields land ((1 lsl 37) - 1) in
+  let year = date lsr 9 and month = (date lsr 5) land 15 and day = date land 31 in
+  if date = 0 && time = 0 then This 0
+  else if year < 1970 || month < 1 || month > 12 || day < 1 then Null
+  else if day > Core.Date.days_in_month ~year ~month:(Core.Month.of_int_exn month) then Null
+  else
+    let days = Quiver_core.Moment.days_since_epoch (Core.Date.create_exn ~y:year ~m:(Core.Month.of_int_exn month) ~d:day) in
+    let micros = (days * Quiver_core.Moment.micros_per_day) + time in
+    if micros / 1_000_000 > 0x7FFF_FFFF then Null else This micros
+
+let latin1_byte code =
+  if code < 0x80 || (code >= 0xA0 && code <= 0xFF) then This code
+  else
+    match code with
+    | 0x81 | 0x8D | 0x8F | 0x90 | 0x9D -> This code
+    | 0x20AC -> This 0x80
+    | 0x201A -> This 0x82
+    | 0x0192 -> This 0x83
+    | 0x201E -> This 0x84
+    | 0x2026 -> This 0x85
+    | 0x2020 -> This 0x86
+    | 0x2021 -> This 0x87
+    | 0x02C6 -> This 0x88
+    | 0x2030 -> This 0x89
+    | 0x0160 -> This 0x8A
+    | 0x2039 -> This 0x8B
+    | 0x0152 -> This 0x8C
+    | 0x017D -> This 0x8E
+    | 0x2018 -> This 0x91
+    | 0x2019 -> This 0x92
+    | 0x201C -> This 0x93
+    | 0x201D -> This 0x94
+    | 0x2022 -> This 0x95
+    | 0x2013 -> This 0x96
+    | 0x2014 -> This 0x97
+    | 0x02DC -> This 0x98
+    | 0x2122 -> This 0x99
+    | 0x0161 -> This 0x9A
+    | 0x203A -> This 0x9B
+    | 0x0153 -> This 0x9C
+    | 0x017E -> This 0x9E
+    | 0x0178 -> This 0x9F
+    | _ -> Null
+
+let width lead = if lead < 0x80 then 1 else if lead < 0xE0 then 2 else if lead < 0xF0 then 3 else 4
+
+let latin1_at source k =
+  let lead = Bytes.get_uint8 source k in
+  let tail n = Bytes.get_uint8 source (k + n) land 0x3F in
+  match width lead with
+  | 1 -> This lead
+  | 2 when lead >= 0xC2 -> latin1_byte (((lead land 0x1F) lsl 6) lor tail 1)
+  | 3 -> latin1_byte (((lead land 0x0F) lsl 12) lor (tail 1 lsl 6) lor tail 2)
+  | _ -> Null
+
+let latin1_length source at length =
+  let stop = at + length in
+  let rec go k n =
+    if k = stop then This n
+    else
+      let next = k + width (Bytes.get_uint8 source k) in
+      if next > stop then Null else match latin1_at source k with Null -> Null | This _ -> go next (n + 1)
+  in
+  go at 0
+
+let put_latin1 source at length bytes pos =
+  let stop = at + length in
+  let rec go k pos =
+    if k >= stop then pos
+    else
+      let byte = match latin1_at source k with This byte -> byte | Null -> 0x3F in
+      Bytes.set_uint8 bytes pos byte;
+      go (k + width (Bytes.get_uint8 source k)) (pos + 1)
+  in
+  go at pos
+
 let put_field bytes pos (field : Layout.field) (columns @ local) i =
   match field.storage with
-  | Trx_id ->
+  | Row_id | Trx_id ->
       Bytes.fill bytes pos 6 '\000';
       pos + 6
   | Roll_ptr ->
@@ -250,11 +339,16 @@ let put_field bytes pos (field : Layout.field) (columns @ local) i =
           Bytes.blit source at bytes pos length;
           Bytes.fill bytes (pos + length) (n - length) '\000';
           pos + n
+      | Char { least; charset = Latin1; _ } ->
+          let next = put_latin1 source at length bytes pos in
+          Bytes.fill bytes next (pos + least - next) ' ';
+          pos + least
       | Char { least; _ } ->
           Bytes.blit source at bytes pos length;
           let padding = Int.max 0 (least - length) in
           Bytes.fill bytes (pos + length) padding ' ';
           pos + length + padding
+      | Text { charset = Latin1; _ } -> put_latin1 source at length bytes pos
       | _ ->
           Bytes.blit source at bytes pos length;
           pos + length)
@@ -294,10 +388,18 @@ let put_field bytes pos (field : Layout.field) (columns @ local) i =
           | Microseconds ->
               let days = Base.Int.( /% ) v Quiver_core.Moment.micros_per_day in
               put_datetime bytes pos fsp (date_number days) (v - (days * Quiver_core.Moment.micros_per_day)))
-      | Timestamp fsp, Int64 ->
+      | Timestamp { fsp; clock }, Int64 ->
           let v = Int64.to_int (Int64_u.to_int64 (Quiver_core.Column.get_int64 column i)) in
-          put_int bytes pos 4 (v / 1_000_000);
-          put_fraction bytes (pos + 4) fsp (v mod 1_000_000)
+          let micros =
+            match clock with
+            | Microseconds -> v
+            | Fields -> (
+                match stamp v with
+                | This micros -> micros
+                | Null -> 0)
+          in
+          put_int bytes pos 4 (micros / 1_000_000);
+          put_fraction bytes (pos + 4) fsp (micros mod 1_000_000)
       | Time fsp, Int64 -> (
           let v = Int64.to_int (Int64_u.to_int64 (Quiver_core.Column.get_int64 column i)) in
           let a = abs v in
@@ -345,7 +447,13 @@ let encode t (columns @ local) ~rows =
               else if Bytes.get_uint8 source k >= 0xF0 then Error (`Tablespace (Unstorable field.source))
               else three (k + 1)
             in
-            match (charset : Layout.charset) with Utf8mb4 -> Ok length | Utf8mb3 -> three at
+            match (charset : Layout.charset) with
+            | Utf8mb4 -> Ok length
+            | Utf8mb3 -> three at
+            | Latin1 -> (
+                match latin1_length source at length with
+                | This length -> Ok length
+                | Null -> Error (`Tablespace (Unstorable field.source)))
           in
           match field.storage with
           | Variable { big } ->
@@ -360,6 +468,10 @@ let encode t (columns @ local) ~rows =
               | Ok binary ->
                   Array.set encoded j binary;
                   varying true (String.length binary) [@nontail])
+          | Char { least; charset = Latin1; _ } -> (
+              match text Latin1 with
+              | Error error -> Error error
+              | Ok length -> if length > least then Error (`Tablespace (Value_too_long length)) else fixed () [@nontail])
           | Char { least; big; charset } -> (
               match text charset with Error error -> Error error | Ok length -> varying big (Int.max least length) [@nontail])
           | Binary n ->
@@ -380,12 +492,26 @@ let encode t (columns @ local) ~rows =
               match digits source at length ~precision ~scale with
               | Null -> Error (`Tablespace (Unstorable field.source))
               | This _ -> fixed () [@nontail])
-          | Integer _ | Float | Double | Datetime _ | Timestamp _ | Time _ | Trx_id | Roll_ptr -> fixed () [@nontail])
+          | Timestamp { clock = Fields; _ } -> (
+              let (Quiver_core.Column.Any column) = Iarray.get columns field.source in
+              match Quiver_core.Column.repr column with
+              | Int64 -> (
+                  match stamp (Int64.to_int (Int64_u.to_int64 (Quiver_core.Column.get_int64 column i))) with
+                  | Null -> Error (`Tablespace (Unstorable field.source))
+                  | This _ -> fixed () [@nontail])
+              | _ -> Error (`Tablespace (Shape field.source)))
+          | Integer _ | Float | Double | Datetime _ | Timestamp _ | Time _ | Row_id | Trx_id | Roll_ptr -> fixed () [@nontail])
   in
   let outside = Bytes.make n_fields '\000' in
   let value_length j i =
     let field = Iarray.get t.fields j in
-    match field.storage with Json -> String.length (Array.get encoded j) | _ -> text_length field columns i
+    match field.storage with
+    | Json -> String.length (Array.get encoded j)
+    | Text { charset = Latin1; _ } -> (
+        match latin1_length (text_bytes field columns) (text_offset field columns i) (text_length field columns i) with
+        | This length -> length
+        | Null -> 0)
+    | _ -> text_length field columns i
   in
   let rec fill bytes start origin j pos lengths tail i =
     if j < n_fields then
@@ -409,6 +535,11 @@ let encode t (columns @ local) ~rows =
           let () =
             match field.storage with
             | Json -> Bytes.blit_string (Array.get encoded j) 0 bytes (tail + 6) length
+            | Text { charset = Latin1; _ } ->
+                let (_ : int) =
+                  put_latin1 (text_bytes field columns) (text_offset field columns i) (text_length field columns i) bytes (tail + 6)
+                in
+                ()
             | _ -> Bytes.blit (text_bytes field columns) (text_offset field columns i) bytes (tail + 6) length
           in
           fill bytes start origin (j + 1) (pos + reference) (lengths - 2) (tail + 6 + length) i
@@ -453,7 +584,7 @@ let encode t (columns @ local) ~rows =
     let size = extra + 5 + data in
     if size <= largest_record then Ok sized
     else
-      match longest 0 (-1) i with
+      match longest t.layout.key (-1) i with
       | -1 -> Error (`Tablespace (Row_too_long size))
       | j ->
           let length = length_outside j i in
@@ -509,28 +640,34 @@ type seen = Nothing | Key
 
 type run = {
   owner : t;
-  last_key : Bytes.t;
+  base : int;  (** The first row number of a [Numbered] run. *)
+  rank : int;  (** Its place among the table's runs, for keys of [Source_order]. *)
+  mutable numbered : int;  (** Rows it numbered. *)
+  mutable last : key;
   mutable seen : seen;
   mutable page : Page.t option;
   mutable number : int;
   mutable previous : int;
   mutable first : int;
-  mutable low : string;
+  mutable low : key;
   mutable extent : (int * int) option;  (** Extent and the pages used in it. *)
   mutable used : (int * int) list;
-  mutable pointers : (string * int) list;  (** First key and number of each page, last first. *)
+  mutable pointers : (key * int) list;  (** First key and number of each page, last first. *)
 }
 
-let run owner =
+let run owner ~rank =
   {
     owner;
-    last_key = Bytes.make owner.key_length '\000';
+    base = (Portable.Atomic.fetch_and_add owner.runs 1 lsl 32) + 1;
+    rank;
+    numbered = 0;
+    last = { lengths = ""; data = "" };
     seen = Nothing;
     page = None;
     number = Page.null;
     previous = Page.null;
     first = Page.null;
-    low = "";
+    low = { lengths = ""; data = "" };
     extent = None;
     used = [];
     pointers = [];
@@ -648,11 +785,21 @@ let store run image ~pos ~length =
 
 let add run { image; rows } =
   let t = run.owner in
-  let rec ascends origin k =
-    if k = t.key_length then Ok ()
-    else
-      let a = Char.code (String.get image (origin + k)) and b = Bytes.get_uint8 run.last_key k in
-      if a > b then Ok () else if a < b then Error (`Tablespace Out_of_order) else ascends origin (k + 1)
+  let stored origin =
+    let header = origin - 5 - t.layout.null_bytes in
+    let rec go fields at data =
+      match fields with
+      | [] -> { lengths = String.sub image at (header - at); data = String.sub image origin data }
+      | storage :: rest -> (
+          match Layout.length storage with
+          | Fixed n -> go rest at (data + n)
+          | Varying { big } ->
+              let first = String.get_uint8 image (at - 1) in
+              if big && first land 0x80 <> 0 then
+                go rest (at - 2) (data + (((first land 0x3F) lsl 8) lor String.get_uint8 image (at - 2)))
+              else go rest (at - 1) (data + first))
+    in
+    go t.key_fields header 0
   in
   let rec page_for size =
     match run.page with
@@ -682,9 +829,24 @@ let add run { image; rows } =
       let length = String.get_uint16_be image pos and origin = String.get_uint16_be image (pos + 2) in
       let count = String.get_uint16_be image (pos + 4) in
       let start = pos + 6 in
-      let%bind () = match run.seen with Nothing -> Ok () | Key -> ascends (start + origin) 0 in
+      let%bind key =
+        match t.keys with
+        | Stored -> Ok (stored (start + origin))
+        | Numbered ->
+            if run.numbered < 0xFFFF_FFFF && run.base < 1 lsl 48 then (
+              let id = Bytes.create 6 in
+              Bytes.set_uint16_be id 0 ((run.base + run.numbered) lsr 32);
+              Bytes.set_int32_be id 2 (Int32.of_int ((run.base + run.numbered) land 0xFFFF_FFFF));
+              run.numbered <- run.numbered + 1;
+              Ok { lengths = ""; data = Bytes.to_string id })
+            else Error (`Tablespace Too_many_rows)
+      in
+      let%bind () =
+        match (t.layout.order, run.seen) with
+        | Bytes_order, Key when String.compare key.data run.last.data <= 0 -> Error (`Tablespace Out_of_order)
+        | Bytes_order, (Key | Nothing) | Source_order, _ -> Ok ()
+      in
       let%bind page = page_for length in
-      let key = String.sub image (start + origin) t.key_length in
       let () =
         match (Page.count page, run.seen) with
         | 0, Nothing ->
@@ -694,6 +856,7 @@ let add run { image; rows } =
         | _ -> ()
       in
       let placed = Page.place page image ~pos:start ~length ~origin - origin in
+      let () = match t.keys with Stored -> () | Numbered -> Bytes.blit_string key.data 0 (Page.bytes page) (placed + origin) 6 in
       let rec outside k at =
         if k = count then Ok at
         else
@@ -704,7 +867,7 @@ let add run { image; rows } =
           outside (k + 1) (at + 6 + bytes)
       in
       let%bind next = outside 0 (start + length) in
-      Bytes.blit_string image (start + origin) run.last_key 0 t.key_length;
+      run.last <- key;
       run.seen <- Key;
       record next (i + 1)
   in
@@ -713,9 +876,10 @@ let add run { image; rows } =
 type pages = {
   first : int;
   last : int;
-  low : string;  (** The run's first key. *)
-  high : string;  (** Its last key. *)
-  pointers : (string * int) list;  (** First key and number of each page. *)
+  rank : int;
+  low : key;  (** The run's first key. *)
+  high : key;  (** Its last key. *)
+  pointers : (key * int) list;  (** First key and number of each page. *)
   used : (int * int) list;  (** Extents and the pages used in each. *)
 }
 
@@ -730,8 +894,9 @@ let close run =
         {
           first = run.first;
           last = run.number;
+          rank = run.rank;
           low = run.low;
-          high = Bytes.to_string run.last_key;
+          high = run.last;
           pointers = List.rev run.pointers;
           used = Option.fold ~none:run.used ~some:(fun current -> current :: run.used) run.extent;
         }
@@ -742,17 +907,19 @@ let stamp bytes =
   Bytes.set_int32_be bytes (Page.size - 8) sum
 
 let finish t finished =
-  let runs =
-    List.sort
-      (fun a b -> String.compare a.low b.low)
-      (List.filter_map (function Empty -> None | Pages pages -> Some pages) finished)
+  let filled = List.filter_map (function Empty -> None | Pages pages -> Some pages) finished in
+  let%bind runs =
+    match t.layout.order with
+    | Source_order -> Ok (List.sort (fun a b -> Int.compare a.rank b.rank) filled)
+    | Bytes_order ->
+        let runs = List.sort (fun a b -> String.compare a.low.data b.low.data) filled in
+        let rec apart = function
+          | a :: (b :: _ as rest) ->
+              if String.compare a.high.data b.low.data < 0 then apart rest else Error (`Tablespace Overlapping_runs)
+          | [ _ ] | [] -> Ok runs
+        in
+        apart runs
   in
-  let rec apart = function
-    | a :: (b :: _ as rest) ->
-        if String.compare a.high b.low < 0 then apart rest else Error (`Tablespace Overlapping_runs)
-    | [ _ ] | [] -> Ok ()
-  in
-  let%bind () = apart runs in
   let leaves = Base.List.sum (module Base.Int) runs ~f:(fun pages -> List.length pages.pointers) in
   let u32 bytes at = Int32.to_int (Bytes.get_int32_be bytes at) land 0xFFFF_FFFF in
   let read n =
@@ -817,30 +984,32 @@ let finish t finished =
         top_extent := Some (k, used + 1);
         (64 * k) + used
   in
-  let node_size = t.layout.null_bytes + 5 + t.key_length + 4 in
   let root page =
     Page.close page;
     Bytes.blit_string t.segments 0 (Page.bytes page) 74 20;
     seal (Page.bytes page) ~number:t.layout.root ~prev:Page.null ~next:Page.null
   in
   let rec level height pointers =
-    let pages =
+    let firsts =
       List.rev
         (List.fold_left
-           (fun pages (key, child) ->
+           (fun pages ({ lengths; data } as key, child) ->
+             let extra = String.length lengths + t.layout.null_bytes and size = String.length data + 4 in
              let pages =
                match pages with
-               | page :: _ when Page.room page node_size = Fits -> pages
-               | _ -> Page.create ~level:height ~index:t.layout.index :: pages
+               | (page, _) :: _ when Page.room page (extra + 5 + size) = Fits -> pages
+               | _ -> (Page.create ~level:height ~index:t.layout.index, key) :: pages
              in
-             let page = List.hd pages in
+             let page, _ = List.hd pages in
              let flag : Page.flag = if List.length pages = 1 && Page.count page = 0 then Leftmost else Plain in
-             let origin = Page.append page ~extra:t.layout.null_bytes ~data:(t.key_length + 4) Node_pointer flag in
-             Bytes.blit_string key 0 (Page.bytes page) origin t.key_length;
-             Bytes.set_int32_be (Page.bytes page) (origin + t.key_length) (Int32.of_int child);
+             let origin = Page.append page ~extra ~data:size Node_pointer flag in
+             Bytes.blit_string lengths 0 (Page.bytes page) (origin - 5 - extra) (String.length lengths);
+             Bytes.blit_string data 0 (Page.bytes page) origin (String.length data);
+             Bytes.set_int32_be (Page.bytes page) (origin + String.length data) (Int32.of_int child);
              pages)
            [] pointers)
     in
+    let pages = List.map fst firsts in
     match pages with
     | [ top ] -> root top
     | _ ->
@@ -855,8 +1024,8 @@ let finish t finished =
         in
         level (height + 1)
           (List.mapi
-             (fun j page -> (Bytes.sub_string (Page.bytes page) (Page.first page) t.key_length, numbers.(j)))
-             pages)
+             (fun j (_, key) -> (key, numbers.(j)))
+             firsts)
   in
   let%bind () =
     match leaves with

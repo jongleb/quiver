@@ -7,12 +7,18 @@
 type zero_dates = Reject | Keep
 [@@deriving to_string ~portable, enumerate ~portable]
 
+(** Whether the source's [STORED] generated columns are read: [Left_out] leaves
+    them for the target to compute; [Read] reads their stored values into
+    {!Quiver_core.Schema.Table.generated}, for a writer that stores whole records. *)
+type generated = Left_out | Read
+
 type conn_config = {
   route : Link.route;
   user : string;
   password : string option;
   timeouts : Link.timeouts;
   zero_dates : zero_dates;
+  generated : generated;
 }
 (** Where and as whom to connect. *)
 

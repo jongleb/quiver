@@ -49,10 +49,15 @@ type renderer =
   | Images of { space : Quiver_innodb.Tablespace.t; table : Quiver_core.Schema.Name.t }
 
 (** Whether a built table reached the server. *)
-type progress = Pending | Imported
+type progress = Pending | Imported of { importing : Core.Time_ns.Span.t; keys : Core.Time_ns.Span.t }
+
+type way =
+  | Imported of { importing : Core.Time_ns.Span.t; keys : Core.Time_ns.Span.t }
+  | Loaded of Physical.unsuitable
 
 type built = {
   physical : Physical.table;
+  source : Quiver_core.Schema.Name.t;  (** Its name in the dump. *)
   into : Quiver_core.Schema.Name.t;
   later : string list;  (** Its secondary keys, added once it is imported. *)
   remaining : int Portable.Atomic.t;  (** Parts not closed yet. *)
@@ -102,11 +107,18 @@ type t = {
   built : (Quiver_core.Schema.Name.t, built) Portable_lockfree_htbl.t;
   builds : built list Portable.Atomic.t;  (** Every built table, to clean up after a failure. *)
   fallbacks : (Quiver_core.Schema.Name.t * Physical.unsuitable) list Portable.Atomic.t;
+  increments : Load.increments;
+  turns : (Quiver_core.Schema.Name.t, Await.Await.Semaphore.t) Portable_lockfree_htbl.t;
+      (** Tables loaded one part at a time, each part waiting for its turn. *)
 }
+
+(** Whether a part waited for its table's turn, given back once its statement ends. *)
+type turn = Any_time | Taken of Await.Await.Semaphore.t
 
 type loading = {
   owner : t;
   loader : int;  (** Held from [part] to [close] or [discard]. *)
+  turn : turn;
   job : job;
   renderer : csv;
   hash : Quiver_sink.Xxh3.t;
@@ -155,6 +167,8 @@ let add_keys link (into : Quiver_core.Schema.Name.t) (first, rest) =
   Base.List.fold_result (first :: rest) ~init:() ~f:(fun () statement ->
       retried link statement)
 
+let give_back = function Any_time -> () | Taken turn -> Await.Await.Semaphore.release turn
+
 let on_idle_loader t work =
   let loader = Await.Await.Mpmc_queue.pop Quiver_core.Blocking.await t.idle in
   let result = Quiver_core.Guarded.hold (Iarray.get t.loaders loader) work in
@@ -175,60 +189,68 @@ let create config target ~keys ~binlog ~ingest ~sessions =
             ~close:(fun control ->
               Quiver_core.Guarded.hold control (fun link -> Quiver_mysql.Link.close link)))
      in
-     let mode =
-       match ingest with
-       | Load_data -> Ok Plain
-       | Tablespaces { datadir } ->
-           Quiver_core.Guarded.hold control (fun link ->
-               let%bind () =
-                 match Quiver_mysql.Link.server link with
-                 | Mysql_8_4 _ -> Ok ()
-                 | Mysql_8_0 _ | Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _ ->
-                     Error (Tablespaces_need Mysql_8_4)
-               in
-               let%bind () =
-                 match binlog with Skip_binlog -> Ok () | Write_binlog -> Error (Tablespaces_need Skipped_binlog)
-               in
-               let%bind datadir =
-                 match datadir with
-                 | Some datadir -> Ok datadir
-                 | None -> (
-                     match
-                       rejected "SELECT @@datadir" (Quiver_mysql.Link.run_query link Datadir)
-                     with
-                     | Ok [ [| Some datadir |] ] -> Ok datadir
-                     | Ok _ -> Error (Tablespaces_need (Local_datadir ""))
-                     | Error error -> Error error)
-               in
-               let%bind () =
-                 match Quiver_innodb.File.size datadir with
-                 | Ok _ -> Ok ()
-                 | Error (`File _) -> Error (Tablespaces_need (Local_datadir datadir))
-               in
-               let%map collations =
-                 rejected "SELECT ID, CHARACTER_SET_NAME FROM information_schema.COLLATIONS"
-                   (Quiver_mysql.Link.run_query link Text_collations)
-               in
-               Physical_at
-                 {
-                   datadir;
-                   collations =
-                     List.filter_map
-                       (function
-                         | [| Some id; Some "utf8mb4" |] -> Option.map (fun id -> (id, Quiver_innodb.Layout.Utf8mb4)) (int_of_string_opt id)
-                         | [| Some id; Some "utf8mb3" |] -> Option.map (fun id -> (id, Quiver_innodb.Layout.Utf8mb3)) (int_of_string_opt id)
-                         | _ -> None)
-                       collations;
-                 })
+     let settings =
+       let%bind increments =
+         Quiver_core.Guarded.hold control (fun link ->
+             rejected (Quiver_mysql.Query.sql Autoinc_lock_mode) (Load.increments link))
+       in
+       let%map mode =
+         match ingest with
+         | Load_data -> Ok Plain
+         | Tablespaces { datadir } ->
+             Quiver_core.Guarded.hold control (fun link ->
+                 let%bind () =
+                   match Quiver_mysql.Link.server link with
+                   | Mysql_8_4 _ -> Ok ()
+                   | Mysql_8_0 _ | Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _ ->
+                       Error (Tablespaces_need Mysql_8_4)
+                 in
+                 let%bind () =
+                   match binlog with Skip_binlog -> Ok () | Write_binlog -> Error (Tablespaces_need Skipped_binlog)
+                 in
+                 let%bind datadir =
+                   match datadir with
+                   | Some datadir -> Ok datadir
+                   | None -> (
+                       match
+                         rejected "SELECT @@datadir" (Quiver_mysql.Link.run_query link Datadir)
+                       with
+                       | Ok [ [| Some datadir |] ] -> Ok datadir
+                       | Ok _ -> Error (Tablespaces_need (Local_datadir ""))
+                       | Error error -> Error error)
+                 in
+                 let%bind () =
+                   match Quiver_innodb.File.size datadir with
+                   | Ok _ -> Ok ()
+                   | Error (`File _) -> Error (Tablespaces_need (Local_datadir datadir))
+                 in
+                 let%map collations =
+                   rejected "SELECT ID, CHARACTER_SET_NAME FROM information_schema.COLLATIONS"
+                     (Quiver_mysql.Link.run_query link Text_collations)
+                 in
+                 Physical_at
+                   {
+                     datadir;
+                     collations =
+                       List.filter_map
+                         (function
+                           | [| Some id; Some "utf8mb4" |] -> Option.map (fun id -> (id, Quiver_innodb.Layout.Utf8mb4)) (int_of_string_opt id)
+                           | [| Some id; Some "utf8mb3" |] -> Option.map (fun id -> (id, Quiver_innodb.Layout.Utf8mb3)) (int_of_string_opt id)
+                           | [| Some id; Some "latin1" |] -> Option.map (fun id -> (id, Quiver_innodb.Layout.Latin1)) (int_of_string_opt id)
+                           | _ -> None)
+                         collations;
+                   })
+       in
+       (mode, increments)
      in
-     match mode with
+     match settings with
      | Error error ->
          List.iter
            (fun loader -> Quiver_core.Guarded.hold loader (fun link -> Quiver_mysql.Link.close link))
            loaders;
          Quiver_core.Guarded.hold control (fun link -> Quiver_mysql.Link.close link);
          Error error
-     | Ok mode ->
+     | Ok (mode, increments) ->
          let idle = Await.Await.Mpmc_queue.create () in
          List.iteri (fun index _ -> Await.Await.Mpmc_queue.push idle index) loaders;
          Ok
@@ -256,13 +278,15 @@ let create config target ~keys ~binlog ~ingest ~sessions =
              built = Portable_lockfree_htbl.create (module Quiver_core.Schema.Name);
              builds = Portable.Atomic.make [];
              fallbacks = Portable.Atomic.make [];
+             increments;
+             turns = Portable_lockfree_htbl.create (module Quiver_core.Schema.Name);
            })
 
 let shutdown t =
   List.iter
     (fun built ->
       match Portable.Atomic.get built.progress with
-      | Imported -> ()
+      | Imported _ -> ()
       | Pending ->
           Quiver_core.Guarded.hold t.control (fun link -> Physical.abandon link built.physical))
     (Portable.Atomic.get t.builds);
@@ -271,13 +295,14 @@ let shutdown t =
     t.loaders;
   Quiver_core.Guarded.hold t.control (fun link -> Quiver_mysql.Link.close link)
 
-let fallbacks t = List.rev (Portable.Atomic.get t.fallbacks)
-
-let imported t =
+let ways t =
   List.filter_map
     (fun built ->
-      match Portable.Atomic.get built.progress with Imported -> Some built.into | Pending -> None)
+      match Portable.Atomic.get built.progress with
+      | Imported { importing; keys } -> Some (built.source, Imported { importing; keys })
+      | Pending -> None)
     (Portable.Atomic.get t.builds)
+  @ List.rev_map (fun (name, reason) -> (name, Loaded reason)) (Portable.Atomic.get t.fallbacks)
 
 let advice t = t.advice
 let format _ = Quiver_core.Output_format.Csv dialect
@@ -312,13 +337,27 @@ let table t ({ name; _ } as table : Quiver_core.Schema.Table.t) ~ddl ~parts =
       match t.keys with With_table -> Foreign_keys | After_data -> All_keys
     in
     let { Deferred_keys.create; later; foreign } = Deferred_keys.split deferral name.table ddl in
-    let%map () =
+    let increments = t.increments in
+    let%map sharing =
       on_idle_loader t (fun link ->
           let%bind () = execute link (Use into.database) in
           let%bind () = retried link create in
           match (later, parts) with
-          | first :: rest, 0 -> add_keys link into (first, rest)
-          | [], _ | _ :: _, _ -> Ok ())
+          | first :: rest, 0 ->
+              let%map () = add_keys link into (first, rest) in
+              Load.Together
+          | _, 0 -> Ok Load.Together
+          | _, _ ->
+              rejected
+                (Quiver_mysql.Query.sql (Auto_increment into))
+                (Load.sharing link increments into))
+    in
+    let () =
+      match sharing with
+      | One_at_a_time ->
+          ignore
+            (Portable_lockfree_htbl.set t.turns ~key:name ~data:(Await.Await.Semaphore.create 1))
+      | Together -> ()
     in
     remember foreign;
     match later with
@@ -338,12 +377,13 @@ let table t ({ name; _ } as table : Quiver_core.Schema.Table.t) ~ddl ~parts =
     in
     match prepared with
     | Unsuitable reason ->
-        Portable.Atomic.update t.fallbacks ~pure_f:(fun fallbacks -> (into, reason) :: fallbacks);
+        Portable.Atomic.update t.fallbacks ~pure_f:(fun fallbacks -> (name, reason) :: fallbacks);
         plain ()
     | Prepared physical ->
         let state =
           {
             physical;
+            source = name;
             into;
             later;
             remaining = Portable.Atomic.make parts;
@@ -428,6 +468,13 @@ let loading t
           columns;
     }
   in
+  let turn =
+    match Portable_lockfree_htbl.find t.turns name with
+    | Null -> Any_time
+    | This turn ->
+        Await.Await.Semaphore.acquire Quiver_core.Blocking.await turn;
+        Taken turn
+  in
   let loader = Await.Await.Mpmc_queue.pop Quiver_core.Blocking.await t.idle in
   let statement = job.statement and database = job.into.database in
   match
@@ -444,6 +491,7 @@ let loading t
   with
   | Error error ->
       Await.Await.Mpmc_queue.push t.idle loader;
+      give_back turn;
       Error (`Sink error)
   | Ok () ->
       Ok
@@ -451,6 +499,7 @@ let loading t
            {
              owner = t;
              loader;
+             turn;
              job;
              renderer =
                {
@@ -475,7 +524,7 @@ let part t (table : Quiver_core.Schema.Table.t) ~index =
              owner = t;
              table = table.name;
              state;
-             run = Quiver_innodb.Tablespace.run (Physical.space state.physical);
+             run = Quiver_innodb.Tablespace.run (Physical.space state.physical) ~rank:index;
              file = file_of table.name index;
              hash = Quiver_sink.Xxh3.create ();
              rows = 0;
@@ -578,6 +627,7 @@ let close_loading (part : loading) answer =
             Error error)
   in
   Await.Await.Mpmc_queue.push t.idle part.loader;
+  give_back part.turn;
   match outcome with
   | Error error -> answer (Error error)
   | Ok () ->
@@ -643,7 +693,8 @@ let close_building (part : building) answer =
           let started =
             Quiver_core.Concurrent.start (fun () ->
                 Await.Await.Ivar.fill_if_empty imported
-                  (let%bind link = session config binlog in
+                  (let started = Quiver_core.Stopwatch.start () in
+                   let%bind link = session config binlog in
                    let outcome =
                      let%bind built =
                        Result.map_error
@@ -652,10 +703,15 @@ let close_building (part : building) answer =
                      in
                      let sent = Portable.Atomic.get state.sent in
                      let%bind () = if built = sent then Ok () else Error (Lost_rows { table; sent; built }) in
-                     Portable.Atomic.set state.progress Imported;
-                     match state.later with
-                     | [] -> Ok ()
-                     | first :: rest -> add_keys link state.into (first, rest)
+                     let importing = Quiver_core.Stopwatch.elapsed started in
+                     let keying = Quiver_core.Stopwatch.start () in
+                     let%map () =
+                       match state.later with
+                       | [] -> Ok ()
+                       | first :: rest -> add_keys link state.into (first, rest)
+                     in
+                     Portable.Atomic.set state.progress
+                       (Imported { importing; keys = Quiver_core.Stopwatch.elapsed keying })
                    in
                    Quiver_mysql.Link.close link;
                    outcome))
@@ -681,7 +737,8 @@ let discard_loading (part : loading) =
   Quiver_core.Guarded.hold (Iarray.get part.owner.loaders part.loader) (fun link ->
       ignore (rejected statement (Quiver_mysql.Link.complete link ~rows ~enums));
       ignore (execute link Rollback));
-  Await.Await.Mpmc_queue.push part.owner.idle part.loader
+  Await.Await.Mpmc_queue.push part.owner.idle part.loader;
+  give_back part.turn
 
 let discard = function Loading loading -> discard_loading loading | Building _ -> ()
 

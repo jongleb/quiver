@@ -71,6 +71,24 @@ val sessions :
 (** [control] and [count] loading sessions, all opened at once; whatever
     opened is closed again if any fails. *)
 
+(** Whether [LOAD DATA] into a table with an [AUTO_INCREMENT] column holds a
+    table lock to the statement's end ([innodb_autoinc_lock_mode] below 2). *)
+type increments = Interleaved | Table_locked
+
+(** Whether parts of a table can load at once: [One_at_a_time] when each
+    [LOAD DATA] would hold the table's [AUTO_INCREMENT] lock while it streams. *)
+type sharing = Together | One_at_a_time
+
+val increments : Quiver_mysql.Link.t -> (increments, [> cause ]) result @@ portable
+
+val sharing :
+  Quiver_mysql.Link.t ->
+  increments ->
+  Quiver_core.Schema.Name.t ->
+  (sharing, [> cause ]) result
+  @@ portable
+(** For a table in the target. *)
+
 val advice : Quiver_mysql.Link.t -> binlog -> Quiver_core.Advice.t list @@ portable
 (** What the target's durability settings cost a load; none when it does not
     tell. *)

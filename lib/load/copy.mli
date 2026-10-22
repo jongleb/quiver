@@ -64,11 +64,15 @@ val create :
 val shutdown : t -> unit
 (** Ends the loading sessions, after the dump succeeded or failed. *)
 
-val fallbacks : t -> (Quiver_core.Schema.Name.t * Physical.unsuitable) list
-(** Tables [Tablespaces] loaded with [LOAD DATA] after all, and why. *)
+(** How a table with rows reached the target under [Tablespaces]. *)
+type way =
+  | Imported of { importing : Core.Time_ns.Span.t; keys : Core.Time_ns.Span.t }
+      (** Built beside the server: checking and importing its file after its
+          last part, then adding its secondary keys. *)
+  | Loaded of Physical.unsuitable  (** [LOAD DATA], since the writer cannot build it. *)
 
-val imported : t -> Quiver_core.Schema.Name.t list
-(** Tables loaded by importing their built tablespace. *)
+val ways : t -> (Quiver_core.Schema.Name.t * way) list
+(** By the table's name in the dump. *)
 
 val advice : t -> Quiver_core.Advice.t list
 (** What the target's durability settings cost the copy. *)

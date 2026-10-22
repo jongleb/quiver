@@ -12,19 +12,15 @@ let ident name = get_ok (Quiver_core.Ident.of_string name)
 let name = { Quiver_core.Schema.Name.database = ident "db"; table = ident "t" }
 
 let table ?(key : string Quiver_core.Schema.Table.key = Primary ("id", []))
-    fields =
+    ?(generated = []) fields =
   let pair (first, rest) = (ident first, List.map ident rest) in
+  let field (field, ltype, nullability) =
+    { Quiver_core.Schema.Field.name = ident field; ltype; nullability }
+  in
   get_ok
     (Quiver_core.Schema.Table.make ~name
-       ~fields:
-         (List.map
-            (fun (field, ltype, nullability) ->
-              {
-                Quiver_core.Schema.Field.name = ident field;
-                ltype;
-                nullability;
-              })
-            fields)
+       ~fields:(List.map field fields)
+       ~generated:(List.map field generated)
        ~key:
          (match key with
          | Primary fields -> Primary (pair fields)

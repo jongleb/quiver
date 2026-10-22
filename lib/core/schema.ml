@@ -43,12 +43,15 @@ module Table = struct
   type t = {
     name : Name.t;
     fields : Field.t * Field.t list;
+    generated : Field.t list; [@sexp.list] [@yojson.default []]
     key : Field.t key;
     estimate : estimate;
   }
   [@@deriving sexp ~portable, yojson]
 
-  let make ~name ~fields ~key ~estimate =
+  let columns { fields = first, rest; generated; _ } = (first :: rest) @ generated
+
+  let make ~name ~fields ~generated ~key ~estimate =
     let resolve (first, rest) =
       let one field =
         Option.fold
@@ -60,7 +63,7 @@ module Table = struct
                 Error (Nullable_key_field { table = name; field }))
           (List.find_opt
              (fun { Field.name; _ } -> Ident.equal name field)
-             fields)
+             (fields @ generated))
       in
       let%map first = one first
       and rest = Base.Result.all (List.map one rest) in
@@ -68,7 +71,7 @@ module Table = struct
     in
     let duplicate =
       Base.List.find_a_dup ~compare:Ident.compare
-        (List.map (fun { Field.name; _ } -> name) fields)
+        (List.map (fun { Field.name; _ } -> name) (fields @ generated))
     in
     match (fields, duplicate) with
     | [], _ -> Error (`Schema (No_fields name))
@@ -86,9 +89,9 @@ module Table = struct
                  let%map fields = resolve fields in
                  Unique { index; fields }
            in
-           { name; fields = (first, rest); key; estimate })
+           { name; fields = (first, rest); generated; key; estimate })
 
-  let remade { name; fields = first, rest; key; estimate } =
+  let remade { name; fields = first, rest; generated; key; estimate } =
     let names (first, rest) =
       (first.Field.name, List.map (fun { Field.name; _ } -> name) rest)
     in
@@ -98,7 +101,7 @@ module Table = struct
       | Primary fields -> Primary (names fields)
       | Unique { index; fields } -> Unique { index; fields = names fields }
     in
-    make ~name ~fields:(first :: rest) ~key ~estimate
+    make ~name ~fields:(first :: rest) ~generated ~key ~estimate
 
   let t_of_sexp sexp =
     Codec.checked_of_sexp (fun (`Schema e) -> sexp_of_error e) (remade (t_of_sexp sexp)) sexp

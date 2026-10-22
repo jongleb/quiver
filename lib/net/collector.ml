@@ -24,6 +24,7 @@ type downstream = {
   control : Channel.t;
   data : Channel.t list;
   format : Quiver_core.Output_format.t;
+  columns : Message.columns;  (** What the next hop takes. *)
   peer : Channel.peer;  (** Where data connections that replace broken ones go. *)
 }
 
@@ -118,9 +119,9 @@ let forward peer (session : session) =
                })))
   in
   let%bind ready = failed (Channel.receive control Message.reply_of_sexp) in
-  let%bind format =
+  let%bind format, columns =
     match ready with
-    | Ready format -> Ok format
+    | Ready { format; columns } -> Ok (format, columns)
     | Refused message | Failed message -> Error (`Collector (Downstream message))
     | Done | Skipped | Committed _ | Rejected _ | Heard _ -> unexpected ready
   in
@@ -141,7 +142,7 @@ let forward peer (session : session) =
                        Channel.close channel;
                        Error (Lost error))))
   in
-  { control; data; format; peer }
+  { control; data; format; columns; peer }
   in
   Result.iter_error (fun _ -> Channel.close control) greeted;
   greeted
@@ -216,7 +217,7 @@ let relay listening (session : session) (downstream : downstream) =
     let%bind () =
       failed
         (Channel.send session.control
-           (Message.sexp_of_reply (Ready downstream.format)))
+           (Message.sexp_of_reply (Ready { format = downstream.format; columns = downstream.columns })))
     in
     attached listening session
   with
@@ -447,7 +448,7 @@ module Make (S : Quiver_core.Sink_intf.S) = struct
   (** Whether the session still beats. *)
   type life = Live | Over
 
-  let run ?forward listening (session : session) sink =
+  let run ?forward listening (session : session) sink ~columns =
     let parts =
       Await.Capsule.Await.With_mutex.create (fun () -> Hashtbl.create 256)
     and owners =
@@ -558,7 +559,16 @@ module Make (S : Quiver_core.Sink_intf.S) = struct
       let%bind () =
         failed
           (Channel.send session.control
-             (Message.sexp_of_reply (Ready (S.format sink))))
+             (Message.sexp_of_reply
+                (Ready
+                   {
+                     format = S.format sink;
+                     columns =
+                       Option.fold forward ~none:columns ~some:(fun (downstream : downstream) ->
+                           match ((columns : Message.columns), downstream.columns) with
+                           | Written, Written -> Written
+                           | Stored_too, _ | _, Stored_too -> Stored_too);
+                   })))
       in
       attached listening session
     with
@@ -947,16 +957,14 @@ module Make (S : Quiver_core.Sink_intf.S) = struct
             | Ok (_, stop) when stop <> raw ->
                 malformed "decompressed length differs from the header's"
             | Ok (decoded, stop) -> (
-                let { Quiver_core.Schema.Table.name; fields = first, rest; _ } =
-                  lane.table
-                in
+                let { Quiver_core.Schema.Table.name; _ } = lane.table in
                 let batch =
                   Base.Hashtbl.find_or_add batches name ~default:(fun () ->
                       Quiver_core.Batch.create
                         (List.map
                            (fun ({ ltype; _ } : Quiver_core.Schema.Field.t) ->
                              ltype)
-                           (first :: rest)))
+                           (Quiver_core.Schema.Table.columns lane.table)))
                 in
                 match
                   Quiver_core.Batch.decode batch decoded ~stop

@@ -44,7 +44,7 @@ type t =
       (** [innodb_flush_log_at_trx_commit], [sync_binlog] and [log_bin]. *)
   | Autoinc_lock_mode  (** [innodb_autoinc_lock_mode]. *)
   | Datadir  (** [datadir]: where the server keeps its files. *)
-  | Text_collations  (** Ids of the server's [utf8mb4] and [utf8mb3] collations, with the set's name. *)
+  | Text_collations  (** Ids of the server's [utf8mb4], [utf8mb3] and [latin1] collations, with the set's name. *)
   | Auto_increment of Quiver_core.Schema.Name.t
       (** The table's [AUTO_INCREMENT] column, if it has one. *)
   | Warnings  (** Level, code and message of the last statement's warnings. *)

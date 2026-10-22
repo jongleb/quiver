@@ -77,6 +77,9 @@ val adjust : t -> Quiver_core.Width.decision -> unit
 (** Opens or closes so many data connections now, as the session does on its
     own while [most_streams] allows; the last one is never closed. *)
 
+val columns : t -> Message.columns
+(** What the collector, or a node after it, takes of each table. *)
+
 val streams : t -> int
 
 val advice : t -> Quiver_core.Advice.t list

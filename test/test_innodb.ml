@@ -17,6 +17,7 @@ let collations =
   List.map (fun id -> (id, Quiver_innodb.Layout.Utf8mb4)) ([ 45; 46 ] @ List.init 24 (fun k -> 224 + k) @ List.init 17 (fun k -> 255 + k)
   @ [ 273; 274; 275 ] @ List.init 18 (fun k -> 277 + k) @ [ 296; 297; 298; 300 ] @ List.init 21 (fun k -> 303 + k))
   @ List.map (fun id -> (id, Quiver_innodb.Layout.Utf8mb3)) ([ 33; 76; 83; 223 ] @ List.init 24 (fun k -> 192 + k))
+  @ List.map (fun id -> (id, Quiver_innodb.Layout.Latin1)) [ 5; 8; 15; 31; 47; 48; 49; 94 ]
 
 
 let tests =
@@ -101,7 +102,7 @@ let built ~cfg ~template ~dumped rows ~cuts ~order ~batch =
   let finished =
     List.map
       (fun (_, slice) ->
-        let run = Quiver_innodb.Tablespace.run space in
+        let run = Quiver_innodb.Tablespace.run space ~rank:0 in
         let rec go at =
           if at < Array.length slice then (
             let chunk = Array.sub slice at (Int.min batch (Array.length slice - at)) in
@@ -139,7 +140,21 @@ let stored (layout : Quiver_innodb.Layout.t) file =
   let first page = (page * size) + ((99 + u16 ((page * size) + 97)) land 0xFFFF) in
   let rec leftmost page =
     if u16 ((page * size) + 64) = 0 then page
-    else leftmost (u32 (first page + Quiver_innodb.Layout.key_length layout))
+    else
+      let origin = first page in
+      let data, _ =
+        List.fold_left
+          (fun (data, at) (field : Quiver_innodb.Layout.field) ->
+            match Quiver_innodb.Layout.length field.storage with
+            | Fixed n -> (data + n, at)
+            | Varying { big } ->
+                let b = Bytes.get_uint8 file at in
+                if big && b land 0x80 <> 0 then (data + (((b land 0x3F) lsl 8) lor Bytes.get_uint8 file (at - 1)), at - 2)
+                else (data + b, at - 1))
+          (0, origin - 6 - layout.null_bytes)
+          (Base.List.take layout.fields layout.key)
+      in
+      leftmost (u32 (origin + data))
   in
   let lob at =
     let first = u32 (at + 4) in
@@ -303,7 +318,7 @@ let tests =
           let u16 at = Bytes.get_uint16_be file at and u32 at = Int32.to_int (Bytes.get_int32_be file at) land 0xFFFF_FFFF in
           let root = layout.root in
           let first page = (99 + u16 ((page * size) + 97)) land 0xFFFF in
-          let leaf = u32 ((root * size) + first root + Quiver_innodb.Layout.key_length layout) in
+          let leaf = u32 ((root * size) + first root + 8) in
           let second = u32 ((leaf * size) + 12) in
           let after page origin = (origin + u16 ((page * size) + origin - 2)) land 0xFFFF in
           let mutations =
@@ -343,7 +358,7 @@ let tests =
               ( "child pointer",
                 fun file ->
                   Bytes.set_int32_be file
-                    ((root * size) + first root + Quiver_innodb.Layout.key_length layout)
+                    ((root * size) + first root + 8)
                     (Int32.of_int second);
                   [ root ] );
               ( "FRAG_N_USED",
@@ -383,7 +398,7 @@ let tests =
           let path = Filename.temp_file "quiver" ".ibd" in
           let file = ok (Quiver_innodb.File.create path) in
           let space = ok (Quiver_innodb.Tablespace.create ~template:(fixture "narrow.ibd") layout file) in
-          let run = Quiver_innodb.Tablespace.run space in
+          let run = Quiver_innodb.Tablespace.run space ~rank:0 in
           let columns = Iarray.of_list [ column Int64 [ `Int 5; `Int 3 ]; column Int32 [ `Int 0; `Int 0 ] ] in
           let records = ok (Quiver_innodb.Tablespace.encode space columns ~rows:2) in
           let added = Quiver_innodb.Tablespace.add run records in
@@ -498,7 +513,7 @@ let tests =
               let finished =
                 Quiver_core.Concurrent.each runs (fun r ->
                     let slice = Iarray.get slices r in
-                    let run = Quiver_innodb.Tablespace.run space in
+                    let run = Quiver_innodb.Tablespace.run space ~rank:0 in
                     let rec go at =
                       if at >= Iarray.length slice then Ok ()
                       else
@@ -629,20 +644,30 @@ let typed_column (ltype, values) =
   List.iter (typed_value column (Quiver_core.Column.repr column)) values;
   Quiver_core.Column.Any column
 
-let typed_build ?(table = "typed") typed =
+let typed_build ?(table = "typed") ?(runs = 1) typed =
   let dumped = List.map fst typed in
   let layout = ok (Quiver_innodb.Layout.of_cfg (ok (Quiver_innodb.Cfg.parse (fixture (table ^ ".cfg")))) ~collations dumped) in
   let path = Filename.temp_file "quiver" ".ibd" in
   let file = ok (Quiver_innodb.File.create path) in
   let space = ok (Quiver_innodb.Tablespace.create ~template:(fixture (table ^ ".ibd")) layout file) in
-  let run = Quiver_innodb.Tablespace.run space in
-  let columns = Iarray.of_list (List.map (fun ((_, ltype), values) -> typed_column (ltype, values)) typed) in
   let rows = List.length (snd (List.hd typed)) in
+  let cuts = List.init runs (fun r -> (r * rows / runs, ((r + 1) * rows / runs) - (r * rows / runs))) in
+  let started = List.mapi (fun rank cut -> (cut, Quiver_innodb.Tablespace.run space ~rank)) cuts in
   let built =
-    let%bind.Base.Result records = Quiver_innodb.Tablespace.encode space columns ~rows in
-    let%bind.Base.Result () = Quiver_innodb.Tablespace.add run records in
-    let%bind.Base.Result finished = Quiver_innodb.Tablespace.close run in
-    Quiver_innodb.Tablespace.finish space [ finished ]
+    let%bind.Base.Result finished =
+      Base.Result.all
+        (List.rev_map
+           (fun ((from, count), run) ->
+             let columns =
+               Iarray.of_list
+                 (List.map (fun ((_, ltype), values) -> typed_column (ltype, Base.List.sub values ~pos:from ~len:count)) typed)
+             in
+             let%bind.Base.Result records = Quiver_innodb.Tablespace.encode space columns ~rows:count in
+             let%bind.Base.Result () = Quiver_innodb.Tablespace.add run records in
+             Quiver_innodb.Tablespace.close run)
+           started)
+    in
+    Quiver_innodb.Tablespace.finish space finished
   in
   Quiver_innodb.File.close file;
   let bytes = Bytes.of_string (In_channel.with_open_bin path In_channel.input_all) in
@@ -664,6 +689,65 @@ let utf8mb3 =
     ("t" * String, [ `Text ""; `Text "tëxt"; `Text (repeat 1000 "ж"); `Null ]);
     ("v4" * String, [ `Text ""; `Text "😀"; `Text (repeat 10 "😀"); `Null ]);
     ("tl" * String, [ `Text ""; `Text "short"; `Text (repeat 20000 "€"); `Null ]);
+  ]
+
+(** [generated.ibd]'s table: [STORED] generated columns between written ones, read after them as
+    the dump reads them, and a [VIRTUAL] one the record lacks; [generated-rows.ibd] holds the rows
+    after [INSERT]. *)
+let generated =
+  let ( * ) name (ltype : Quiver_core.Ltype.t) = (name, ltype) in
+  [
+    ("id" * Quiver_core.Ltype.Int32, [ `Int 1; `Int 2; `Int 3; `Int 4 ]);
+    ("a" * Int32, [ `Int 5; `Null; `Int (-7); `Int 2147483 ]);
+    ("s" * String, [ `Text "ab"; `Text "жук"; `Null; `Text "Émile" ]);
+    ("tail" * String, [ `Text "x"; `Null; `Text "tail"; `Text "" ]);
+    ("total" * Int64, [ `Int 1005; `Null; `Int 2993; `Int 2151483 ]);
+    ("up" * String, [ `Text "AB"; `Text "ЖУК"; `Null; `Text "ÉMILE" ]);
+    ( "dt" * Datetime (fsp 0),
+      [ `Int (micros 2020 1 2 0 0 0 0); `Int (micros 2020 1 3 0 0 0 0); `Int (micros 2020 1 4 0 0 0 0); `Int (micros 2020 1 5 0 0 0 0) ] );
+  ]
+
+(** [nokey.ibd]'s table, without a primary key: rows 1 to 700 as [nokey-rows.ibd] holds them after
+    [INSERT], over several pages, with NULLs and a [TEXT] of 20 000 [ж] off its record. *)
+let nokey =
+  let k = List.init 700 (fun k -> k + 1) in
+  [
+    (("a", Quiver_core.Ltype.Int32), List.map (fun k -> if k mod 9 = 0 then `Null else `Int ((k * 7) - 1000)) k);
+    (("b", Quiver_core.Ltype.String), List.map (fun k -> if k mod 4 = 0 then `Null else `Text (String.make (k mod 100) (Char.chr (97 + (k mod 26))))) k);
+    ( ("c", Quiver_core.Ltype.String),
+      List.map
+        (fun k ->
+          if k = 350 then `Text (String.concat "" (List.init 20000 (fun _ -> "ж")))
+          else if k mod 3 = 0 then `Null
+          else `Text ("t" ^ string_of_int k))
+        k );
+    (("d", Quiver_core.Ltype.Int64), List.map (fun k -> `Int k) k);
+  ]
+
+(** [latin1.ibd]'s table: [latin1] text of every byte in fixed [CHAR], [VARCHAR], [TEXT] and a
+    [LONGTEXT] off its record, as [latin1-rows.ibd] holds it after [INSERT]; [latin1.txt] is the
+    same rows as the dump reads them, in [utf8mb4], in hex. *)
+let latin1 =
+  let rows =
+    List.map
+      (fun line -> String.split_on_char '\t' line)
+      (List.filter (fun line -> line <> "") (String.split_on_char '\n' (fixture "latin1.txt")))
+  in
+  let column k = List.map (fun row -> match List.nth row k with "NULL" -> `Null | text -> `Text (hex text)) rows in
+  (("id", Quiver_core.Ltype.Int32), List.map (fun row -> `Int (int_of_string (List.hd row))) rows)
+  :: List.mapi (fun k name -> ((name, Quiver_core.Ltype.String), column (k + 1))) [ "c"; "cb"; "v"; "vg"; "t"; "tl" ]
+
+(** [textkey.ibd]'s table, keyed by [(VARCHAR utf8mb4_0900_ai_ci, INT)]: 3000 rows in the
+    collation's order, keys up to 149 bytes, as [textkey-rows.ibd] holds them after [INSERT];
+    [textkey.txt] is the rows in that order. *)
+let textkey =
+  let rows =
+    List.map (String.split_on_char '\t') (List.filter (fun line -> line <> "") (String.split_on_char '\n' (fixture "textkey.txt")))
+  in
+  [
+    (("name", Quiver_core.Ltype.String), List.map (fun row -> `Text (hex (List.nth row 0))) rows);
+    (("n", Quiver_core.Ltype.Int32), List.map (fun row -> `Int (int_of_string (List.nth row 1))) rows);
+    (("v", Quiver_core.Ltype.String), List.map (fun row -> match List.nth row 2 with "NULL" -> `Null | v -> `Text (hex v)) rows);
   ]
 
 let as_server table typed =
@@ -696,6 +780,54 @@ let tests =
           as_server "typed" typed);
       Alcotest.test_case "utf8mb3 text is written byte for byte as the server writes it" `Quick (fun () ->
           as_server "utf8mb3" utf8mb3);
+      Alcotest.test_case "stored generated columns read after the others are written in their place" `Quick (fun () ->
+          as_server "generated" generated);
+      Alcotest.test_case "a table without a primary key is written as the server writes it, numbered by its runs" `Quick
+        (fun () ->
+          as_server "nokey" nokey;
+          List.iter
+            (fun runs ->
+              let layout, built = typed_build ~table:"nokey" ~runs nokey in
+              let bytes = ok built in
+              let () = match checked layout bytes with Ok _ -> () | Error _ as failed -> Alcotest.fail (check_error failed) in
+              let ids =
+                List.map
+                  (fun record ->
+                    match record with
+                    | ((field : Quiver_innodb.Layout.field), Some raw) :: _ when field.storage = Row_id -> raw
+                    | _ -> Alcotest.fail "no row id first")
+                  (stored layout bytes)
+              in
+              Alcotest.(check int) "rows" 700 (List.length ids);
+              Alcotest.(check bool) "ascending" true (List.sort_uniq String.compare ids = ids))
+            [ 1; 3; 7 ]);
+      Alcotest.test_case "latin1 text is transcoded byte for byte as the server stores it" `Quick (fun () ->
+          as_server "latin1" latin1;
+          List.iter
+            (fun (name, value, expected) ->
+              let replaced =
+                List.map
+                  (fun (((field, _) as column), values) ->
+                    if field = name then (column, List.mapi (fun r v -> if r = 1 then `Text value else v) values) else (column, values))
+                  latin1
+              in
+              match typed_build ~table:"latin1" replaced with
+              | _, Error (`Tablespace error) ->
+                  Alcotest.(check string) name expected (Sexplib0.Sexp.to_string (Quiver_innodb.Tablespace.sexp_of_error error))
+              | _, Error _ -> Alcotest.failf "%s: another error" name
+              | _, Ok _ -> Alcotest.failf "%s: built" name)
+            [ ("v", "ж", "(Unstorable 3)"); ("t", "\xc2\x80", "(Unstorable 5)"); ("tl", "😀", "(Unstorable 6)");
+              ("v", "\xc0\xa9", "(Unstorable 3)"); ("c", "abcdef", "(Value_too_long 6)"); ("c", "€€€€€€", "(Value_too_long 6)") ]);
+      Alcotest.test_case "a key in a collation's order is written as the server writes it, runs by rank" `Quick (fun () ->
+          as_server "textkey" textkey;
+          let ours runs =
+            let layout, built = typed_build ~table:"textkey" ~runs textkey in
+            let bytes = ok built in
+            let () = match checked layout bytes with Ok _ -> () | Error _ as failed -> Alcotest.fail (check_error failed) in
+            List.map (List.map snd) (stored layout bytes)
+          in
+          let one = ours 1 in
+          List.iter (fun runs -> Alcotest.(check bool) (Printf.sprintf "%d runs" runs) true (ours runs = one)) [ 2; 5 ]);
       Alcotest.test_case "a character of four bytes is refused in utf8mb3 text" `Quick (fun () ->
           List.iter
             (fun name ->
@@ -726,7 +858,7 @@ let tests =
               (fun (((name, (ltype : Quiver_core.Ltype.t)) as column), values) ->
                 match ltype with
                 | Date -> ((name, Quiver_core.Ltype.Unchecked_date), List.map (function `Int v -> `Int (fields v) | v -> v) values)
-                | Datetime fsp ->
+                | Datetime fsp | Timestamp fsp ->
                     ((name, Quiver_core.Ltype.Unchecked_datetime fsp), List.map (function `Int v -> `Int (unchecked v) | v -> v) values)
                 | _ -> (column, values))
               typed
@@ -756,6 +888,35 @@ let tests =
               ("dc", `Text "1e5", "(Unstorable 12)");
               ("bn", `Text "abcde", "(Value_too_long 5)");
             ]);
+      Alcotest.test_case "an unchecked TIMESTAMP stores its zero as 0 and refuses a day that is not" `Quick (fun () ->
+          let fields y m d = `Int (((y lsl 9) lor (m lsl 5) lor d) lsl 37) in
+          let relaxed values =
+            List.map
+              (fun (((name, (ltype : Quiver_core.Ltype.t)) as column), rows) ->
+                match (name, ltype) with
+                | "ts", Timestamp fsp -> ((name, Quiver_core.Ltype.Unchecked_datetime fsp), values)
+                | "ts6", Timestamp fsp -> ((name, Quiver_core.Ltype.Unchecked_datetime fsp), List.map (fun _ -> `Null) rows)
+                | _ -> (column, rows))
+              typed
+          in
+          let layout, built = typed_build (relaxed [ `Int 0; fields 2020 2 29; `Int 0; `Null ]) in
+          let stored = stored layout (ok built) in
+          let field (record : (Quiver_innodb.Layout.field * string option) list) =
+            List.find_map
+              (fun ((field : Quiver_innodb.Layout.field), raw) ->
+                if field.source >= 0 && fst (fst (List.nth typed field.source)) = "ts" then Some raw else None)
+              record
+          in
+          Alcotest.(check (list (option string)))
+            "zero" [ Some "\000\000\000\000\000"; Some "\000\000\000\000\000" ]
+            (List.filter_map (fun record -> field record) [ List.nth stored 0; List.nth stored 2 ]);
+          List.iter
+            (fun (y, m, d) ->
+              match typed_build (relaxed [ `Int 0; fields y m d; `Int 0; `Null ]) with
+              | _, Error (`Tablespace (Unstorable 5)) -> ()
+              | _, Error _ -> Alcotest.failf "%d-%d-%d: another error" y m d
+              | _, Ok _ -> Alcotest.failf "%d-%d-%d: built" y m d)
+            [ (2021, 2, 29); (2020, 0, 1); (2020, 1, 0); (1969, 12, 31); (2040, 1, 1) ]);
       Alcotest.test_case "text in another character set than the dump's is not built" `Quick (fun () ->
           let cfg = ok (Quiver_innodb.Cfg.parse (fixture "typed.cfg")) in
           let dumped = List.map fst typed in
@@ -796,7 +957,7 @@ let outside_build rows ~cuts =
     List.mapi
       (fun k from ->
         let until = List.nth bounds (k + 1) in
-        let run = Quiver_innodb.Tablespace.run space in
+        let run = Quiver_innodb.Tablespace.run space ~rank:0 in
         let slice = Array.to_list (Array.sub rows from (until - from)) in
         let columns =
           Iarray.of_list
@@ -927,7 +1088,7 @@ let tests =
           let path = Filename.temp_file "quiver" ".ibd" in
           let file = ok (Quiver_innodb.File.create path) in
           let space = ok (Quiver_innodb.Tablespace.create ~template:(fixture "json.ibd") layout file) in
-          let run = Quiver_innodb.Tablespace.run space in
+          let run = Quiver_innodb.Tablespace.run space ~rank:0 in
           let batch =
             Iarray.of_list
               [ typed_column (Quiver_core.Ltype.Int32, List.mapi (fun k _ -> `Int (k + 1)) texts);

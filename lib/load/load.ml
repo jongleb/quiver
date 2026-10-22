@@ -76,9 +76,22 @@ type report =
   | Ran
   | Failed of failure
 
-(** Whether [LOAD DATA] into a table with an [AUTO_INCREMENT] column holds a
-    table lock to the statement's end, letting one load in at a time. *)
 type increments = Interleaved | Table_locked
+
+type sharing = Together | One_at_a_time
+
+let increments link =
+  Result.map
+    (function [ [| Some "2" |] ] -> Interleaved | _ -> Table_locked)
+    (Quiver_mysql.Link.run_query link Autoinc_lock_mode)
+
+let sharing link increments table =
+  match increments with
+  | Interleaved -> Ok Together
+  | Table_locked ->
+      Result.map
+        (function [] -> Together | _ :: _ -> One_at_a_time)
+        (Quiver_mysql.Link.run_query link (Auto_increment table))
 
 (** Whether the loading threads still work, or only answer after a failure. *)
 type course = Going | Stopping
@@ -108,17 +121,13 @@ let advice link binlog =
   match Quiver_mysql.Link.run_query link Durability with
   | Ok [ [| flush; sync; logged |] ] ->
       let on value = Option.equal String.equal value (Some "1") in
-      let logged_load =
+      let binlogged =
         match binlog with
-        | Write_binlog when on logged -> Some Quiver_core.Advice.Logged_load
-        | Write_binlog | Skip_binlog -> None
+        | Write_binlog when on logged ->
+            [ Base.Option.some_if (on sync) Quiver_core.Advice.Synced_binlog; Some Quiver_core.Advice.Logged_load ]
+        | Write_binlog | Skip_binlog -> []
       in
-      List.filter_map Fun.id
-        [
-          Base.Option.some_if (on flush) Quiver_core.Advice.Durable_commits;
-          Base.Option.some_if (on sync && on logged) Quiver_core.Advice.Synced_binlog;
-          logged_load;
-        ]
+      List.filter_map Fun.id (Base.Option.some_if (on flush) Quiver_core.Advice.Durable_commits :: binlogged)
   | Ok _ | Error _ -> []
 
 let sessions config binlog uniqueness ~count ~control ~close =
@@ -329,12 +338,7 @@ let run config ~dir target ~keys ~binlog ~threads =
           let%bind loaded =
             Quiver_mysql.Link.run_query control (Loaded_files { dump; target = progress_target })
           in
-          let%map mode = Quiver_mysql.Link.run_query control Autoinc_lock_mode in
-          let increments =
-            match mode with
-            | [ [| Some "2" |] ] -> Interleaved
-            | _ -> Table_locked
-          in
+          let%map increments = increments control in
           (List.filter_map (function [| file |] -> file | _ -> None) loaded, increments)
         with
         | Ok (loaded, increments) -> Ok (control, loaded, increments)
@@ -473,13 +477,7 @@ let run config ~dir target ~keys ~binlog ~threads =
         remaining = Portable.Atomic.make (List.length pending);
       }
     in
-    let%bind serial =
-      match increments with
-      | Interleaved -> Ok []
-      | Table_locked ->
-          Quiver_mysql.Link.run_query link
-            (Auto_increment { database = renamed target database; table })
-    in
+    let%bind sharing = sharing link increments { database = renamed target database; table } in
     let%map () = match pending with [] -> add_keys link keys | _ -> Ok () in
     let most =
       let rows = Base.List.sum (module Base.Int) parts ~f:(fun part -> part.rows) in
@@ -487,10 +485,10 @@ let run config ~dir target ~keys ~binlog ~threads =
       if rows > 0 && bytes / rows > 8192 then 1 else threads
     in
     let cap : Schedule.cap =
-      match (serial, Quiver_mysql.Link.server link) with
-      | _ :: _, _ -> Alone
-      | [], (Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _) -> First_alone most
-      | [], (Mysql_8_0 _ | Mysql_8_4 _) -> At_most most
+      match (sharing, Quiver_mysql.Link.server link) with
+      | One_at_a_time, _ -> Alone
+      | Together, (Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _) -> First_alone most
+      | Together, (Mysql_8_0 _ | Mysql_8_4 _) -> At_most most
     in
     (cap, List.map (fun part -> { database; part; delivery; keys }) pending)
   in

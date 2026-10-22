@@ -63,7 +63,7 @@ let database n = ident ("db" ^ string_of_int n)
 
 let table ~databases n =
   Support.get_ok
-    (Schema.Table.make
+    (Schema.Table.make ~generated:[]
        ~name:
          { database = database (n mod databases); table = ident ("t" ^ string_of_int n) }
        ~fields:[ { name = ident "id"; ltype = Int64; nullability = Not_null } ]

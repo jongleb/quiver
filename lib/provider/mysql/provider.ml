@@ -5,12 +5,15 @@
 type zero_dates = Reject | Keep
 [@@deriving to_string ~capitalize:"kebab-case" ~portable, enumerate]
 
+type generated = Left_out | Read
+
 type conn_config = {
   route : Link.route;
   user : string;
   password : string option;
   timeouts : Link.timeouts;
   zero_dates : zero_dates;
+  generated : generated;
 }
 
 (** How the group of sessions is opened. *)
@@ -152,6 +155,7 @@ let hang_up session = Quiver_core.Guarded.hold session (fun session -> close ses
 
 type connections = {
   zero_dates : zero_dates;
+  generated : generated;
   server : Server.t;
   control : session Await.Capsule.Await.With_mutex.t;
       (** Takes the lock while the sessions open their snapshots. *)
@@ -234,6 +238,7 @@ let connect config (wanted : Quiver_core.Provider_intf.sessions) =
             Ok
               {
                 zero_dates = config.zero_dates;
+                generated = config.generated;
                 server;
                 control;
                 sessions = Iarray.of_list sessions;
@@ -398,20 +403,24 @@ let introspect connections (filter : Quiver_core.Filter.t) =
                   in
                   (ltype, `Splittable)
             in
-            let generated =
-              Base.List.mem
-                (String.split_on_char ' ' (Option.value ~default:"" extra))
-                "GENERATED" ~equal:String.equal
+            let flags = String.split_on_char ' ' (Option.value ~default:"" extra) in
+            let has flag = Base.List.mem flags flag ~equal:String.equal in
+            let nullability : Quiver_core.Schema.Field.nullability =
+              match nullable with "YES" -> Nullable | _ -> Not_null
             in
-            if generated then Ok fields
-            else
-              let nullability : Quiver_core.Schema.Field.nullability =
-                match nullable with "YES" -> Nullable | _ -> Not_null
-              in
+            let field kind =
               Ok
                 (( table,
-                   ({ Quiver_core.Schema.Field.name = column; ltype; nullability }, splitting) )
-                :: fields))
+                   ( { Quiver_core.Schema.Field.name = column; ltype; nullability },
+                     splitting,
+                     kind ) )
+                :: fields)
+            in
+            if not (has "GENERATED") then field `Written
+            else
+              match connections.generated with
+              | Read when has "STORED" -> field `Generated
+              | Read | Left_out -> Ok fields)
         | _ -> unexpected Columns)
   in
   let fields_by_table =
@@ -503,13 +512,16 @@ let introspect connections (filter : Quiver_core.Filter.t) =
       (List.map
          (fun (name, rows, bytes) ->
            let columns = Base.Hashtbl.find_multi fields_by_table name in
-           let fields = List.map fst columns in
+           let fields, generated =
+             Base.List.partition_map columns ~f:(fun (field, _, kind) ->
+                 match kind with `Written -> First field | `Generated -> Second field)
+           in
            let keyable =
              Idents.of_list
                (List.filter_map
                   (fun ( ({ name; nullability; ltype } :
                            Quiver_core.Schema.Field.t),
-                         literals ) ->
+                         literals, _ ) ->
                     match (nullability, literals, key_parser ltype) with
                     | Not_null, `Splittable, Some _ -> Some name
                     | Nullable, _, _ | _, `Unsplittable, _ | _, _, None ->
@@ -555,7 +567,7 @@ let introspect connections (filter : Quiver_core.Filter.t) =
                 in
                 Quiver_core.Schema.Table.Primary fields)
            in
-           Quiver_core.Schema.Table.make ~name ~fields ~key
+           Quiver_core.Schema.Table.make ~name ~fields ~generated ~key
              ~estimate:{ rows; bytes })
          (List.filter (fun (name, _, _) -> admitted name) tables))
   in
@@ -1034,8 +1046,7 @@ let key_span { conn; _ } chunk =
 
 let read_chunk { conn; _ } (chunk : Quiver_core.Chunk.t) writer =
   let table = Quiver_core.Chunk.table chunk in
-  let first, rest = table.fields in
-  let fields = Array.of_list (first :: rest) in
+  let fields = Array.of_list (Quiver_core.Schema.Table.columns table) in
   let query = Query.Chunk chunk in
   let failed = function
     | (`Link _ | `Wire _ | `Transport _) as failure ->

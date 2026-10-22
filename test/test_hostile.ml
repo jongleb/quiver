@@ -4,7 +4,7 @@ let ident = Support.ident
 
 let table n =
   Support.get_ok
-    (Schema.Table.make
+    (Schema.Table.make ~generated:[]
        ~name:{ database = ident "db"; table = ident ("t" ^ string_of_int n) }
        ~fields:[ { name = ident "id"; ltype = Int64; nullability = Not_null } ]
        ~key:No_key ~estimate:{ rows = 0; bytes = 0 })
@@ -213,7 +213,7 @@ let hostile_agent =
                      Quiver_net.Protection.plaintext ~reconnect:Support.reconnect
                  with
                  | Error _ -> ()
-                 | Ok session -> ignore (Collecting.run listening session ())
+                 | Ok session -> ignore (Collecting.run listening session () ~columns:Written)
                with
               | () -> `Ended
               | exception failure -> `Raised (Printexc.to_string failure)))
@@ -297,7 +297,7 @@ let replies =
     list_size (int_range 0 12)
       (oneof
          [
-           pure (message (Sexplib0.Sexp.to_string (Quiver_net.Message.sexp_of_reply (Ready Sql))));
+           pure (message (Sexplib0.Sexp.to_string (Quiver_net.Message.sexp_of_reply (Ready { format = Sql; columns = Written }))));
            pure (message (Sexplib0.Sexp.to_string (Quiver_net.Message.sexp_of_reply Done)));
            pure (message (Sexplib0.Sexp.to_string (Quiver_net.Message.sexp_of_reply Skipped)));
            pure (message (Sexplib0.Sexp.to_string (Quiver_net.Message.sexp_of_reply (Refused "no"))));
@@ -468,7 +468,7 @@ let vanishing_hop =
                   request ();
                   ignore
                     (Quiver_net.Channel.send control
-                       (Quiver_net.Message.sexp_of_reply (Ready Sql)));
+                       (Quiver_net.Message.sexp_of_reply (Ready { format = Sql; columns = Written })));
                   let data =
                     List.filter_map
                       (fun _ ->
@@ -488,7 +488,7 @@ let vanishing_hop =
                   match Quiver_net.Collector.forward (peer next) session with
                   | Error _ -> `Unforwarded
                   | Ok forward -> (
-                      match Collecting.run ~forward collecting session () with
+                      match Collecting.run ~forward collecting session () ~columns:Written with
                       | Ok () -> `Finished
                       | Error _ -> `Failed)))
         in

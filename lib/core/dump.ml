@@ -406,11 +406,10 @@ module Make (P : Provider_intf.S) (S : Sink_intf.S) = struct
               and since = Stopwatch.elapsed began
               and waited = Batch_pool.waited pool
               and allocated = Gc.minor_words () in
-              let first, rest = (Chunk.table chunk).fields in
               let ltypes =
                 List.map
                   (fun { Schema.Field.ltype; _ } -> ltype)
-                  (first :: rest)
+                  (Schema.Table.columns (Chunk.table chunk))
               in
               match
                 Guarded.hold session (fun session ->

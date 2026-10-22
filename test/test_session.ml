@@ -68,6 +68,8 @@ type scenario = {
   compression : Quiver_net.Remote.compression;
   place : place;  (** [Into_last] in a chain only. *)
   linger : float;  (** Seconds readers wait before their first part. *)
+  columns : Quiver_net.Message.columns * Quiver_net.Message.columns;
+      (** What the first collector's sink takes, and the last one's in a chain. *)
 }
 [@@deriving sexp_of]
 
@@ -75,7 +77,7 @@ let ident = Support.ident
 
 let table n =
   Support.get_ok
-    (Schema.Table.make
+    (Schema.Table.make ~generated:[]
        ~name:{ database = ident "db"; table = ident ("t" ^ string_of_int n) }
        ~fields:[ { name = ident "id"; ltype = Int64; nullability = Not_null } ]
        ~key:No_key ~estimate:{ rows = 0; bytes = 0 })
@@ -268,6 +270,11 @@ let scenario =
              map (fun n -> Quiver_core.Width.Close n) (int_range 1 3);
            ])
     in
+    let* columns =
+      pair
+        (oneof_list [ Quiver_net.Message.Written; Stored_too ])
+        (oneof_list [ Quiver_net.Message.Written; Stored_too ])
+    in
     let* compression =
       oneof_list
         [
@@ -291,6 +298,7 @@ let scenario =
         place;
         adjustments;
         linger = 0.;
+        columns;
       })
 
 let print scenario = Sexplib0.Sexp.to_string_hum (sexp_of_scenario scenario)
@@ -429,6 +437,7 @@ let property
       adjustments;
       compression;
       linger;
+      columns = first_columns, last_columns;
     } =
   let schema = List.mapi (fun n _ -> table n) tables in
   let rows =
@@ -500,7 +509,7 @@ let property
         address = Quiver_net.Channel.listening_address socket;
       } )
   in
-  let collected recorder ?next socket =
+  let collected recorder ~columns ?next socket =
     Support.start (fun () ->
           (let%bind session =
              Quiver_net.Collector.accept socket protection
@@ -517,7 +526,7 @@ let property
            in
            Result.map_error
              (fun _ -> `Failed)
-             (Recording.run ?forward socket session recorder)))
+             (Recording.run ?forward socket session recorder ~columns)))
   in
   let relayed next =
     let socket, address = listen () in
@@ -542,20 +551,20 @@ let property
     match topology with
     | Direct ->
         let socket, address = listen () in
-        ([ (first, collected first socket) ], address)
+        ([ (first, collected first ~columns:first_columns socket) ], address)
     | Relayed hops ->
         let socket, address = listen () in
-        let result = collected first socket in
+        let result = collected first ~columns:first_columns socket in
         ( [ (first, result) ],
           List.fold_left
             (fun next _ -> relayed next)
             address (List.init hops Fun.id) )
     | Chained ->
         let tail, tail_address = listen () in
-        let tail_result = collected last tail in
+        let tail_result = collected last ~columns:last_columns tail in
         let head, head_address = listen () in
         let head_result =
-          collected first ~next:(breaking_at Into_last tail_address) head
+          collected first ~columns:first_columns ~next:(breaking_at Into_last tail_address) head
         in
         ([ (first, head_result); (last, tail_result) ], head_address)
   in
@@ -570,6 +579,18 @@ let property
           Sexplib0.Sexp.pp_hum
           (Quiver_net.Remote.sexp_of_error error)
   in
+  let asked : Quiver_net.Message.columns =
+    match (topology, first_columns, last_columns) with
+    | (Direct | Relayed _), asked, _ -> asked
+    | Chained, Written, Written -> Written
+    | Chained, Stored_too, _ | Chained, _, Stored_too -> Stored_too
+  in
+  if Quiver_net.Remote.columns agent <> asked then
+    Alcotest.failf "the agent was told to read %a, the collectors asked for %a"
+      Sexplib0.Sexp.pp_hum
+      (Quiver_net.Message.sexp_of_columns (Quiver_net.Remote.columns agent))
+      Sexplib0.Sexp.pp_hum
+      (Quiver_net.Message.sexp_of_columns asked);
   ignore (Quiver_net.Remote.database agent (ident "db") ~ddl:"");
   List.iteri
     (fun n parts ->
@@ -827,6 +848,7 @@ let refused_downstream =
          adjustments = [];
          compression = Adaptive;
          linger = 0.;
+         columns = (Written, Written);
        })
     property
 
@@ -887,6 +909,7 @@ let resumed_through_relays =
          adjustments = [];
          compression = Fixed Plain;
          linger = 0.;
+         columns = (Written, Written);
        })
     property
 
@@ -919,6 +942,7 @@ let replaced_when_silent =
          adjustments = [];
          compression = Fixed Plain;
          linger = 0.;
+         columns = (Written, Written);
        })
        (QCheck2.Gen.oneof_list [ Direct; Relayed 1; Relayed 2; Chained ]))
     property
@@ -944,6 +968,7 @@ let resumed_after_heartbeats =
          adjustments = [];
          compression = Fixed Plain;
          linger = 1.3;
+         columns = (Written, Written);
        })
     property
 
@@ -968,6 +993,7 @@ let refused_while_cut =
          adjustments = [ Open 1 ];
          compression = Fixed Plain;
          linger = 0.;
+         columns = (Written, Written);
        })
     property
 

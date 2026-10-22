@@ -18,6 +18,7 @@ type error =
   | Out_of_order  (** A run's keys do not ascend. *)
   | Overlapping_runs  (** Two runs share a key range. *)
   | Too_many_extents  (** Past the 4 GiB a 32-bit page number reaches. *)
+  | Too_many_rows  (** More rows than six-byte row ids number, for a table without a primary key. *)
 [@@deriving sexp_of ~portable]
 
 type t : value mod contended portable
@@ -43,7 +44,9 @@ val image : records -> string @@ portable
 type run
 (** Rows of one key range, in key order, on one thread at a time. *)
 
-val run : t -> run @@ portable
+val run : t -> rank:int -> run @@ portable
+(** [rank] orders the table's runs when their keys cannot be compared by bytes
+    ([Layout.Source_order]): the runs of chunks in key order, by chunk. *)
 
 val add : run -> records -> (unit, [> `Tablespace of error | `File of File.error ]) result @@ portable
 (** After the run's earlier rows. *)

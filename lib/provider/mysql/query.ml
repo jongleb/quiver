@@ -186,14 +186,13 @@ let sql = function
       [%string "SHOW CREATE %{kind} %{Quiver_core.Ident.backquoted database}.%{Quiver_core.Ident.backquoted name}"]
   | Chunk chunk ->
       let table = Quiver_core.Chunk.table chunk in
-      let first, rest = table.fields in
       let order =
         match table.key with
         | Primary (key, keys) -> " ORDER BY " ^ columns (key :: keys)
         | Unique _ | No_key -> ""
       in
       [%string
-        "SELECT %{columns (first :: rest)} FROM %{qualified table.name}%{where chunk}%{order}"]
+        "SELECT %{columns (Quiver_core.Schema.Table.columns table)} FROM %{qualified table.name}%{where chunk}%{order}"]
   | Key_span { chunk; key } ->
       let key = Quiver_core.Ident.backquoted key in
       [%string
@@ -215,7 +214,7 @@ let sql = function
   | Autoinc_lock_mode -> "SELECT @@innodb_autoinc_lock_mode"
   | Datadir -> "SELECT @@datadir"
   | Text_collations ->
-      "SELECT ID, CHARACTER_SET_NAME FROM information_schema.COLLATIONS WHERE CHARACTER_SET_NAME IN ('utf8mb4', 'utf8mb3')"
+      "SELECT ID, CHARACTER_SET_NAME FROM information_schema.COLLATIONS WHERE CHARACTER_SET_NAME IN ('utf8mb4', 'utf8mb3', 'latin1')"
   | Auto_increment { database; table } ->
       [%string
         "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = \

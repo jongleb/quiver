@@ -105,6 +105,22 @@ deliberately broken code.
 
 </td>
 </tr>
+<tr>
+<td valign="top">
+
+**Tables built on the client.** With `--ingest tablespace`, quiver writes a table's InnoDB pages
+itself on every core, and the server imports the finished file. Writing the rows took 5–9× less
+time than `LOAD DATA` on one laptop.
+
+</td>
+<td valign="top">
+
+**JSON numbers stay exact.** MySQL reads some of the doubles it prints in JSON as the next
+double, so a copy through text changes them. quiver finds those numbers and writes them as exact
+SQL literals.
+
+</td>
+</tr>
 </table>
 
 ## How it works
@@ -256,6 +272,77 @@ Each chunk streams from its reading session into a loading session of its own th
 `LOAD DATA LOCAL INFILE`, in one transaction, while other chunks are still being read. Foreign
 keys are added once all data is in.
 
+### Building tablespaces
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/ingest-dark.svg">
+  <img src="assets/ingest.svg" alt="LOAD DATA: batches go to loading sessions and the server inserts row by row, sessions of one table waiting on its index latch. With --ingest tablespace quiver builds records, pages and runs on every core into an .ibd beside the target, checked as IMPORT reads it, then IMPORT TABLESPACE, RENAME and secondary keys. Copy of 6 tables, 1.56 M rows: 0.33–0.35 s against 1.73–2.00 s; columns off-page, 68 MB: 0.18–0.24 s against 0.78–1.30 s; the server's part for 8 M rows: 0.84 s against 7.82 s" width="100%">
+</picture>
+
+```sh
+quiver copy -B shop --to-database shop_copy --ingest tablespace --binlog skip
+```
+
+`LOAD DATA` makes the target insert every row into its B-tree. Sessions that load the same table
+wait on that table's index latch. With `--ingest tablespace`, quiver builds the clustered index
+itself.
+
+1. The target creates the table under a name of quiver's, with its primary key alone.
+2. `FLUSH TABLES … FOR EXPORT` gives quiver the server's own empty tablespace and `.cfg` file as a
+   template.
+3. Renderers turn batches into InnoDB records, and runs of each table fill pages on threads of
+   their own.
+4. Before the server sees the file, quiver checks it the way `IMPORT` and the server read it.
+5. `IMPORT TABLESPACE` takes the file. quiver checks the row count, renames the table and adds
+   its secondary keys.
+
+- **Types.** Every type a dump reads is stored, including JSON in the server's binary form and
+  columns too long for their page (LOB pages). Text in `utf8mb4`, `utf8mb3` and `latin1` is
+  stored, and zero dates are kept with `--zero-dates keep`. `STORED` generated columns hold the
+  source's own values: quiver reads them for these tables only, and never writes them back
+  through `LOAD DATA`.
+- **Keys.** Any primary key works, also text in a collation or a float. Rows of such a key are
+  stored in the order the source sorted them, and the target checks that order in its own
+  collation when it imports the table: a table out of order is refused, not stored. A table without a primary key works too; its
+  hidden row ids are numbered by quiver.
+- **Checks.** Each stored field is compared byte for byte with records the server wrote itself.
+- **Fallback.** A table the writer cannot build goes through `LOAD DATA`, and quiver says why.
+  Partitions and other character sets are such cases. At the end, quiver sums up rows and bytes
+  by way and by reason, and times each table's import and secondary keys.
+- **What it saves.** Only the writing of rows gets faster. Secondary keys are still built by the
+  server after the import, and tables that fall back load as before. On a schema where those
+  dominate, the whole copy speeds up much less.
+- **Requirements.** MySQL 8.4 or Percona Server 8.4, and the target's data directory on the same
+  machine (`--datadir` if quiver sees it under another path).
+- **Binlog.** `--binlog skip` is required: an import writes no rows to the binlog, so replicas
+  would silently miss them.
+
+`quiver collect` takes `--ingest tablespace` as well, so an agent can feed a collector next to
+the target; the collector tells the agent to read `STORED` generated columns too, and so does a
+collector in a chain when a node after it builds tablespaces.
+
+### JSON numbers
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/json-dark.svg">
+  <img src="assets/json.svg" alt="The source holds {&quot;v&quot;: 9.999999999999999e24}. Copied as text by LOAD DATA, mysqldump, mydumper or quiver 1.2 it becomes 1e25. quiver 1.3 writes JSON_SET(text, '$.v', 9.999999999999999e24), or the binary JSON in a built tablespace, and keeps the same double" width="100%">
+</picture>
+
+MySQL prints a double in JSON as its shortest exact text. When it reads JSON text back, its parser
+takes about one in nine of those texts as the neighbouring double, without a warning. Every tool
+that moves JSON as text changes such numbers. In a live copy through `LOAD DATA`, 63 of 553
+documents came out different.
+
+quiver checks every JSON value with a model of the server's parser and writes values that would
+change differently:
+
+- **SQL dumps.** The value becomes `JSON_SET(<text>, <path>, <exact double literal>, …)`. The
+  server reads an SQL double literal exactly.
+- **`copy` to MySQL.** Such rows bypass `LOAD DATA` and are inserted that way in the same
+  transaction.
+- **CSV dumps.** Such a value fails with an error; a CSV file has no way to keep it.
+- **MariaDB targets.** Their JSON is text, so nothing changes there.
+
 ### Connecting
 
 ```sh
@@ -351,6 +438,11 @@ Repeat the last two for the agent and every relay.
 - If the requested consistency cannot be given, quiver refuses to start.
 - Floats in their shortest exact form, decimals and fractional seconds as stored. A lossy
   conversion is an error. Zero dates are an error unless kept explicitly.
+- JSON doubles the server would read back as their neighbour are written as exact SQL literals.
+- `LOAD DATA LOCAL` must store exactly the rows sent and raise no warning. Otherwise the part
+  rolls back and the error carries the server's warnings.
+- A built tablespace passes quiver's own check of every page, list and LOB before the server
+  sees it. After the import, its row count must match the rows sent.
 - Chunks cover each key domain exactly, also when a chunk is divided while it is read: the open
   edges are first bounded by `MIN` and `MAX` inside the snapshot.
 - xxh3 of every file in the manifest, checked by `quiver load`. On the wire every frame and
@@ -372,6 +464,7 @@ quiver is young and moving fast.
 | Area | |
 |---|---|
 | Dump, load and copy; separate schema and rows | shipped |
+| Tablespaces built on the client (MySQL 8.4, Percona 8.4) | new in 1.3 |
 | Unix sockets, `my.cnf`, every common login | shipped |
 | Agent, collector, relays and chains, mutual TLS 1.3 | shipped |
 | Online tuning of streams, compression, readers; chunks divided while read | shipped |

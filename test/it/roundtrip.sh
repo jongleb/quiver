@@ -384,6 +384,18 @@ objects() {
   [ "$(definitions sakila)" = "$(definitions sakila_n)" ] || fail "--no-data: object definitions differ after quiver load"
   [ "$(rows_of sakila_n | awk '$2 != 0' | wc -l | tr -d ' ')" = 0 ] || fail "--no-data: rows were loaded"
   echo "$service sakila: --no-data dumps and loads every table's schema and objects, no rows"
+  digits="(SELECT 0 d UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9)"
+  sql -e "DROP DATABASE IF EXISTS autoinc; DROP DATABASE IF EXISTS autoinc_c; CREATE DATABASE autoinc;
+    CREATE TABLE autoinc.wide (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, s VARCHAR(1000));
+    INSERT INTO autoinc.wide (s) SELECT REPEAT(CHAR(97 + (a.d + 10 * b.d) % 26), 1000)
+      FROM $digits a, $digits b, $digits c, $digits e, (SELECT 0 d UNION ALL SELECT 1 UNION ALL SELECT 2) f"
+  "$quiver" copy --tls "$tls" -P "$port" -p quiver -B autoinc -t 4 --render-threads 1 \
+    --to-tls "$tls" --to-port "$port" --to-password quiver --to-database autoinc_c > "$dir.autoinc.log" 2>&1 \
+    || fail "quiver copy of an AUTO_INCREMENT table in parts: $(cat "$dir.autoinc.log")"
+  [ "$(sql -N -e "CHECKSUM TABLE autoinc.wide" | cut -f2)" = "$(sql -N -e "CHECKSUM TABLE autoinc_c.wide" | cut -f2)" ] \
+    || fail "AUTO_INCREMENT table in parts: checksums differ"
+  sql -e "DROP DATABASE autoinc; DROP DATABASE autoinc_c"
+  echo "$service: an AUTO_INCREMENT table copied in parts while its table lock lets one load at a time"
 }
 # Faults in the middle of a dump through toxiproxy (downstream slowed to
 # 256 KB/s so the dump lasts): a reset connection, a silent one, sessions

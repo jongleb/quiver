@@ -142,7 +142,7 @@ module Dialect = struct
               Quiver_core.Byte_buffer.add_char out '"';
               Ok ())
     in
-    let width = Iarray.length columns and count = Quiver_core.Batch.sealed_rows batch in
+    let width = Iarray.length lines.fields and count = Quiver_core.Batch.sealed_rows batch in
     let rec cells row j =
       if j = width then Ok ()
       else

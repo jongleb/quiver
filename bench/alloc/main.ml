@@ -20,6 +20,7 @@ let () =
           silence = Core.Time_ns.Span.of_int_sec 600;
         };
       zero_dates = Reject;
+      generated = Left_out;
     }
   in
   let fail pp error =

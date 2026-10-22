@@ -34,8 +34,10 @@ type attach =
   | Control of { session : string; replies : int }
 [@@deriving sexp ~portable]
 
+type columns = Written | Stored_too [@@deriving sexp ~portable]
+
 type reply =
-  | Ready of Quiver_core.Output_format.t
+  | Ready of { format : Quiver_core.Output_format.t; columns : columns }
   | Done
   | Refused of string
   | Skipped

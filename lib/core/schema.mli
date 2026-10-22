@@ -38,11 +38,16 @@ module Table : sig
 
   type t = private {
     name : Name.t;
-    fields : Field.t * Field.t list;
+    fields : Field.t * Field.t list;  (** Written back to a target. *)
+    generated : Field.t list;
+        (** [STORED] generated columns read after [fields], never written back. *)
     key : Field.t key;
     estimate : estimate;
   }
   [@@deriving sexp_of ~portable, yojson_of]
+
+  val columns : t -> Field.t list @@ portable
+  (** A batch's columns: [fields], then [generated]. *)
 
   val t_of_yojson : Yojson.Safe.t -> t
   (** Checked as {!make} checks; raises as derived converters do. *)
@@ -53,6 +58,7 @@ module Table : sig
   val make :
     name:Name.t ->
     fields:Field.t list ->
+    generated:Field.t list ->
     key:Ident.t key ->
     estimate:estimate ->
     (t, [> `Schema of error ]) result @@ portable

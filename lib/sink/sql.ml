@@ -14,6 +14,9 @@ let escapes =
     | '\\' -> Some "\\\\"
     | _ -> None)
 
+(** Which rows of a batch to write. *)
+type chosen = All | Only of int list
+
 module Insert = struct
   type settings = int
 
@@ -45,8 +48,7 @@ module Insert = struct
     Some (fun (out : Quiver_core.Byte_buffer.t @ local) ->
         Quiver_core.Byte_buffer.append_string out Layout.header)
 
-  let write lines (batch : Quiver_core.Batch.sealed @ local)
-      (out : Quiver_core.Byte_buffer.t @ local) =
+  let some lines (batch : Quiver_core.Batch.sealed @ local) (out : Quiver_core.Byte_buffer.t @ local) chosen =
     let columns = Quiver_core.Batch.sealed_columns batch in
     let quoted j result =
       match result with
@@ -114,6 +116,35 @@ module Insert = struct
           | Text, Decimal _ ->
               Render.text out column row;
               Ok ()
+          | Text, Json -> (
+              let text () =
+                Quiver_core.Byte_buffer.add_char out '\'';
+                Escape.add escapes column row out;
+                Quiver_core.Byte_buffer.add_char out '\''
+              in
+              match
+                Json_numbers.misread (Quiver_core.Column.text_bytes column)
+                  ~pos:(Quiver_core.Column.text_offset column row)
+                  ~length:(Quiver_core.Column.text_length column row)
+              with
+              | [] ->
+                  text ();
+                  Ok ()
+              | numbers ->
+                  Quiver_core.Byte_buffer.append_string out "JSON_SET(";
+                  text ();
+                  let rec each = function
+                    | [] -> ()
+                    | ({ path; literal } : Json_numbers.misread) :: rest ->
+                        Quiver_core.Byte_buffer.append_string out ",'";
+                        Escape.add_string escapes path out;
+                        Quiver_core.Byte_buffer.append_string out "',";
+                        Quiver_core.Byte_buffer.append_string out literal;
+                        each rest
+                  in
+                  each numbers;
+                  Quiver_core.Byte_buffer.add_char out ')';
+                  Ok ())
           | Text, _ ->
               Quiver_core.Byte_buffer.add_char out '\'';
               Escape.add escapes column row out;
@@ -130,6 +161,7 @@ module Insert = struct
         | Error error -> Error error
     in
     let rec rows row statement =
+      let row = match chosen with All -> row | Only rows -> Option.value ~default:count (List.find_opt (fun r -> r >= row) rows) in
       if row = count then
         let () =
           match statement with
@@ -165,7 +197,11 @@ module Insert = struct
               rows (row + 1) next
     in
     rows 0 Closed [@nontail]
+
+  let write lines batch out = some lines batch out All
 end
+
+let values lines batch out ~rows = Insert.some lines batch out (Only rows)
 
 include Files.Make (Insert)
 

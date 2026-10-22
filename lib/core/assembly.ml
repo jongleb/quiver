@@ -155,6 +155,17 @@ module Make (S : Sink_intf.S) = struct
             told (Failed error)
         | Sealed _ | Ended -> ())
 
+  type growth = Grown | Shut | Refused of S.error
+
+  let grow t sink table =
+    Guarded.hold t.state (fun state ->
+        match state.stage with
+        | Open -> (
+            match S.add_part sink table with
+            | Ok () -> Grown
+            | Error (`Sink error) -> Refused error)
+        | Sealed _ | Broken _ | Ended -> Shut)
+
   let abandon t =
     Guarded.hold t.state (fun state ->
         match state.stage with

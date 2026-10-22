@@ -81,6 +81,17 @@ type phase = Running | Stopping
 type senders = { mutable started : unit Await.Await.Ivar.t list }
 
 type lines = { mutable lines : line list }
+
+type tally = {
+  bytes_sent : int Portable.Atomic.t;
+  bytes_resent : int Portable.Atomic.t;
+  busy : int Portable.Atomic.t;  (** Microseconds, Linux. *)
+  window_full : int Portable.Atomic.t;  (** Microseconds, Linux. *)
+  buffer_full : int Portable.Atomic.t;  (** Microseconds, Linux. *)
+  peer_windows : int Portable.Atomic.t;  (** Bytes, summed, macOS. *)
+  counted : int Portable.Atomic.t;  (** Connections that told. *)
+}
+(** What the kernel counted for the data connections that ended. *)
 (** The data connections that may still carry frames. *)
 (** Filled when each data sender ended, with a TLS [close_notify]: [shutdown]
     waits for them, and for the control writer. *)
@@ -143,6 +154,8 @@ type t = {
   reconnect : Core.Time_ns.Span.t;
       (** How long replacing a broken control connection may take. *)
   lines : lines Await.Capsule.Await.With_mutex.t;
+  tally : tally;
+  began : Quiver_core.Stopwatch.t;
   outbox : outbound Await.Await.Mpmc_queue.t;  (** To the control writer. *)
   replies : int Portable.Atomic.t;  (** Counted replies that arrived. *)
   silent : int Portable.Atomic.t;
@@ -486,6 +499,19 @@ and acknowledgements (t : t) line =
   in
   go ();
   Await.Await.Ivar.read Quiver_core.Blocking.await line.written;
+  Option.iter
+    (fun ({ sent; resent; held } : Quiver_core.Tcp.strain) ->
+      let add counter amount = ignore (Portable.Atomic.fetch_and_add counter amount) in
+      add t.tally.bytes_sent sent;
+      add t.tally.bytes_resent resent;
+      add t.tally.counted 1;
+      match held with
+      | Timed { busy; receive_window; send_buffer } ->
+          add t.tally.busy (Core.Time_ns.Span.to_int_us busy);
+          add t.tally.window_full (Core.Time_ns.Span.to_int_us receive_window);
+          add t.tally.buffer_full (Core.Time_ns.Span.to_int_us send_buffer)
+      | Peer_window window -> add t.tally.peer_windows window)
+    (Channel.strain line.channel);
   Channel.close line.channel
 
 let adjust (t : t) (decision : Quiver_core.Width.decision) =
@@ -590,6 +616,17 @@ let create protection peer
          path = Channel.path control;
          reconnect;
          lines = Await.Capsule.Await.With_mutex.create (fun () -> { lines = [] });
+         tally =
+           {
+             bytes_sent = Portable.Atomic.make 0;
+             bytes_resent = Portable.Atomic.make 0;
+             busy = Portable.Atomic.make 0;
+             window_full = Portable.Atomic.make 0;
+             buffer_full = Portable.Atomic.make 0;
+             peer_windows = Portable.Atomic.make 0;
+             counted = Portable.Atomic.make 0;
+           };
+         began = Quiver_core.Stopwatch.start ();
          outbox = Await.Await.Mpmc_queue.create ();
          replies = Portable.Atomic.make 0;
          silent = Portable.Atomic.make 0;
@@ -1059,6 +1096,30 @@ let sent t message =
 let format t = t.format
 let path t = t.path
 let streams t = Portable.Atomic.get t.alive
+
+let advice t =
+  let get = Portable.Atomic.get in
+  let held : Quiver_core.Advice.held =
+    match get t.tally.busy with
+    | 0 -> Peer_windows (get t.tally.peer_windows)
+    | busy ->
+        Timed
+          {
+            busy_us = busy;
+            window_full_us = get t.tally.window_full;
+            buffer_full_us = get t.tally.buffer_full;
+          }
+  in
+  Quiver_core.Advice.of_counts
+    {
+      sent = get t.tally.bytes_sent;
+      resent = get t.tally.bytes_resent;
+      held;
+      connections = get t.tally.counted;
+    }
+    t.path
+    ~seconds:(Core.Time_ns.Span.to_sec (Quiver_core.Stopwatch.elapsed t.began))
+    ~streams:(get t.alive)
 
 let waited_for_acks t =
   Core.Time_ns.Span.of_int_ns (Portable.Atomic.get t.unacknowledged_wait)

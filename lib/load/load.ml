@@ -22,7 +22,13 @@ type keys = After_data | With_table
 [@@deriving to_string ~capitalize:"kebab-case" ~portable, enumerate]
 type binlog = Write_binlog [@rename "write"] | Skip_binlog [@rename "skip"]
 [@@deriving to_string ~capitalize:"kebab-case" ~portable, enumerate]
-type summary = { files : int; rows : int; bytes : int; skipped : int }
+type summary = {
+  files : int;
+  rows : int;
+  bytes : int;
+  skipped : int;
+  advice : Quiver_core.Advice.t list;
+}
 
 (** Whether an earlier load of the same dump into the same target left committed
     files behind. *)
@@ -31,7 +37,9 @@ type resume = Fresh | Resuming
 (** How a data file reaches the server. *)
 type delivery =
   | As_statements
-  | As_local_data of string  (** With this [LOAD DATA LOCAL] statement. *)
+  | As_local_data of { statement : string; enums : Quiver_core.Ident.t list }
+      (** With this [LOAD DATA LOCAL] statement into a table with these
+          [ENUM] columns. *)
 
 (** Everything a loading thread can fail with. *)
 type failure =
@@ -56,13 +64,21 @@ type data_file = {
 (** Work for a loading thread, which owns one session. *)
 type task =
   | Create of (Quiver_core.Schema.Name.t * Quiver_core.Manifest.part list)
-  | Fill of data_file
+  | Fill of Schedule.slot * data_file
   | Run of { database : Quiver_core.Ident.t; files : File_path.Part.t list }
       (** Schema files of the database's objects, one after another. *)
   | Stop
 
 (** What a loading thread made of a task. *)
-type report = Created of data_file list | Filled | Ran | Failed of failure
+type report =
+  | Created of (Schedule.cap * data_file list)
+  | Filled of Schedule.slot
+  | Ran
+  | Failed of failure
+
+(** Whether [LOAD DATA] into a table with an [AUTO_INCREMENT] column holds a
+    table lock to the statement's end, letting one load in at a time. *)
+type increments = Interleaved | Table_locked
 
 (** Whether the loading threads still work, or only answer after a failure. *)
 type course = Going | Stopping
@@ -87,6 +103,23 @@ let session (config : Quiver_mysql.Provider.conn_config) binlog uniqueness =
     | Skip_binlog -> Quiver_mysql.Link.run_statement link Skip_binlog
   in
   link
+
+let advice link binlog =
+  match Quiver_mysql.Link.run_query link Durability with
+  | Ok [ [| flush; sync; logged |] ] ->
+      let on value = Option.equal String.equal value (Some "1") in
+      let logged_load =
+        match binlog with
+        | Write_binlog when on logged -> Some Quiver_core.Advice.Logged_load
+        | Write_binlog | Skip_binlog -> None
+      in
+      List.filter_map Fun.id
+        [
+          Base.Option.some_if (on flush) Quiver_core.Advice.Durable_commits;
+          Base.Option.some_if (on sync && on logged) Quiver_core.Advice.Synced_binlog;
+          logged_load;
+        ]
+  | Ok _ | Error _ -> []
 
 let sessions config binlog uniqueness ~count ~control ~close =
   let loaders, control =
@@ -286,20 +319,29 @@ let run config ~dir target ~keys ~binlog ~threads =
                [ views; optional (prefix ^ "-schema-triggers"); optional (prefix ^ "-schema-post") ] ))
          databases)
   in
-  let%bind (control, loaded), links =
+  let%bind (control, loaded, increments), links =
     sessions config binlog Unchecked ~count:threads
       ~control:(fun () ->
         let%bind control = session config binlog Unchecked in
         match
           let%bind () = Quiver_mysql.Link.run_statement control Create_progress_schema in
           let%bind () = Quiver_mysql.Link.run_statement control Create_progress_table in
-          Quiver_mysql.Link.run_query control (Loaded_files { dump; target = progress_target })
+          let%bind loaded =
+            Quiver_mysql.Link.run_query control (Loaded_files { dump; target = progress_target })
+          in
+          let%map mode = Quiver_mysql.Link.run_query control Autoinc_lock_mode in
+          let increments =
+            match mode with
+            | [ [| Some "2" |] ] -> Interleaved
+            | _ -> Table_locked
+          in
+          (List.filter_map (function [| file |] -> file | _ -> None) loaded, increments)
         with
-        | Ok rows -> Ok (control, List.filter_map (function [| file |] -> file | _ -> None) rows)
+        | Ok (loaded, increments) -> Ok (control, loaded, increments)
         | Error error ->
             Quiver_mysql.Link.close control;
             Error error)
-      ~close:(fun (control, _) -> Quiver_mysql.Link.close control)
+      ~close:(fun (control, _, _) -> Quiver_mysql.Link.close control)
   in
   let committed = Base.Set.of_list (module Base.String) loaded in
   let resume = match loaded with [] -> Fresh | _ -> Resuming in
@@ -401,12 +443,22 @@ let run config ~dir target ~keys ~binlog ~threads =
                          | "geometrycollection" | "geomcollection" ->
                              Quiver_mysql.Statement.Hex_value
                          | "bit" -> Number_value
+                         | "enum" -> Enum_value
                          | _ -> Text_value ))
                    | _ -> Error (`Load (Unreadable_columns name)))
                  rows)
           in
           As_local_data
-            (Quiver_mysql.Statement.sql (Load_local { table; dialect; columns }))
+            {
+              statement = Quiver_mysql.Statement.sql (Load_local { table; dialect; columns });
+              enums =
+                List.filter_map
+                  (fun (name, (conversion : Quiver_mysql.Statement.conversion)) ->
+                    match conversion with
+                    | Enum_value -> Some name
+                    | Text_value | Hex_value | Number_value -> None)
+                  columns;
+            }
     in
     let pending =
       List.filter
@@ -421,10 +473,28 @@ let run config ~dir target ~keys ~binlog ~threads =
         remaining = Portable.Atomic.make (List.length pending);
       }
     in
+    let%bind serial =
+      match increments with
+      | Interleaved -> Ok []
+      | Table_locked ->
+          Quiver_mysql.Link.run_query link
+            (Auto_increment { database = renamed target database; table })
+    in
     let%map () = match pending with [] -> add_keys link keys | _ -> Ok () in
-    List.map (fun part -> { database; part; delivery; keys }) pending
+    let most =
+      let rows = Base.List.sum (module Base.Int) parts ~f:(fun part -> part.rows) in
+      let bytes = Base.List.sum (module Base.Int) parts ~f:(fun part -> part.bytes) in
+      if rows > 0 && bytes / rows > 8192 then 1 else threads
+    in
+    let cap : Schedule.cap =
+      match (serial, Quiver_mysql.Link.server link) with
+      | _ :: _, _ -> Alone
+      | [], (Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _) -> First_alone most
+      | [], (Mysql_8_0 _ | Mysql_8_4 _) -> At_most most
+    in
+    (cap, List.map (fun part -> { database; part; delivery; keys }) pending)
   in
-  let fill link { database; part = { file; checksum; _ }; delivery; keys } =
+  let fill link { database; part = { file; checksum; rows; _ }; delivery; keys } =
     let%bind () = Quiver_mysql.Link.run_statement link (Use (renamed target database)) in
     let%bind () =
       retried ~cause (fun () ->
@@ -434,10 +504,10 @@ let run config ~dir target ~keys ~binlog ~threads =
               match delivery with
               | As_statements ->
                   statements Quiver_mysql.Link.execute link file Fun.id
-              | As_local_data statement ->
+              | As_local_data { statement; enums } ->
                   read file (fun data ->
                       rejected file statement
-                        (Quiver_mysql.Link.load_local link statement data))
+                        (Quiver_mysql.Link.load_local link statement ~rows ~enums data))
             with
             | found when Quiver_core.Checksum.equal found checksum ->
                 let%bind () = record link (File_path.Part.to_string file) in
@@ -471,10 +541,10 @@ let run config ~dir target ~keys ~binlog ~threads =
           | Create table ->
               report
                 (fun () -> Result.map (fun files -> Created files) (create link table))
-                (Created []);
+                (Created (Alone, []));
               serve ()
-          | Fill file ->
-              report (fun () -> Result.map (fun () -> Filled) (fill link file)) Filled;
+          | Fill (slot, file) ->
+              report (fun () -> Result.map (fun () -> Filled slot) (fill link file)) (Filled slot);
               serve ()
           | Run { database; files } ->
               report
@@ -509,31 +579,57 @@ let run config ~dir target ~keys ~binlog ~threads =
       | 0 -> Option.fold ~none:(Ok created) ~some:Result.error first
       | _ -> (
           match Await.Await.Mpmc_queue.pop Quiver_core.Blocking.await reports with
-          | Created files -> collect (count - 1) (files @ created) first
-          | Filled | Ran -> collect (count - 1) created first
+          | Created table -> collect (count - 1) (table :: created) first
+          | Filled _ | Ran -> collect (count - 1) created first
           | Failed failure ->
               Portable.Atomic.set course Stopping;
               collect (count - 1) created (Base.Option.first_some first (Some failure)))
     in
     collect (List.length items) [] None
   in
+  let fill_all tables =
+    let schedule =
+      Schedule.create
+        (List.map
+           (fun (cap, files) ->
+             (cap, List.map (fun (file : data_file) -> (file, file.part.stored_bytes)) files))
+           tables)
+    in
+    let rec give busy =
+      if busy < started then
+        Option.fold ~none:busy
+          ~some:(fun (slot, file) ->
+            Await.Await.Mpmc_queue.push tasks (Fill (slot, file));
+            give (busy + 1))
+          (Schedule.take schedule)
+      else busy
+    in
+    let rec collect busy first =
+      match busy with
+      | 0 -> Option.fold ~none:(Ok ()) ~some:Result.error first
+      | _ -> (
+          match Await.Await.Mpmc_queue.pop Quiver_core.Blocking.await reports with
+          | Filled slot ->
+              Schedule.release schedule slot;
+              let busy = match first with None -> give (busy - 1) | Some _ -> busy - 1 in
+              collect busy first
+          | Created _ | Ran -> collect (busy - 1) first
+          | Failed failure ->
+              Portable.Atomic.set course Stopping;
+              collect (busy - 1) (Base.Option.first_some first (Some failure)))
+    in
+    collect (give 0) None
+  in
   let loaded =
     match (started, Base.Result.all_unit workers) with
     | 0, Error error -> Error (`Load (Unstarted error))
     | _, (Ok () | Error _) ->
-        let%bind files =
+        let%bind tables =
           phase
             (List.sort (fun (_, a) (_, b) -> Int.compare (size b) (size a)) tables)
             (fun table -> Create table)
         in
-        let%bind _ =
-          phase
-            (List.sort
-               (fun (a : data_file) b ->
-                 Int.compare b.part.stored_bytes a.part.stored_bytes)
-               files)
-            (fun file -> Fill file)
-        in
+        let%bind () = fill_all tables in
         let%bind _ = phase (List.concat_map fst objects) Fun.id in
         let%map _ = phase (List.concat_map snd objects) Fun.id in
         ()
@@ -558,5 +654,5 @@ let run config ~dir target ~keys ~binlog ~threads =
           rows = summary.rows + part.rows;
           bytes = summary.bytes + part.bytes;
         })
-    { files = 0; rows = 0; bytes = 0; skipped = 0 }
+    { files = 0; rows = 0; bytes = 0; skipped = 0; advice = advice control binlog }
     parts

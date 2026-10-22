@@ -17,13 +17,19 @@ type t =
   | Begin
   | Commit
   | Rollback
+  | Export of Quiver_core.Schema.Name.t
+  | Discard_tablespace of Quiver_core.Schema.Name.t
+  | Import_tablespace of Quiver_core.Schema.Name.t
+  | Rename_table of { from : Quiver_core.Schema.Name.t; into : Quiver_core.Schema.Name.t }
+  | Drop_table of Quiver_core.Schema.Name.t
   | Load_local of {
       table : Quiver_core.Ident.t;
       dialect : Quiver_core.Output_format.dialect;
       columns : (Quiver_core.Ident.t * conversion) list;
     }
 
-and conversion = Text_value | Hex_value | Number_value [@@deriving sexp_of ~portable]
+and conversion = Text_value | Hex_value | Number_value | Enum_value
+[@@deriving sexp_of ~portable]
 
 let sql = function
   | Configure_session server ->
@@ -49,7 +55,8 @@ let sql = function
   | Use database -> [%string "USE %{Quiver_core.Ident.backquoted database}"]
   | Prepare_load ->
       "SET SESSION foreign_key_checks = 0, unique_checks = 0, time_zone = \
-       '+00:00', sql_mode = 'NO_AUTO_VALUE_ON_ZERO,ALLOW_INVALID_DATES'"
+       '+00:00', sql_mode = 'NO_AUTO_VALUE_ON_ZERO,ALLOW_INVALID_DATES', \
+       lc_messages = 'en_US', max_error_count = 65535"
   | Check_unique -> "SET SESSION unique_checks = 1"
   | Skip_binlog -> "SET SESSION sql_log_bin = 0"
   | Create_progress_schema -> "CREATE DATABASE IF NOT EXISTS quiver_load"
@@ -67,6 +74,11 @@ let sql = function
         "DELETE FROM quiver_load.progress WHERE dump = %{Query.bytes dump} AND \
          target = %{Query.text target}"]
   | Begin -> "START TRANSACTION"
+  | Export name -> [%string "FLUSH TABLES %{Query.qualified name} FOR EXPORT"]
+  | Discard_tablespace name -> [%string "ALTER TABLE %{Query.qualified name} DISCARD TABLESPACE"]
+  | Import_tablespace name -> [%string "ALTER TABLE %{Query.qualified name} IMPORT TABLESPACE"]
+  | Rename_table { from; into } -> [%string "RENAME TABLE %{Query.qualified from} TO %{Query.qualified into}"]
+  | Drop_table name -> [%string "DROP TABLE IF EXISTS %{Query.qualified name}"]
   | Commit -> "COMMIT"
   | Rollback -> "ROLLBACK"
   | Load_local { table; dialect; columns } ->
@@ -91,7 +103,7 @@ let sql = function
              (fun i (name, conversion) ->
                let value =
                  match conversion with
-                 | Text_value -> value i
+                 | Text_value | Enum_value -> value i
                  | Hex_value -> [%string "UNHEX(%{value i})"]
                  | Number_value -> [%string "CAST(%{value i} AS UNSIGNED)"]
                in

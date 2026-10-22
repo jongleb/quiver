@@ -30,6 +30,15 @@ module Make (S : Sink_intf.S) : sig
   (** No batch numbered [batches] or above follows; the outcome reaches the
       callback on whichever thread ends the part. *)
 
+  (** Whether the sink took another part of the table beside this one. *)
+  type growth =
+    | Grown
+    | Shut  (** This part was discarded or sealed: nothing asked of the sink. *)
+    | Refused of S.error
+
+  val grow : t -> S.t -> Schema.Table.t -> growth @@ portable
+  (** [S.add_part] under the part's lock, only while the part is open. *)
+
   val abandon : t -> unit @@ portable
   (** Discards the part; batches delivered later are dropped. *)
 end

@@ -63,6 +63,30 @@ let payloads =
 let tests =
   [
     QCheck_alcotest.to_alcotest
+      (QCheck2.Test.make ~count:300
+         ~name:"data split into pieces reads back as packets no longer than a piece"
+         QCheck2.Gen.(pair (string_size (int_range 0 70_000)) (int_range 1 20_000))
+         (fun (payload, piece) ->
+           let writer = Quiver_mysql.Wire.create (fun _ ~off:_ ~len:_ -> 0) in
+           let wire = Quiver_mysql.Wire.pieces writer payload ~piece in
+           let rec packets at sequence taken =
+             if at >= String.length wire then Some (List.rev taken)
+             else
+               let length =
+                 Char.code wire.[at]
+                 lor (Char.code wire.[at + 1] lsl 8)
+                 lor (Char.code wire.[at + 2] lsl 16)
+               in
+               if Char.code wire.[at + 3] <> sequence || length > piece || length = 0
+               then None
+               else
+                 packets (at + 4 + length) ((sequence + 1) land 0xFF)
+                   (String.sub wire (at + 4) length :: taken)
+           in
+           Option.equal String.equal
+             (Option.map (String.concat "") (packets 0 0 []))
+             (Some payload)));
+    QCheck_alcotest.to_alcotest
       (QCheck2.Test.make ~count:300 ~name:"packets survive any split into reads"
          QCheck2.Gen.(
            pair payloads (list_size (int_range 0 8) (int_range 1 9000)))

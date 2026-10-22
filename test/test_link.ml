@@ -432,4 +432,106 @@ let discovered =
             [];
         ])
 
-let tests = [ handshake; proxysql; cleartext; sealed; short_scramble; unreachable; timeouts; discovered ]
+let lossy_load =
+  Alcotest.test_case
+    "LOAD DATA LOCAL that stores other than the rows sent, or warns but of an \
+     ENUM's error value, is an error with the server's warnings"
+    `Quick (fun () ->
+      let truncated column = Printf.sprintf "Data truncated for column '%s' at row 2" column in
+      let loaded ?(said = [ truncated "a" ]) ?(enums = []) ~stored ~warned () =
+        let listener, route = listening Over_tcp in
+        let server =
+          Support.start (fun () ->
+              let client, _ = Unix.accept listener in
+              send client (greeting "mysql_native_password");
+              ignore (receive client);
+              send client (ok 2);
+              ignore (receive client);
+              send client (packet 1 "\251file");
+              let rec drain sequence =
+                match receive client with
+                | Ok "" | Error () -> sequence
+                | Ok _ -> drain (sequence + 1)
+              in
+              let sequence = drain 3 in
+              let counts = Bytes.create 2 in
+              Bytes.set_uint16_le counts 0 warned;
+              send client
+                (packet sequence
+                   ("\000" ^ String.make 1 (Char.chr stored) ^ "\000\002\000"
+                  ^ Bytes.to_string counts));
+              let lenenc text = String.make 1 (Char.chr (String.length text)) ^ text in
+              let () =
+                match receive client with
+                | Ok _ ->
+                    send client
+                      (String.concat ""
+                         ([ packet 1 "\003"; packet 2 "level"; packet 3 "code"; packet 4 "message" ]
+                         @ List.mapi
+                             (fun i message ->
+                               packet (5 + i)
+                                 (lenenc "Warning" ^ lenenc "1265" ^ lenenc message))
+                             said
+                         @ [ packet (5 + List.length said) "\254\000\000\002\000\000\000" ]));
+                    ignore (receive client)
+                | Error () -> ()
+              in
+              Unix.close client)
+        in
+        let data = ref "1\n2\n3\n" in
+        let loaded =
+          Result.bind
+            (Quiver_mysql.Link.connect ~local_data:With_local_data route
+               ~timeouts:
+                 {
+                   connecting = Core.Time_ns.Span.of_int_sec 5;
+                   silence = Core.Time_ns.Span.of_int_sec 5;
+                 }
+               ~user:"root" ~password:None)
+            (fun link ->
+              let loaded =
+                Quiver_mysql.Link.load_local link "LOAD DATA LOCAL INFILE 'f' INTO TABLE t"
+                  ~rows:3
+                  ~enums:
+                    (List.map
+                       (fun name -> Result.get_ok (Quiver_core.Ident.of_string name))
+                       enums)
+                  (fun buffer ~pos ~len:_ ->
+                    let length = String.length !data in
+                    Bytes.blit_string !data 0 buffer pos length;
+                    data := "";
+                    Ok length)
+              in
+              Quiver_mysql.Link.close link;
+              loaded)
+        in
+        Support.join server;
+        Unix.close listener;
+        match loaded with
+        | Ok () -> "stored"
+        | Error (`Link error) ->
+            Sexplib0.Sexp.to_string (Quiver_mysql.Link.sexp_of_error error)
+        | Error (`Wire _ | `Transport _) -> "broken"
+      in
+      let lossy ?(column = "a") stored =
+        Printf.sprintf
+          "(Lossy_load(sent 3)(stored %d)(warnings(\"Warning 1265 Data truncated \
+           for column '%s' at row 2\")))"
+          stored column
+      in
+      Alcotest.(check (list string))
+        "loaded"
+        [ "stored"; lossy 2; lossy 3; lossy 4; "stored"; lossy 2; lossy ~column:"b" 3; lossy 3 ]
+        [
+          loaded ~stored:3 ~warned:0 ();
+          loaded ~stored:2 ~warned:0 ();
+          loaded ~stored:3 ~warned:1 ();
+          loaded ~stored:4 ~warned:0 ();
+          loaded ~enums:[ "a" ] ~stored:3 ~warned:1 ();
+          loaded ~enums:[ "a" ] ~stored:2 ~warned:1 ();
+          loaded ~enums:[ "a" ] ~said:[ truncated "a"; truncated "b" ] ~stored:3 ~warned:2 ();
+          loaded ~enums:[ "a" ] ~stored:3 ~warned:2 ();
+        ])
+
+let tests =
+  [ handshake; proxysql; cleartext; sealed; short_scramble; unreachable; timeouts; lossy_load; discovered ]

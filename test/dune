@@ -1,7 +1,8 @@
 (test
  (name main)
  (deps
-  (glob_files tls/*))
+  (glob_files tls/*)
+  (glob_files innodb/*))
  (flags
   (:standard -open Stdlib_stable))
  (libraries
@@ -19,6 +20,7 @@
   quiver.sink
   quiver.mysql
   quiver.load
+  quiver.innodb
   quiver.net
   quiver.openssl
   threads.posix

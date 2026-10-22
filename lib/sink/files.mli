@@ -23,7 +23,8 @@ module type Format = sig
     Quiver_core.Batch.sealed @ local ->
     Quiver_core.Byte_buffer.t @ local ->
     ( unit,
-      [> `Unrepresentable_date of Quiver_core.Schema.Name.t * Quiver_core.Ident.t ] )
+      [> `Unrepresentable_date of Quiver_core.Schema.Name.t * Quiver_core.Ident.t
+      | `Misread_json of Quiver_core.Schema.Name.t * Quiver_core.Ident.t ] )
     result
     @@ portable
 end
@@ -37,6 +38,12 @@ module Make (F : Format) : sig
         table : Quiver_core.Schema.Name.t @@ aliased;
         column : Quiver_core.Ident.t @@ aliased;
       }  (** A date or time value outside the proleptic Gregorian years 0–9999. *)
+    | Misread_json of {
+        table : Quiver_core.Schema.Name.t @@ aliased;
+        column : Quiver_core.Ident.t @@ aliased;
+      }
+        (** A JSON value with a number the server would read as another double
+            ({!Json_numbers}): CSV has no room to set it apart, SQL and [copy] do. *)
     | Unsplittable_definition of Quiver_core.Schema.Name.t
         (** A routine, trigger or view with [";\n"] inside a string literal. *)
   [@@deriving sexp_of ~portable]

@@ -97,6 +97,7 @@ type handle : immutable_data
 
 val handle : t -> handle @@ portable
 val path : t -> Quiver_core.Tcp.path option @@ portable
+val strain : t -> Quiver_core.Tcp.strain option @@ portable
 val mark : t -> Quiver_core.Tcp.Class.t -> unit @@ portable
 val sever : handle -> unit @@ portable
 (** Ends both directions, waking the owner if it is blocked reading. *)

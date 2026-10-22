@@ -324,7 +324,7 @@ module Make (P : Provider_intf.S) (S : Sink_intf.S) = struct
             | Set_here -> Claimed
             | Compare_failed -> claimed ()
         in
-        let offered position remaining width =
+        let offered part position remaining width =
           let rec claims count =
             if count >= sessions_count then count
             else match claimed () with Claimed -> claims (count + 1) | Unclaimed -> count
@@ -332,19 +332,26 @@ module Make (P : Provider_intf.S) (S : Sink_intf.S) = struct
             ignore (Portable.Atomic.fetch_and_add hungry count)
           in
           let publish at piece =
+            let growth = Part.grow part sink (Chunk.table piece) in
             let () =
-              match S.add_part sink (Chunk.table piece) with
-              | Ok () -> ()
-              | Error error -> fail error
+              match growth with
+              | Grown | Shut -> ()
+              | Refused error -> fail (`Sink error)
             in
-            let table = Portable.Atomic_array.get chunk_tables position in
-            Portable.Atomic_array.set chunk_tables at table;
-            Portable.Atomic_array.set indexes at
-              (Portable.Atomic.fetch_and_add (Iarray.get table_parts table) 1);
-            Portable.Atomic_array.set divided at (Some piece);
-            Portable.Atomic_array.set widths at width;
-            Await.Await.Mpmc_queue.push spill at;
-            Await.Await.Semaphore.release offers
+            let () =
+              match growth with
+              | Shut -> ()
+              | Grown | Refused _ ->
+                  let table = Portable.Atomic_array.get chunk_tables position in
+                  Portable.Atomic_array.set chunk_tables at table;
+                  Portable.Atomic_array.set indexes at
+                    (Portable.Atomic.fetch_and_add (Iarray.get table_parts table) 1);
+                  Portable.Atomic_array.set divided at (Some piece);
+                  Portable.Atomic_array.set widths at width;
+                  Await.Await.Mpmc_queue.push spill at;
+                  Await.Await.Semaphore.release offers
+            in
+            growth
           in
           match Chunk.bounds remaining with
           | Some (lo, hi)
@@ -375,13 +382,11 @@ module Make (P : Provider_intf.S) (S : Sink_intf.S) = struct
                           Option.bind (Chunk.bounds given) (fun (from, _) ->
                               Chunk.divide given (Int64.add from width))
                       in
-                      match cut with
-                      | None ->
-                          publish (at + dealt) given;
-                          dealt + 1
-                      | Some (piece, rest) ->
-                          publish (at + dealt) piece;
-                          deal rest (dealt + 1)
+                      let piece = Option.fold ~none:given ~some:fst cut in
+                      match (publish (at + dealt) piece, cut) with
+                      | Shut, _ -> dealt
+                      | (Grown | Refused _), None -> dealt + 1
+                      | (Grown | Refused _), Some (_, rest) -> deal rest (dealt + 1)
                     in
                     unclaim (wanted - deal given 0);
                     Portable.Atomic_array.set divided position
@@ -450,7 +455,7 @@ module Make (P : Provider_intf.S) (S : Sink_intf.S) = struct
                                     *. Float.min 4.
                                          (Float.max 0.5 (step_seconds /. took)))))
                           in
-                          stepped (offered position rest width) width
+                          stepped (offered part position rest width) width
                     in
                     let%bind bounded =
                       match Chunk.bounds chunk with

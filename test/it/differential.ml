@@ -385,7 +385,19 @@ let column dates place =
       {
         sql_type = "JSON";
         literal =
-          map text
+          oneof
+            [
+              map
+                (fun numbers -> "JSON_ARRAY(" ^ String.concat "," numbers ^ ")")
+                (list_size (int_range 1 4)
+                   (oneof
+                      [
+                        oneof_list
+                          [ "0.49178151800806813e0"; "8.690000000000001e-181"; "9.999999999999999e24";
+                            "1.0271471865319853e-6" ];
+                        map (Printf.sprintf "%.17e") (float_range (-1e300) 1e300);
+                      ]));
+              map text
             (sized_size (int_range 0 3)
                (fix (fun self depth ->
                     let leaf =
@@ -428,6 +440,7 @@ let column dates place =
                               (list_size (int_range 0 3)
                                  (pair json_string (self (depth - 1))));
                           ])));
+            ];
       }
   in
   let splittable =
@@ -747,11 +760,12 @@ let () =
             @ flags)
         with
         | Error output -> (
-            match (zero_dates, dates) with
-            | Reject, Any_dates
+            match (zero_dates, dates, format) with
+            | _, _, Csv _ when Base.String.is_substring output ~substring:"Misread_json" -> true
+            | Reject, Any_dates, _
               when Base.String.is_substring output ~substring:"Invalid_date" ->
                 true
-            | (Reject | Keep), (Valid_dates | Any_dates) ->
+            | (Reject | Keep), (Valid_dates | Any_dates), _ ->
                 QCheck2.Test.fail_reportf "%s" output)
         | Ok () ->
             (let manifest =

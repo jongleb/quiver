@@ -79,6 +79,9 @@ val adjust : t -> Quiver_core.Width.decision -> unit
 
 val streams : t -> int
 
+val advice : t -> Quiver_core.Advice.t list
+(** What the data connections that ended show the operator could change. *)
+
 val waited_for_acks : t -> Core.Time_ns.Span.t
 (** How long data connections waited, all together, with as many frames
     unacknowledged as they may hold. *)

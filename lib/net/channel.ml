@@ -397,6 +397,7 @@ type handle = Unix.file_descr
 
 let handle t = Protection.descriptor t.flow
 let path t = Quiver_core.Tcp.path (Protection.descriptor t.flow)
+let strain t = Quiver_core.Tcp.strain (Protection.descriptor t.flow)
 let mark t traffic = Quiver_core.Tcp.mark (Protection.descriptor t.flow) traffic
 
 let sever fd =

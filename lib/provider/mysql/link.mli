@@ -43,6 +43,8 @@ type error =
   | Refused of { code : int; sqlstate : string; message : string }
       (** An ERR packet from the server. *)
   | Unexpected_packet of int  (** First byte of a packet out of place. *)
+  | Lossy_load of { sent : int; stored : int; warnings : string list }
+      (** [LOAD DATA LOCAL] stored other than the rows sent, or warned. *)
 [@@deriving sexp_of ~portable]
 
 type t
@@ -118,21 +120,41 @@ val upload :
   result @@ portable
 
 val send_data :
-  t -> string -> (unit, [> `Transport of Transport.error ]) result
+  t -> string -> (unit, [> `Link of error | `Transport of Transport.error ]) result
   @@ portable
+(** Data for [LOAD DATA LOCAL], in packets of 16 KiB whatever its size; when
+    the server ended the connection, the error it gave instead of the broken
+    write. *)
 
 val complete :
   t ->
+  rows:int ->
+  enums:Quiver_core.Ident.t list ->
   ( unit,
     [> `Link of error | `Wire of Wire.error | `Transport of Transport.error ]
   )
   result @@ portable
 (** Ends the data of the [LOAD DATA LOCAL] statement [upload] started; the
-    server then runs the statement to completion. *)
+    server then runs the statement to completion, which must store exactly
+    [rows] rows with no warning but [enums] columns given their error value. *)
+
+val insert :
+  t ->
+  string ->
+  rows:int ->
+  enums:Quiver_core.Ident.t list ->
+  ( unit,
+    [> `Link of error | `Wire of Wire.error | `Transport of Transport.error ]
+  )
+  result @@ portable
+(** Runs an [INSERT] that must store exactly [rows] rows, held to the same
+    terms as {!complete}. *)
 
 val load_local :
   t ->
   string ->
+  rows:int ->
+  enums:Quiver_core.Ident.t list ->
   (Bytes.t ->
   pos:int ->
   len:int ->

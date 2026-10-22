@@ -336,3 +336,82 @@ let tests =
          (fun layout -> Quiver_sink.Sql.create layout ~statement_bytes:200)
          "sql");
   ]
+
+let json_table =
+  Result.get_ok
+    (Schema.Table.make
+       ~name:{ database = ident "db"; table = ident "t" }
+       ~fields:
+         [
+           { Schema.Field.name = ident "id"; ltype = Int32; nullability = Not_null };
+           { Schema.Field.name = ident "j"; ltype = Json; nullability = Nullable };
+         ]
+       ~key:No_key ~estimate:{ rows = 0; bytes = 0 })
+
+let json_rows = [ (1, Some "[0.5]"); (2, Some "[1, 0.49178151800806813]"); (3, None); (4, Some {|{"a": 1e25, "b": 9.999999999999999e24}|}) ]
+
+let with_json_batch f =
+  let batch = Batch.create [ Int32; Json ] in
+  let rec fill (batch : Batch.t @ local) = function
+    | [] -> ()
+    | ((id : int), (text : string option)) :: rest ->
+        let columns = Batch.columns batch in
+        let () =
+          let (Column.Any ids) = Iarray.get columns 0 in
+          match Column.repr ids with Int -> (Support.get_ok (Column.add ids id) : unit) | _ -> Alcotest.fail "id"
+        in
+        let () =
+          let (Column.Any texts) = Iarray.get columns 1 in
+          match (Column.repr texts, text) with
+          | _, None -> Column.add_null texts
+          | Text, Some text -> Support.get_ok (Column.add texts text)
+          | _ -> Alcotest.fail "json"
+        in
+        Batch.commit_row batch;
+        fill batch rest
+  in
+  fill (borrow_ batch) json_rows;
+  match Batch.seal batch with Ok sealed -> f sealed | Error _ -> Alcotest.fail "seal"
+
+let tests =
+  tests
+  @ [
+      Alcotest.test_case "a JSON number the server would misread is set apart in SQL" `Quick (fun () ->
+          with_json_batch (fun sealed ->
+              let out = Byte_buffer.create () in
+              let () =
+                match Quiver_sink.Sql.values (Quiver_sink.Sql.Insert.lines 1_000_000 json_table) sealed out ~rows:[ 0; 1; 2; 3 ] with
+                | Ok () -> ()
+                | Error _ -> Alcotest.fail "values"
+              in
+              Alcotest.(check string)
+                "insert"
+                "INSERT INTO `t` (`id`,`j`) VALUES\n\
+                 (1,'[0.5]'),\n\
+                 (2,JSON_SET('[1, 0.49178151800806813]','$[1]',0.49178151800806813e0)),\n\
+                 (3,NULL),\n\
+                 (4,JSON_SET('{\\\"a\\\": 1e25, \\\"b\\\": 9.999999999999999e24}','$.\\\"b\\\"',9.999999999999999e24));\n"
+                (Byte_buffer.contents out)));
+      Alcotest.test_case "CSV refuses such a row, or leaves it out for an INSERT" `Quick (fun () ->
+          with_json_batch (fun sealed ->
+              let lines = Quiver_sink.Csv.Dialect.lines Mysql_load_data json_table in
+              let out = Byte_buffer.create () in
+              let () =
+                match Quiver_sink.Csv.Dialect.write lines sealed out with
+                | Error (`Misread_json (_, column)) -> Alcotest.(check string) "column" "j" (column :> string)
+                | Error _ | Ok () -> Alcotest.fail "written"
+              in
+              let out = Byte_buffer.create () in
+              match Quiver_sink.Csv.write_apart Rapidjson lines sealed out with
+              | Ok apart ->
+                  Alcotest.(check (list int)) "left out" [ 1; 3 ] apart;
+                  Alcotest.(check string) "kept" "1,\"[0.5]\"\n3,\\N\n" (Byte_buffer.contents out);
+                  let out = Byte_buffer.create () in
+                  let () =
+                    match Quiver_sink.Csv.write_apart Verbatim lines sealed out with
+                    | Ok apart -> Alcotest.(check (list int)) "a text column keeps every row" [] apart
+                    | Error _ -> Alcotest.fail "write_apart"
+                  in
+                  Alcotest.(check int) "rows written" 4 (List.length (String.split_on_char '\n' (String.trim (Byte_buffer.contents out))))
+              | Error _ -> Alcotest.fail "write_apart"));
+    ]

@@ -32,6 +32,12 @@ type t =
       column : Quiver_core.Ident.t;
     }
   | Load_columns of Quiver_core.Schema.Name.t
+  | Durability
+  | Autoinc_lock_mode
+  | Datadir
+  | Text_collations
+  | Auto_increment of Quiver_core.Schema.Name.t
+  | Warnings
   | Loaded_files of { dump : string; target : string }
   | Probe of {
       table : Quiver_core.Schema.Name.t;
@@ -181,8 +187,13 @@ let sql = function
   | Chunk chunk ->
       let table = Quiver_core.Chunk.table chunk in
       let first, rest = table.fields in
+      let order =
+        match table.key with
+        | Primary (key, keys) -> " ORDER BY " ^ columns (key :: keys)
+        | Unique _ | No_key -> ""
+      in
       [%string
-        "SELECT %{columns (first :: rest)} FROM %{qualified table.name}%{where chunk}"]
+        "SELECT %{columns (first :: rest)} FROM %{qualified table.name}%{where chunk}%{order}"]
   | Key_span { chunk; key } ->
       let key = Quiver_core.Ident.backquoted key in
       [%string
@@ -200,6 +211,17 @@ let sql = function
          TABLE_SCHEMA = %{text (database :> string)} AND TABLE_NAME = %{text \
          (table :> string)} AND EXTRA NOT LIKE '%GENERATED%' ORDER BY \
          ORDINAL_POSITION"]
+  | Durability -> "SELECT @@innodb_flush_log_at_trx_commit, @@sync_binlog, @@log_bin"
+  | Autoinc_lock_mode -> "SELECT @@innodb_autoinc_lock_mode"
+  | Datadir -> "SELECT @@datadir"
+  | Text_collations ->
+      "SELECT ID, CHARACTER_SET_NAME FROM information_schema.COLLATIONS WHERE CHARACTER_SET_NAME IN ('utf8mb4', 'utf8mb3')"
+  | Auto_increment { database; table } ->
+      [%string
+        "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = \
+         %{text (database :> string)} AND TABLE_NAME = %{text (table :> string)} AND \
+         EXTRA LIKE '%auto_increment%'"]
+  | Warnings -> "SHOW WARNINGS"
   | Loaded_files { dump; target } ->
       [%string
         "SELECT file FROM quiver_load.progress WHERE dump = %{bytes dump} AND \

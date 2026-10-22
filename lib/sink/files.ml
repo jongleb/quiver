@@ -16,7 +16,8 @@ module type Format = sig
     Quiver_core.Batch.sealed @ local ->
     Quiver_core.Byte_buffer.t @ local ->
     ( unit,
-      [> `Unrepresentable_date of Quiver_core.Schema.Name.t * Quiver_core.Ident.t ] )
+      [> `Unrepresentable_date of Quiver_core.Schema.Name.t * Quiver_core.Ident.t
+      | `Misread_json of Quiver_core.Schema.Name.t * Quiver_core.Ident.t ] )
     result
     @@ portable
 end
@@ -36,6 +37,10 @@ module Make (F : Format) = struct
   type error =
     | Output of Output.error
     | Unrepresentable_date of {
+        table : Quiver_core.Schema.Name.t @@ aliased;
+        column : Quiver_core.Ident.t @@ aliased;
+      }
+    | Misread_json of {
         table : Quiver_core.Schema.Name.t @@ aliased;
         column : Quiver_core.Ident.t @@ aliased;
       }
@@ -81,6 +86,7 @@ module Make (F : Format) = struct
     match F.write renderer.lines batch (borrow_ out) with
     | Error (`Unrepresentable_date (table, column)) ->
         Error (`Sink (Unrepresentable_date { table; column }))
+    | Error (`Misread_json (table, column)) -> Error (`Sink (Misread_json { table; column }))
     | Ok () -> (
         match Output.seal renderer.buffers renderer.compression out with
         | Ok frame -> Ok { frame; rows = Quiver_core.Batch.sealed_rows batch }

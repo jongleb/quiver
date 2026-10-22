@@ -32,4 +32,8 @@ let () =
       ("assembly", Test_assembly.tests);
       ("concurrency", Test_concurrency.tests);
       ("cores", Test_cores.tests);
+      ("advice", Test_advice.tests);
+      ("spent", Test_spent.tests);
+      ("schedule", Test_schedule.tests);
+      ("innodb", Test_innodb.tests);
     ]

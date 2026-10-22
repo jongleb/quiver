@@ -57,7 +57,7 @@ let () =
   in
   let read (type (sink : value mod contended portable))
       (module Sink : Quiver_core.Sink_intf.S with type t = sink) (sink : sink)
-      { conn; mode; filter; rows; objects; opts } ~report =
+      { conn; mode; filter; rows; objects; opts } ~report ~sink:written =
     let module Dump = Quiver_core.Dump.Make (Quiver_mysql.Provider) (Sink) in
     let result =
       match mode with
@@ -82,6 +82,24 @@ let () =
                  | Done { part = { rows; _ }; _ } -> rows
                  | Pending -> 0))
           ~chunks:(List.length manifest.chunks);
+        let spent =
+          Quiver_core.Spent.of_states
+            (List.map
+               (fun ({ state; _ } : Quiver_core.Manifest.entry) -> state)
+               manifest.chunks)
+        in
+        let holding =
+          match Quiver_core.Spent.holding spent with
+          | Source -> "the source"
+          | Rendering -> "rendering"
+          | Writing -> written
+        in
+        Format.printf
+          "time over all parts: reading %a, readers held back %a, rendering %a, \
+           writing to %s %a, committing %a; %s held the run back@."
+          Core.Time_ns.Span.pp spent.reading Core.Time_ns.Span.pp spent.waiting
+          Core.Time_ns.Span.pp spent.rendering written Core.Time_ns.Span.pp
+          spent.writing Core.Time_ns.Span.pp spent.committing holding;
         Format.printf
           "%d readers at the start, %d at most, %d sessions, %d renderers, %d \
            cores to use@."
@@ -136,7 +154,8 @@ let () =
           {
             consume =
               (fun sink_module sink ->
-                read sink_module sink reading ~report:(fun ~rows ~chunks ->
+                read sink_module sink reading ~sink:"the files"
+                  ~report:(fun ~rows ~chunks ->
                     Format.printf "dumped %d rows in %d chunks into %a@." rows
                       chunks File_path.pp output.dir));
           })
@@ -162,6 +181,61 @@ let () =
     in
     Format.printf "listening on %s@." text;
     listener
+  in
+  let tablespaces sink =
+    List.iter
+      (fun name -> Format.printf "imported %a as a built tablespace@." Quiver_core.Schema.Name.pp name)
+      (Quiver_load.Copy.imported sink);
+    List.iter
+      (fun (name, why) ->
+        Format.printf "loaded %a with LOAD DATA: %s@." Quiver_core.Schema.Name.pp name
+          (Sexplib0.Sexp.to_string (Quiver_load.Physical.sexp_of_unsuitable why)))
+      (Quiver_load.Copy.fallbacks sink)
+  in
+  let advise advice =
+    let evidence (evidence : Quiver_core.Advice.evidence) =
+      match evidence with
+      | Share share ->
+          Printf.sprintf "%.0f%% of the time they had data to send" (100. *. share)
+      | Near_ceiling reach ->
+          Printf.sprintf "at %.0f%% of what it allows in a round trip" (100. *. reach)
+    in
+    List.iter
+      (fun (advice : Quiver_core.Advice.t) ->
+        let text =
+          match advice with
+          | Receive_buffer held ->
+              "connections waited for the receiver's window "
+              ^ evidence held
+              ^ "; on the receiving host raise the kernel's receive buffer \
+                 limit: Linux sysctl -w net.core.rmem_max=67108864 \
+                 net.ipv4.tcp_rmem='4096 131072 67108864', macOS sysctl -w \
+                 net.inet.tcp.autorcvbufmax=67108864"
+          | Send_buffer held ->
+              "connections were held by their send buffer " ^ evidence held
+              ^ "; on this host raise the kernel's send buffer limit: Linux \
+                 sysctl -w net.core.wmem_max=67108864 \
+                 net.ipv4.tcp_wmem='4096 16384 67108864', macOS sysctl -w \
+                 net.inet.tcp.autosndbufmax=67108864"
+          | Lossy_path resent ->
+              Printf.sprintf
+                "%.2f%% of bytes were sent again; where \
+                 net.ipv4.tcp_available_congestion_control lists bbr, sysctl \
+                 -w net.ipv4.tcp_congestion_control=bbr \
+                 net.core.default_qdisc=fq keeps the pace on losses"
+                (100. *. resent)
+          | Durable_commits ->
+              "the target syncs its redo log at every commit; for the load, \
+               SET GLOBAL innodb_flush_log_at_trx_commit = 2, and 1 again after"
+          | Synced_binlog ->
+              "the target syncs its binlog at every commit; for the load, SET \
+               GLOBAL sync_binlog = 0, and 1 again after"
+          | Logged_load ->
+              "the target writes the load to its binlog; --binlog skip leaves \
+               it out where replicas need not see it"
+        in
+        Format.printf "advice: %s@." text)
+      advice
   in
   let agent reading protection collector level streams most_streams chunks
       rate traffic reconnect stall =
@@ -226,7 +300,7 @@ let () =
                 let code =
                   read
                     (module Quiver_net.Remote)
-                    sink reading
+                    sink reading ~sink:"the network"
                     ~report:(fun ~rows ~chunks ->
                       Format.printf
                         "sent %d rows in %d chunks to %s in %a, %d streams at \
@@ -238,6 +312,7 @@ let () =
                         (Quiver_net.Remote.waited_for_acks sink))
                 in
                 Quiver_net.Remote.shutdown sink;
+                advise (Quiver_net.Remote.advice sink);
                 code))
   in
   let warned (config : Quiver_mysql.Provider.conn_config) =
@@ -255,7 +330,7 @@ let () =
     config
   in
   let collect protection reconnect listen forward output to_server into keys
-      binlog =
+      binlog ingest =
     match
       match output with
       | Some output -> Ok (`Files output)
@@ -305,21 +380,23 @@ let () =
                 | `Files output -> files output { consume = collected }
                 | `Server to_server -> (
                     match
-                      Quiver_load.Copy.create to_server (target into) ~keys ~binlog
+                      Quiver_load.Copy.create to_server (target into) ~keys ~binlog ~ingest
                         ~sessions:(Quiver_net.Collector.chunks session)
                     with
                     | Error (`Sink error) -> failed (Quiver_load.Copy.sexp_of_error error)
                     | Ok sink ->
                         let code = collected (module Quiver_load.Copy) sink in
                         Quiver_load.Copy.shutdown sink;
+                        tablespaces sink;
+                        advise (Quiver_load.Copy.advice sink);
                         code)))
   in
-  let copy reading to_server into keys binlog target_threads =
+  let copy reading to_server into keys binlog ingest target_threads =
     (
         (
             let started = Quiver_core.Stopwatch.start () in
             match
-              Quiver_load.Copy.create to_server (target into) ~keys ~binlog
+              Quiver_load.Copy.create to_server (target into) ~keys ~binlog ~ingest
                 ~sessions:
                   (Option.value target_threads ~default:(Quiver_core.Dump_opts.most_readers reading.opts))
             with
@@ -328,13 +405,15 @@ let () =
                 let code =
                   read
                     (module Quiver_load.Copy)
-                    sink reading
+                    sink reading ~sink:"the target"
                     ~report:(fun ~rows ~chunks ->
                       Format.printf "copied %d rows in %d chunks in %a@." rows
                         chunks Core.Time_ns.Span.pp
                         (Quiver_core.Stopwatch.elapsed started))
                 in
                 Quiver_load.Copy.shutdown sink;
+                tablespaces sink;
+                advise (Quiver_load.Copy.advice sink);
                 code))
   in
   let load conn dir into keys binlog threads =
@@ -344,7 +423,7 @@ let () =
           Quiver_load.Load.run
             conn ~dir:(File_path.of_string dir) (target into) ~keys ~binlog ~threads
         with
-        | Ok { files; rows; bytes; skipped } ->
+        | Ok { files; rows; bytes; skipped; advice } ->
             Format.printf "loaded %d rows (%d bytes) from %d files in %a@." rows
               bytes files Core.Time_ns.Span.pp
               (Quiver_core.Stopwatch.elapsed started);
@@ -353,6 +432,7 @@ let () =
             | n ->
                 Format.printf
                   "resumed: %d files were loaded by an earlier run@." n);
+            advise advice;
             0
         | Error error ->
             failed
@@ -805,6 +885,30 @@ let () =
              keys once a table's data is in, so InnoDB builds each index by \
              sorting, which pays off when indexes outgrow memory.")
   in
+  let ingest =
+    let open Cmdliner in
+    Term.(
+      const (fun way datadir ->
+          match way with
+          | `Load_data -> Quiver_load.Copy.Load_data
+          | `Tablespace -> Tablespaces { datadir })
+      $ Arg.(
+          value
+          & opt (enum [ ("load-data", `Load_data); ("tablespace", `Tablespace) ]) `Load_data
+          & info [ "ingest" ] ~docv:"WAY"
+              ~doc:
+                "$(b,tablespace) builds each table it can as an InnoDB tablespace beside the \
+                 target and imports it (MySQL 8.4 only, with $(b,--binlog skip), quiver on the \
+                 target's machine); other tables, and every table with $(b,load-data), go \
+                 through LOAD DATA.")
+      $ Arg.(
+          value
+          & opt (some string) None
+          & info [ "datadir" ] ~docv:"DIR"
+              ~doc:
+                "The target's data directory as this machine sees it, for $(b,--ingest \
+                 tablespace); the server's own when not given."))
+  in
   let binlog =
     let open Cmdliner in
     Arg.(
@@ -856,7 +960,7 @@ let () =
            "Copy MySQL or MariaDB into another server, with no files: each \
             reading session's chunks stream into a loading session of its own")
       Term.(
-        const copy $ reading $ server `Target $ into $ keys $ binlog
+        const copy $ reading $ server `Target $ into $ keys $ binlog $ ingest
         $ Arg.(
             value
             & opt (some int) None
@@ -1083,9 +1187,9 @@ let () =
       Term.(
         const
           (fun protection reconnect listen forward dir output target into keys
-               binlog ->
+               binlog ingest ->
             collect protection reconnect listen forward (Option.map output dir)
-              target into keys binlog)
+              target into keys binlog ingest)
         $ wire $ reconnect $ listen
         $ Arg.(
             value
@@ -1097,7 +1201,7 @@ let () =
                    counts once every target committed it.")
         $ Arg.value
             (outputdir ~doc:"Write files here instead of loading into a server.")
-        $ output $ conn `Target $ into $ keys $ binlog)
+        $ output $ conn `Target $ into $ keys $ binlog $ ingest)
   in
   exit
     (Cmdliner.Cmd.eval'

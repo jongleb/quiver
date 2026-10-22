@@ -16,6 +16,27 @@ type path = {
 val path : Unix.file_descr -> path option
 (** [None] where the kernel does not tell. *)
 
+(** What held a connection back, as its kernel counted. *)
+type held =
+  | Timed of {
+      busy : Core.Time_ns.Span.t;  (** It had data to send. *)
+      receive_window : Core.Time_ns.Span.t;
+          (** Of that, the peer's receive window was full. *)
+      send_buffer : Core.Time_ns.Span.t;
+          (** Of that, its own send buffer was full. *)
+    }  (** Linux. *)
+  | Peer_window of int  (** macOS: bytes the peer lets it have in flight now. *)
+
+type strain = {
+  sent : int;  (** Bytes, retransmissions included. *)
+  resent : int;  (** Of them, bytes sent again. *)
+  held : held;
+}
+(** A connection's sending so far. *)
+
+val strain : Unix.file_descr -> strain option
+(** [None] where the kernel does not tell (Linux before 4.19). *)
+
 val ceiling : path -> float option
 (** Bytes per second one connection carries at most on the path: a full send
     buffer each round trip; [None] for a round trip too short to measure. *)

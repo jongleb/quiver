@@ -71,6 +71,10 @@ val sessions :
 (** [control] and [count] loading sessions, all opened at once; whatever
     opened is closed again if any fails. *)
 
+val advice : Quiver_mysql.Link.t -> binlog -> Quiver_core.Advice.t list @@ portable
+(** What the target's durability settings cost a load; none when it does not
+    tell. *)
+
 val retried :
   cause:('e -> cause option) -> (unit -> ('a, 'e) result) -> ('a, 'e) result @@ portable
 (** Runs again, up to 5 times in all, while the server reports a deadlock or a
@@ -86,6 +90,7 @@ type summary = {
   rows : int;
   bytes : int;
   skipped : int;  (** Files an interrupted earlier load had committed. *)
+  advice : Quiver_core.Advice.t list;  (** What the target's settings cost. *)
 }
 (** Data files loaded now, their rows and uncompressed bytes. *)
 

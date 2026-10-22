@@ -12,11 +12,11 @@ type t =
   | Use of Quiver_core.Ident.t
       (** Default database, so [SHOW CREATE VIEW] leaves names unqualified. *)
   | Prepare_load
+      (** A loading session: no foreign key or unique checks, UTC time zone, the
+          [sql_mode] dump files are written for, warnings in English and kept. *)
   | Check_unique
       (** Unique checks back on: MariaDB 10.6+ locks an empty table until commit
           for the first transaction inserting into it without them. *)
-      (** A loading session: no foreign key or unique checks, UTC time zone, the
-          [sql_mode] dump files are written for. *)
   | Skip_binlog
       (** The session's writes stay out of the binlog, so replicas miss them. *)
   | Create_progress_schema
@@ -28,6 +28,13 @@ type t =
   | Begin
   | Commit
   | Rollback
+  | Export of Quiver_core.Schema.Name.t
+      (** [FLUSH TABLES … FOR EXPORT]: the table's files are consistent and its
+          [.cfg] written until [UNLOCK TABLES]. *)
+  | Discard_tablespace of Quiver_core.Schema.Name.t
+  | Import_tablespace of Quiver_core.Schema.Name.t
+  | Rename_table of { from : Quiver_core.Schema.Name.t; into : Quiver_core.Schema.Name.t }
+  | Drop_table of Quiver_core.Schema.Name.t  (** If it exists. *)
   | Load_local of {
       table : Quiver_core.Ident.t;
       dialect : Quiver_core.Output_format.dialect;
@@ -41,6 +48,8 @@ and conversion =
   | Text_value
   | Hex_value  (** Bytes and geometry, written as hex. *)
   | Number_value  (** [BIT], written as a decimal number. *)
+  | Enum_value
+      (** [ENUM]: its error value [''] is stored only with a warning. *)
 [@@deriving sexp_of ~portable]
 
 val sql : t -> string @@ portable

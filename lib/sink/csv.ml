@@ -15,6 +15,8 @@ let newline : Quiver_core.Output_format.dialect -> string = function
   | Rfc4180 -> "\r\n"
   | Mysql_load_data -> "\n"
 
+type json_reader = Rapidjson | Verbatim
+
 module Dialect = struct
   type settings = Quiver_core.Output_format.dialect
 
@@ -23,6 +25,7 @@ module Dialect = struct
     newline : string;
     table : Quiver_core.Schema.Table.t;
     fields : Quiver_core.Schema.Field.t iarray;
+    json : int list;  (** The [JSON] columns. *)
   }
 
   let extension = "csv"
@@ -33,7 +36,18 @@ module Dialect = struct
     let escapes =
       match dialect with Rfc4180 -> rfc4180_escapes | Mysql_load_data -> load_data_escapes
     in
-    { escapes; newline = newline dialect; table; fields = Iarray.of_list (first :: rest) }
+    let fields = first :: rest in
+    {
+      escapes;
+      newline = newline dialect;
+      table;
+      fields = Iarray.of_list fields;
+      json =
+        List.filter_map
+          (fun (j, ({ ltype; _ } : Quiver_core.Schema.Field.t)) ->
+            match ltype with Json -> Some j | _ -> None)
+          (List.mapi (fun j field -> (j, field)) fields);
+    }
 
   let preamble (dialect : settings)
       ({ fields = first, rest; _ } : Quiver_core.Schema.Table.t) =
@@ -48,9 +62,26 @@ module Dialect = struct
                 Quiver_core.Byte_buffer.add_char out '"');
             Quiver_core.Byte_buffer.append_string out (newline Rfc4180))
 
-  let write lines (batch : Quiver_core.Batch.sealed @ local)
-      (out : Quiver_core.Byte_buffer.t @ local) =
+  let rows lines (batch : Quiver_core.Batch.sealed @ local) (out : Quiver_core.Byte_buffer.t @ local) reader =
     let columns = Quiver_core.Batch.sealed_columns batch in
+    let misread row =
+      let rec go = function
+        | [] -> Null
+        | j :: rest -> (
+            let (Quiver_core.Column.Any column) = Iarray.get columns j in
+            match (Quiver_core.Column.presence column row, Quiver_core.Column.repr column) with
+            | Present, Text -> (
+                match
+                  Json_numbers.misread (Quiver_core.Column.text_bytes column)
+                    ~pos:(Quiver_core.Column.text_offset column row)
+                    ~length:(Quiver_core.Column.text_length column row)
+                with
+                | [] -> go rest
+                | _ :: _ -> This j)
+            | _ -> go rest)
+      in
+      match reader with Rapidjson -> go lines.json [@nontail] | Verbatim -> Null
+    in
     let checked j result =
       match result with
       | Ok () -> Ok ()
@@ -120,16 +151,27 @@ module Dialect = struct
         | Ok () -> cells row (j + 1)
         | Error error -> Error error
     in
-    let rec rows row =
-      if row = count then Ok ()
+    let rec rows row apart =
+      if row = count then Ok (List.rev apart)
       else
-        match cells row 0 with
-        | Error error -> Error error
-        | Ok () ->
-            Quiver_core.Byte_buffer.append_string out lines.newline;
-            rows (row + 1)
+        match misread row with
+        | This j -> rows (row + 1) ((row, j) :: apart)
+        | Null -> (
+            match cells row 0 with
+            | Error error -> Error error
+            | Ok () ->
+                Quiver_core.Byte_buffer.append_string out lines.newline;
+                rows (row + 1) apart)
     in
-    rows 0 [@nontail]
+    rows 0 [] [@nontail]
+
+  let write lines (batch : Quiver_core.Batch.sealed @ local) (out : Quiver_core.Byte_buffer.t @ local) =
+    match rows lines batch out Rapidjson with
+    | Ok [] -> Ok ()
+    | Ok ((_, j) :: _) -> Error (`Misread_json (lines.table.name, (Iarray.get lines.fields j).name))
+    | Error _ as failed -> failed
 end
+
+let write_apart reader lines batch out = Result.map (List.map fst) (Dialect.rows lines batch out reader)
 
 include Files.Make (Dialect)

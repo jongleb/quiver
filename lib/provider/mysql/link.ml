@@ -32,6 +32,7 @@ type error =
   | Short_scramble
   | Refused of { code : int; sqlstate : string; message : string }
   | Unexpected_packet of int
+  | Lossy_load of { sent : int; stored : int; warnings : string list }
 [@@deriving sexp_of ~portable]
 
 type t = {
@@ -367,29 +368,99 @@ let upload t sql =
       | Ok_packet | Auth_more_data | Eof_packet | Data ->
           Error (`Link (Unexpected_packet first)))
 
-let send_data t data = send t.transport t.wire data
+let send_data t data =
+  let piece = 16384 in
+  match Transport.write t.transport (Wire.pieces t.wire data ~piece) with
+  | Error (`Transport (Transport.Io _)) as failed ->
+      let said = Base_bigstring.create 4096 in
+      let length =
+        Transport.read t.transport said ~off:0 ~len:(Base_bigstring.length said)
+      in
+      let text = Base_bigstring.To_string.sub said ~pos:0 ~len:length in
+      if length < 7 || not (Char.equal text.[4] '\xff') then failed
+      else
+        let stop =
+          Int.min length
+            (4 + (Char.code text.[0] lor (Char.code text.[1] lsl 8)
+                 lor (Char.code text.[2] lsl 16)))
+        and code = Char.code text.[5] lor (Char.code text.[6] lsl 8) in
+        let sqlstate, from =
+          if length >= 13 && Char.equal text.[7] '#' then (String.sub text 8 5, 13)
+          else ("", 7)
+        in
+        Error
+          (`Link
+             (Refused
+                {
+                  code;
+                  sqlstate;
+                  message = String.sub text from (Int.max 0 (stop - from));
+                }))
+  | (Ok () | Error _) as written -> written
 
-let complete t =
+let settled t ~rows ~enums =
+  let%bind stored, warned =
+    receive_on t (fun reader ->
+        let first = Wire.Cursor.uint8 reader in
+        match Wire.marker first with
+        | Ok_packet ->
+            let stored = Wire.Cursor.lenenc_int reader in
+            let (_ : int) = Wire.Cursor.lenenc_int reader in
+            Wire.Cursor.skip reader 2;
+            Ok (stored, Wire.Cursor.uint16 reader)
+        | Err_packet -> Error (refused reader)
+        | Local_infile | Auth_more_data | Eof_packet | Data ->
+            Error (`Link (Unexpected_packet first)))
+  in
+  if stored = rows && warned = 0 then Ok ()
+  else
+    let%bind said = query t (Query.sql Warnings) in
+    let error_value = function
+      | [| Some "Warning"; Some "1265"; Some message |] ->
+          List.exists
+            (fun (column : Quiver_core.Ident.t) ->
+              String.starts_with message
+                ~prefix:
+                  [%string
+                    "Data truncated for column '%{(column :> string)}' at row "])
+            enums
+      | _ -> false
+    in
+    let untold = List.filter (fun row -> not (error_value row)) said in
+    let shown = if List.is_empty untold then said else untold in
+    if stored = rows && List.length said = warned && List.is_empty untold then Ok ()
+    else
+      Error
+        (`Link
+           (Lossy_load
+              {
+                sent = rows;
+                stored;
+                warnings =
+                  List.map
+                    (fun row -> String.concat " " (List.filter_map Fun.id (Array.to_list row)))
+                    (Base.List.take shown 5);
+              }))
+
+let complete t ~rows ~enums =
   let%bind () = send t.transport t.wire "" in
-  receive_on t (fun reader ->
-      let first = Wire.Cursor.uint8 reader in
-      match Wire.marker first with
-      | Ok_packet -> Ok ()
-      | Err_packet -> Error (refused reader)
-      | Local_infile | Auth_more_data | Eof_packet | Data ->
-          Error (`Link (Unexpected_packet first)))
+  settled t ~rows ~enums
 
-let load_local t sql read =
+let insert t sql ~rows ~enums =
+  let%bind () = command t (Wire.command Query ^ sql) in
+  settled t ~rows ~enums
+
+let load_local t sql ~rows ~enums read =
   let%bind () = upload t sql in
   let buffer = Bytes.create 65536 in
   let rec stream () =
     match read buffer ~pos:0 ~len:(Bytes.length buffer) with
-    | Ok 0 -> complete t
+    | Ok 0 -> complete t ~rows ~enums
     | Ok length ->
         let%bind () = send_data t (Bytes.sub_string buffer 0 length) in
         stream ()
     | Error error ->
-        ignore (complete t);
+        ignore (complete t ~rows ~enums);
         Error error
   in
   stream ()

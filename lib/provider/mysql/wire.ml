@@ -169,6 +169,22 @@ let frame t payload =
   add 0;
   Buffer.contents out
 
+let pieces t payload ~piece =
+  let length = String.length payload in
+  let out = Buffer.create (length + (4 * ((length / piece) + 1))) in
+  let rec add offset =
+    if offset < length then (
+      let size = Int.min piece (length - offset) in
+      Buffer.add_uint16_le out (size land 0xFFFF);
+      Buffer.add_uint8 out (size lsr 16);
+      Buffer.add_uint8 out t.sequence;
+      t.sequence <- (t.sequence + 1) land 0xFF;
+      Buffer.add_substring out payload offset size;
+      add (offset + size))
+  in
+  add 0;
+  Buffer.contents out
+
 (* Reading blocks on the socket and may grow the buffer: it runs once per
    buffer of rows, not per row, so the checker trusts it. *)
 let[@inline never] [@zero_alloc assume] receive t needed =

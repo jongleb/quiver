@@ -1,0 +1,12 @@
+(library
+ (name quiver_innodb)
+ (public_name quiver.innodb)
+ (libraries stdlib_stable base core sexplib0 portable quiver.core)
+ (foreign_stubs
+  (language c)
+  (names crc32c_stubs file_stubs)
+  (flags (:standard -O3)))
+ (preprocess
+  (pps ppx_sexp_conv ppx_let))
+ (flags
+  (:standard -open Stdlib_stable -open Sexplib0.Sexp_conv)))

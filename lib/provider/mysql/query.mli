@@ -31,6 +31,7 @@ type t =
       kind : Quiver_core.Definition.kind;
     }
   | Chunk of Quiver_core.Chunk.t
+      (** The chunk's rows, in primary key order when the table has one. *)
   | Key_span of { chunk : Quiver_core.Chunk.t; key : Quiver_core.Ident.t }
       (** The smallest and the largest [key] of the chunk's rows. *)
   | Collation of {
@@ -39,6 +40,14 @@ type t =
     }
   | Load_columns of Quiver_core.Schema.Name.t
       (** Name and [DATA_TYPE] of each stored column, in table order. *)
+  | Durability
+      (** [innodb_flush_log_at_trx_commit], [sync_binlog] and [log_bin]. *)
+  | Autoinc_lock_mode  (** [innodb_autoinc_lock_mode]. *)
+  | Datadir  (** [datadir]: where the server keeps its files. *)
+  | Text_collations  (** Ids of the server's [utf8mb4] and [utf8mb3] collations, with the set's name. *)
+  | Auto_increment of Quiver_core.Schema.Name.t
+      (** The table's [AUTO_INCREMENT] column, if it has one. *)
+  | Warnings  (** Level, code and message of the last statement's warnings. *)
   | Loaded_files of { dump : string; target : string }
       (** Data files an earlier [quiver load] of this dump committed. *)
   | Probe of {
@@ -70,4 +79,7 @@ val bytes : string -> string @@ portable
 (** A binary string literal: [X'…']. *)
 
 val text : string -> string @@ portable
+
+val qualified : Quiver_core.Schema.Name.t -> string @@ portable
+(** [`database`.`table`]. *)
 (** A UTF-8 string literal in hex, so no byte is ever escaped: [_utf8mb4 X'…']. *)

@@ -13,7 +13,8 @@
   quiver.mysql
   await
   portable
-  portable_lockfree_htbl)
+  portable_lockfree_htbl
+  quiver.innodb)
  (preprocess
   (pps ppx_sexp_conv ppx_let ppx_enumerate ppx_string_conv))
  (flags

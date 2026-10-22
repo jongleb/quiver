@@ -28,6 +28,11 @@ val command : command -> string @@ portable
 val frame_limit : int
 val create : (Base_bigstring.t -> off:int -> len:int -> int) -> t @@ portable
 val restart : t -> unit @@ portable
+val pieces : t -> string -> piece:int -> string @@ portable
+(** The payload as packets of at most [piece] bytes each, numbered on: how
+    [LOAD DATA LOCAL] data goes, so no packet outgrows the server's
+    [max_allowed_packet]. *)
+
 val frame : t -> string -> string
 
 (** Fields of the current packet, read in order only inside {!Cursor.decode}. *) @@ portable

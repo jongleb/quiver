@@ -81,8 +81,6 @@ type deferred = {
 (** Keys of a table added once its last part commits. *)
 
 type t = {
-  config : Quiver_mysql.Provider.conn_config;
-  binlog : Load.binlog;
   target : Load.target;
   keys : Load.keys;
   control : Quiver_mysql.Link.t Await.Capsule.Await.With_mutex.t;
@@ -151,11 +149,6 @@ let rejected statement result =
 
 let run link sql = rejected sql (Quiver_mysql.Link.execute link sql)
 let execute link statement = run link (Quiver_mysql.Statement.sql statement)
-
-let session config binlog =
-  Result.map_error
-    (fun (#Load.cause as cause) -> Unreachable cause)
-    (Load.session config binlog Checked_on_mariadb)
 
 let retried link statement =
   Load.retried
@@ -255,8 +248,6 @@ let create config target ~keys ~binlog ~ingest ~sessions =
          List.iteri (fun index _ -> Await.Await.Mpmc_queue.push idle index) loaders;
          Ok
            {
-             config;
-             binlog;
              target;
              keys;
              control;
@@ -637,18 +628,13 @@ let close_loading (part : loading) answer =
         | This { into; later; remaining } -> (
             match Portable.Atomic.fetch_and_add remaining (-1) with
             | 1 ->
-                let added = Await.Await.Ivar.create ()
-                and config = t.config
-                and binlog = t.binlog in
+                let added = Await.Await.Ivar.create () in
                 Portable.Atomic.update t.building ~pure_f:(fun building ->
                     added :: building);
                 Result.map ignore
                   (Quiver_core.Concurrent.start (fun () ->
                        Await.Await.Ivar.fill_if_empty added
-                         (let%bind link = session config binlog in
-                          let added = add_keys link into later in
-                          Quiver_mysql.Link.close link;
-                          added)))
+                         (on_idle_loader t (fun link -> add_keys link into later))))
                 |> Result.map_error (fun (`Concurrent error) ->
                        Await.Await.Ivar.fill_if_empty added
                          (Error (Unstarted error));
@@ -685,17 +671,13 @@ let close_building (part : building) answer =
       let (_ : int) = Portable.Atomic.fetch_and_add state.sent part.rows in
       match Portable.Atomic.fetch_and_add state.remaining (-1) with
       | 1 ->
-          let imported = Await.Await.Ivar.create ()
-          and config = t.config
-          and binlog = t.binlog
-          and table = part.table in
+          let imported = Await.Await.Ivar.create () and table = part.table in
           Portable.Atomic.update t.building ~pure_f:(fun building -> imported :: building);
           let started =
             Quiver_core.Concurrent.start (fun () ->
                 Await.Await.Ivar.fill_if_empty imported
-                  (let started = Quiver_core.Stopwatch.start () in
-                   let%bind link = session config binlog in
-                   let outcome =
+                  (on_idle_loader t (fun link ->
+                     let started = Quiver_core.Stopwatch.start () in
                      let%bind built =
                        Result.map_error
                          (fun (#Physical.cause as cause) -> Built { table; cause })
@@ -711,10 +693,7 @@ let close_building (part : building) answer =
                        | first :: rest -> add_keys link state.into (first, rest)
                      in
                      Portable.Atomic.set state.progress
-                       (Imported { importing; keys = Quiver_core.Stopwatch.elapsed keying })
-                   in
-                   Quiver_mysql.Link.close link;
-                   outcome))
+                       (Imported { importing; keys = Quiver_core.Stopwatch.elapsed keying }))))
           in
           let built =
             Result.map_error

@@ -1452,3 +1452,18 @@ let tests =
           | Error (`Check (Quiver_innodb.Check.Duplicate _)) -> ()
           | failed -> Alcotest.fail ("a repeated unique key: " ^ check_error failed));
     ]
+
+let tests =
+  tests
+  @ [
+      Alcotest.test_case "a table InnoDB clusters by a unique key, having no primary key, is not built" `Quick (fun () ->
+          match
+            Quiver_innodb.Layout.of_cfg
+              (ok (Quiver_innodb.Cfg.parse (fixture "unique.cfg")))
+              ~collations
+              [ ("code", Quiver_core.Ltype.Int32); ("v", String) ]
+          with
+          | Error (`Layout (Quiver_innodb.Layout.Clustered_by "uc")) -> ()
+          | Error (`Layout error) -> Alcotest.fail (Sexplib0.Sexp.to_string (Quiver_innodb.Layout.sexp_of_error error))
+          | Ok _ -> Alcotest.fail "built");
+    ]

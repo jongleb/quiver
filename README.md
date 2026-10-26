@@ -317,8 +317,8 @@ itself.
   strings (prefixes too) into the file, and checks `UNIQUE` keys itself, since `IMPORT` does
   not. Keys over text in a collation, floats or `DESC` columns, keys of a table without a primary
   key, `SPATIAL` and `FULLTEXT` keys are added by the server after the import, in their places,
-  so `SHOW CREATE TABLE` matches the source. `--tablespace-keys server` leaves them all to the
-  server.
+  so `SHOW CREATE TABLE` matches the source. This is `--tablespace-keys quiver`; by default
+  (`server`) the server adds them all after the import.
 - **Checks.** Each stored field and every secondary index record is compared byte for byte with
   records the server wrote itself.
 - **Fallback.** A table the writer cannot build goes through `LOAD DATA`, and quiver says why.
@@ -326,8 +326,11 @@ itself.
   by way and by reason, and times each table's import and secondary keys.
 - **What it saves.** Writing rows and building byte-ordered keys moves to the client's cores; the
   import then has more pages to take. Tables that fall back load as before.
-- **Settings.** `--tablespace-keys quiver|server`, `--sort-dir` (where sorted secondary records
+- **Settings.** `--tablespace-keys server|quiver`, `--sort-dir` (where sorted secondary records
   wait; beside the file by default), `--build-threads` (threads merging a table's indexes).
+  `--read-order largest-tables` reads the largest tables first, so their check, import and keys
+  run while the rest is read, and `--declare-tables all-at-once` prepares every table before
+  the rows; both default to how 1.3.2 worked (`largest-chunks`, `before-rows`).
 - **Requirements.** MySQL 8.4 or Percona Server 8.4, and the target's data directory on the same
   machine (`--datadir` if quiver sees it under another path).
 - **Binlog.** `--binlog skip` is required: an import writes no rows to the binlog, so replicas

@@ -52,6 +52,8 @@ type scenario = {
   reading : reading;
   rendering : rendering;
   batch_bytes : int;
+  order : Dump_opts.order;
+  declaring : Dump_opts.declaring;
   fault : fault;
   pace : pace;
 }
@@ -274,7 +276,9 @@ let scenario =
         ]
     and* rendering =
       oneof [ map (fun renderers -> Renderers renderers) (int_range 1 3); pure Spare ]
-    and* batch_bytes = oneof [ int_range 1 64; int_range 64 4096 ] in
+    and* batch_bytes = oneof [ int_range 1 64; int_range 64 4096 ]
+    and* order = oneof_list Dump_opts.all_of_order
+    and* declaring = oneof_list Dump_opts.all_of_declaring in
     let+ fault =
       oneof_weighted
         [
@@ -298,6 +302,8 @@ let scenario =
       reading;
       rendering;
       batch_bytes;
+      order;
+      declaring;
       fault;
       pace = Unpaced;
     })
@@ -314,6 +320,8 @@ let holds
       reading;
       rendering;
       batch_bytes;
+      order;
+      declaring;
       fault;
       pace;
     } =
@@ -593,7 +601,7 @@ let holds
         Support.get_ok
           (Dump_opts.make
              ~plan:(Support.get_ok (Plan_opts.make ~chunk_bytes:1))
-             ~readers ~renderers ~cores ~batch_bytes)
+             ~readers ~renderers ~cores ~batch_bytes ~order ~declaring)
       in
       let dump_seconds =
         match pace with
@@ -840,6 +848,8 @@ let paced pace =
       reading = Fitting { cores = 8; suggests = None };
       rendering = Spare;
       batch_bytes = 4096;
+      order = Largest_chunks;
+      declaring = Before_its_rows;
       fault = Clean;
       pace;
     }
@@ -862,6 +872,8 @@ let tests =
                reading = Readers 4;
                rendering = Spare;
                batch_bytes = 4096;
+               order = Largest_chunks;
+               declaring = Before_its_rows;
                fault = Clean;
                pace = Per_row 0.0005;
              }));

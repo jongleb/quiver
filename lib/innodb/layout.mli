@@ -16,6 +16,9 @@ type error =
   | Descending_key of string  (** Rows of such a key are stored backwards. *)
   | Charset of { column : string; collation : int }
       (** Text in a character set other than [utf8mb4], [utf8mb3] and [latin1]. *)
+  | Clustered_by of string
+      (** With no primary key InnoDB clusters the table by this unique key, whose order the rows
+          are not read in. *)
 [@@deriving sexp_of ~portable]
 
 (** Whether a stored integer has a sign, kept sortable by flipping its top bit. *)

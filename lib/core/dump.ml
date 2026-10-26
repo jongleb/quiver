@@ -142,7 +142,8 @@ module Make (P : Provider_intf.S) (S : Sink_intf.S) = struct
           Array.mapi
             (fun position chunk ->
               let bytes = (Chunk.table chunk).estimate.bytes in
-              bytes + (bytes / Int.max 1 parts.(chunk_tables_planned.(position))))
+              let share = bytes / Int.max 1 parts.(chunk_tables_planned.(position)) in
+              match opts.order with Largest_chunks -> share | Largest_tables -> bytes + share)
             chunks
         in
         let order = Array.init (Array.length chunks) Fun.id in
@@ -164,10 +165,14 @@ module Make (P : Provider_intf.S) (S : Sink_intf.S) = struct
           before @ first seen_tables table (Table table)
         in
         let reads =
-          List.concat_map
-            (fun position -> announced chunk_tables_planned.(position))
-            (Array.to_list order)
-          @ List.map (fun position -> Chunk position) (Array.to_list order)
+          match opts.declaring with
+          | Before_its_rows ->
+              List.concat_map
+                (fun position -> announced chunk_tables_planned.(position) @ [ Chunk position ])
+                (Array.to_list order)
+          | All_at_once ->
+              List.concat_map (fun position -> announced chunk_tables_planned.(position)) (Array.to_list order)
+              @ List.map (fun position -> Chunk position) (Array.to_list order)
         in
         let schema_only =
           List.concat_map announced

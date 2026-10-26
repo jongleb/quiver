@@ -26,7 +26,9 @@ copy:
   secondary-keys: after-data
   ingest: tablespace          # MySQL 8.4 target on this machine
   binlog: skip
-  tablespace-keys: quiver     # or server: every secondary key by ALTER after the import
+  tablespace-keys: quiver     # server (the default): every secondary key by ALTER after the import
+  read-order: largest-tables  # largest-chunks (the default): the largest chunks first
+  declare-tables: all-at-once # before-rows (the default): a table just before its rows
   sort-dir: /fast/scratch
   build-threads: 8
   data-table: [shop.orders, shop.items]

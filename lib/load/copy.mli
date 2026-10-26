@@ -48,8 +48,6 @@ type error =
     }  (** A date or time value outside the proleptic Gregorian years 0–9999. *)
   | Unsplittable_definition of Quiver_core.Schema.Name.t
       (** A routine, trigger or view with [";\n"] inside a string literal. *)
-  | Unstarted of Quiver_core.Concurrent.error
-      (** The thread adding a table's keys did not start. *)
   | Tablespaces_need of need
   | Built of { table : Quiver_core.Schema.Name.t @@ aliased; cause : Physical.cause @@ aliased }
       (** Building, checking or importing the table's tablespace failed. *)

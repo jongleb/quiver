@@ -156,7 +156,10 @@ let split deferral table statement =
                        | (Plain_key | Spatial_key | Full_text_key | Foreign_key), _ -> [])
                      definitions)
               in
-              let keys = List.filter_map (function Deferred key -> Some key | Fixed _ -> None) lines in
+              let keys =
+                Option.fold primary ~none:[] ~some:(fun _ ->
+                    List.filter_map (function Deferred key -> Some key | Fixed _ -> None) lines)
+              in
               {
                 create =
                   first ^ "\n"

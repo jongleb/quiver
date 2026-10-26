@@ -361,6 +361,44 @@ let spread =
       && Portable.Atomic.get calls = items
       && Portable.Atomic.get peak <= workers)
 
+let fixed_pool =
+  QCheck2.Test.make ~count:200
+    ~name:"a pool does every item once, on no more threads than it was given, and stop waits for them"
+    ~print:(fun (items, workers, work) -> Printf.sprintf "%d items, %d workers, %d steps of work" items workers work)
+    QCheck2.Gen.(triple (int_range 0 300) (int_range 0 6) (int_range 0 2000))
+    (fun (items, workers, work) ->
+      let done_ = Iarray.init items (fun _ -> Portable.Atomic.make 0) in
+      let running = Portable.Atomic.make 0 and most = Portable.Atomic.make 0 in
+      let pool =
+        Quiver_core.Pool.start ~workers (fun item ->
+            let now = Portable.Atomic.fetch_and_add running 1 + 1 in
+            let rec raise_most () =
+              let seen = Portable.Atomic.get most in
+              if now > seen then
+                match Portable.Atomic.compare_and_set most ~if_phys_equal_to:seen ~replace_with:now with
+                | Set_here -> ()
+                | Compare_failed -> raise_most ()
+            in
+            raise_most ();
+            let (_ : int) = Base.Fn.apply_n_times ~n:work (fun k -> k + 1) 0 in
+            Portable.Atomic.incr (Iarray.get done_ item);
+            Portable.Atomic.decr running)
+      in
+      let rec submit item =
+        if item < items then (
+          let () =
+            match Quiver_core.Pool.submit pool item with
+            | Queued -> ()
+            | Unqueued -> Portable.Atomic.incr (Iarray.get done_ item)
+          in
+          submit (item + 1))
+      in
+      submit 0;
+      Quiver_core.Pool.stop pool;
+      List.for_all (fun item -> Portable.Atomic.get (Iarray.get done_ item) = 1) (List.init items Fun.id)
+      && Portable.Atomic.get most <= Int.max 1 workers
+      && Portable.Atomic.get running = 0)
+
 let tests =
   List.map QCheck_alcotest.to_alcotest
-    [ mailbox_model; mailbox_threads; registry; buffers; pool_waits; each; spread ]
+    [ mailbox_model; mailbox_threads; registry; buffers; pool_waits; each; spread; fixed_pool ]

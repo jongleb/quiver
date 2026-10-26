@@ -936,12 +936,44 @@ let () =
     let batch_bytes =
       Arg.(value & opt int (256 * 1024) & described [ "batch-bytes" ] ~docv:"BYTES")
     in
+    let order =
+      Arg.(
+        value
+        & opt
+            (enum
+               [
+                 ("largest-chunks", Quiver_core.Dump_opts.Largest_chunks);
+                 ("largest-tables", Largest_tables);
+               ])
+            Quiver_core.Dump_opts.Largest_chunks
+        & described [ "read-order" ] ~docv:"ORDER"
+            ~doc:
+              "$(b,largest-chunks) reads the largest chunks first, wherever their tables are; \
+               $(b,largest-tables) reads the largest tables first, their chunks together, so what \
+               a sink does after a table's last part (a tablespace's check, import and keys) \
+               starts early.")
+    and declaring =
+      Arg.(
+        value
+        & opt
+            (enum
+               [
+                 ("before-rows", Quiver_core.Dump_opts.Before_its_rows);
+                 ("all-at-once", All_at_once);
+               ])
+            Quiver_core.Dump_opts.Before_its_rows
+        & described [ "declare-tables" ] ~docv:"WHEN"
+            ~doc:
+              "$(b,before-rows) tells the sink of a table just before its first chunk; \
+               $(b,all-at-once) tells it of every table before any rows, so $(b,copy) creates \
+               or prepares them while rows are read.")
+    in
     Term.(
       term_result
         (const
            (fun
              conn mode filter rows objects threads render_threads chunk_bytes
-             batch_bytes ->
+             batch_bytes order declaring ->
              Result.map_error
                (fun error ->
                  `Msg (Sexplib0.Sexp.to_string_hum (Quiver_core.Error.sexp_of_t error)))
@@ -959,12 +991,12 @@ let () =
                     ~cores:
                       (Quiver_core.Cores.budget
                          (Quiver_mysql.Local.machine conn.Quiver_mysql.Provider.route))
-                    ~batch_bytes
+                    ~batch_bytes ~order ~declaring
                 in
                 { conn; mode; filter; rows; objects; opts }))
         $ server `Source $ mode $ filter $ rows $ objects $ threads $ render_threads
         $ chunk_bytes
-        $ batch_bytes))
+        $ batch_bytes $ order $ declaring))
   in
   let output =
     let open Cmdliner in
@@ -1061,7 +1093,7 @@ let () =
                  tablespace); the server's own when not given.")
       $ Arg.(
           value
-          & opt (enum [ ("quiver", Quiver_load.Physical.Quiver); ("server", Server) ]) Quiver_load.Physical.Quiver
+          & opt (enum [ ("quiver", Quiver_load.Physical.Quiver); ("server", Server) ]) Quiver_load.Physical.Server
           & described [ "tablespace-keys" ] ~docv:"WHO"
               ~doc:
                 "Who builds the secondary keys of a table built as a tablespace: $(b,quiver) builds \

@@ -9,6 +9,7 @@ type error =
   | Key_type of string
   | Descending_key of string
   | Charset of { column : string; collation : int }
+  | Clustered_by of string
 [@@deriving sexp_of ~portable]
 
 type sign = Signed | Unsigned [@@deriving sexp_of ~portable]
@@ -84,6 +85,11 @@ let of_cfg (cfg : Cfg.t) ~collations dumped =
     match (cfg.table_flags, cfg.space_flags) with
     | 33, 0x4021 -> Ok ()
     | table_flags, space_flags -> Error (`Layout (Row_format { table_flags; space_flags }))
+  in
+  let%bind () =
+    match cfg.clustered.name with
+    | "PRIMARY" | "GEN_CLUST_INDEX" -> Ok ()
+    | name -> Error (`Layout (Clustered_by name))
   in
   let storage (field : Cfg.Index.field) =
     let%bind (column : Cfg.Column.t) =

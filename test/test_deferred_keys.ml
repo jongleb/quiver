@@ -173,7 +173,8 @@ let tests =
                  original
              in
              let sorted = List.sort compare in
-             lines (Quiver_load.Deferred_keys.with_keys t chosen) = expected
+             (List.exists (fun line -> Base.String.is_prefix line ~prefix:"PRIMARY KEY ") original || t.keys = [])
+             && lines (Quiver_load.Deferred_keys.with_keys t chosen) = expected
              && sorted (keys @ added t.special) = sorted deferred_keys
              && List.for_all
                   (fun (key : Quiver_load.Deferred_keys.key) ->
@@ -181,4 +182,72 @@ let tests =
                     | Unique, _ | Plain, None -> true
                     | Plain, Some first -> position key.definition < first)
                   t.keys));
+    ]
+
+(** The index InnoDB clusters a table by, as MySQL picks it: the primary key, else the first
+    [UNIQUE] key over [NOT NULL] columns only, else a hidden row id. *)
+let clustered create =
+  let lines = lines create in
+  let not_null column =
+    List.exists
+      (fun line ->
+        Base.String.is_prefix line ~prefix:("`" ^ column ^ "` ") && Base.String.is_substring line ~substring:"NOT NULL")
+      lines
+  in
+  let columns line =
+    match String.split_on_char '(' line with
+    | _ :: rest ->
+        List.filter_map
+          (fun part -> List.nth_opt (String.split_on_char '`' part) 1)
+          (String.split_on_char ',' (String.concat "(" rest))
+    | [] -> []
+  in
+  if List.exists (fun line -> Base.String.is_prefix line ~prefix:"PRIMARY KEY ") lines then "PRIMARY"
+  else
+    Option.value ~default:"GEN_CLUST_INDEX"
+      (List.find_map
+         (fun line ->
+           if Base.String.is_prefix line ~prefix:"UNIQUE KEY " && List.for_all not_null (columns line) then
+             List.nth_opt (String.split_on_char '`' line) 1
+           else None)
+         lines)
+
+let keyed_table =
+  QCheck2.Gen.(
+    let* nullable = list_size (return 5) bool in
+    let* auto = option (int_range 0 4) in
+    let* primary = option (int_range 0 4) in
+    let+ keys =
+      list_size (int_range 0 6)
+        (pair (oneof_list [ "KEY"; "UNIQUE KEY" ]) (list_size (int_range 1 2) (int_range 0 4)))
+    in
+    let not_null i = Option.equal Int.equal (Some i) primary || Option.equal Int.equal (Some i) auto || not (List.nth nullable i) in
+    let columns =
+      List.init 5 (fun i ->
+          Printf.sprintf "  `c%d` int %s%s" i
+            (if not_null i then "NOT NULL" else "DEFAULT NULL")
+            (match auto with Some a when a = i -> " AUTO_INCREMENT" | _ -> ""))
+    in
+    let key j (kind, cols) =
+      let cols = List.sort_uniq compare cols in
+      let name = (if kind = "KEY" then "k" else "u") ^ string_of_int j in
+      ( kind,
+        Printf.sprintf "  %s `%s` (%s)" kind name (String.concat "," (List.map (Printf.sprintf "`c%d`") cols)) )
+    in
+    let keys = List.mapi key keys in
+    let unique = List.filter_map (fun (kind, line) -> if kind = "UNIQUE KEY" then Some line else None) keys
+    and plain = List.filter_map (fun (kind, line) -> if kind = "KEY" then Some line else None) keys in
+    columns @ Option.to_list (Option.map (Printf.sprintf "  PRIMARY KEY (`c%d`)") primary) @ unique @ plain)
+
+let tests =
+  tests
+  @ [
+      QCheck_alcotest.to_alcotest
+        (QCheck2.Test.make ~count:1000 ~name:"keys put back never change which index clusters the table"
+           ~print:(String.concat "\n")
+           keyed_table
+           (fun definitions ->
+             let text = "CREATE TABLE `t` (\n" ^ String.concat ",\n" definitions ^ "\n) ENGINE=InnoDB" in
+             let t = Quiver_load.Deferred_keys.split All_keys table text in
+             clustered (Quiver_load.Deferred_keys.with_keys t t.keys) = clustered t.create));
     ]

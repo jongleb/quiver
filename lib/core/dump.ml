@@ -72,6 +72,7 @@ module Make (P : Provider_intf.S) (S : Sink_intf.S) = struct
       | Fitting -> At_most (Dump_opts.most_readers opts)
     in
     let%bind connections = P.connect conn sessions in
+    let connected = Stopwatch.elapsed began in
     let%bind schema, chunks =
       match
         let%bind schema = P.introspect connections filter in
@@ -94,7 +95,9 @@ module Make (P : Provider_intf.S) (S : Sink_intf.S) = struct
           P.disconnect connections;
           Error error
     in
+    let chunked = Stopwatch.elapsed began in
     let%bind sessions, position = P.snapshot supports connections in
+    let snapshot = Stopwatch.elapsed began in
     let dump () =
       let databases =
         Iarray.of_list
@@ -138,8 +141,8 @@ module Make (P : Provider_intf.S) (S : Sink_intf.S) = struct
         let sizes =
           Array.mapi
             (fun position chunk ->
-              (Chunk.table chunk).estimate.bytes
-              / Int.max 1 parts.(chunk_tables_planned.(position)))
+              let bytes = (Chunk.table chunk).estimate.bytes in
+              bytes + (bytes / Int.max 1 parts.(chunk_tables_planned.(position))))
             chunks
         in
         let order = Array.init (Array.length chunks) Fun.id in
@@ -162,9 +165,9 @@ module Make (P : Provider_intf.S) (S : Sink_intf.S) = struct
         in
         let reads =
           List.concat_map
-            (fun position ->
-              announced chunk_tables_planned.(position) @ [ Chunk position ])
+            (fun position -> announced chunk_tables_planned.(position))
             (Array.to_list order)
+          @ List.map (fun position -> Chunk position) (Array.to_list order)
         in
         let schema_only =
           List.concat_map announced
@@ -749,6 +752,7 @@ module Make (P : Provider_intf.S) (S : Sink_intf.S) = struct
         else None
       in
       List.iter (Option.iter Concurrent.join) readers;
+      let read = Stopwatch.elapsed began in
       Portable.Atomic.set ending Ended;
       Option.iter Concurrent.join tuning;
       List.iter
@@ -759,6 +763,7 @@ module Make (P : Provider_intf.S) (S : Sink_intf.S) = struct
       List.iter (Result.iter Concurrent.join) renderers;
       committed ();
       Await.Await.Ivar.read Blocking.await all_committed;
+      let committed = Stopwatch.elapsed began in
       match Portable.Atomic.get failure with
       | Some error -> Error error
       | None ->
@@ -793,6 +798,25 @@ module Make (P : Provider_intf.S) (S : Sink_intf.S) = struct
                   readers = start;
                   peak = Portable.Atomic.get peak;
                   renderers = rendering;
+                }
+              ~phases:
+                {
+                  connected;
+                  planned = chunked;
+                  snapshot;
+                  first_part =
+                    List.fold_left
+                      (fun first ((_ : Chunk.t), (state : Manifest.state)) ->
+                        match state with
+                        | Done { reading = { started; _ }; _ } ->
+                            Some
+                              (Option.fold ~none:started
+                                 ~some:(Core.Time_ns.Span.min started)
+                                 first)
+                        | Pending -> first)
+                      None entries;
+                  read;
+                  committed;
                 }
               ~schema entries
           in

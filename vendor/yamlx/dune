@@ -1,0 +1,10 @@
+; yamlx 0.5.0 (https://github.com/mjambon/yamlx, opam yamlx.0.5.0), AGPL-3.0-only (LICENSE).
+; Changed: [@@deriving show] and the printers it made (Node.pp/show, Value.pp/show,
+; pp_*/show_* of the types) are left out, since ppx_deriving does not install on
+; OxCaml; nothing else.
+
+(library
+ (name YAMLx)
+ (public_name quiver.yamlx)
+ (flags
+  (:standard -w -a -alert -all)))

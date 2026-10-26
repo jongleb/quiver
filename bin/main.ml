@@ -26,6 +26,15 @@ type 'r consumer = {
 (** What runs with a sink of any kind. *)
 
 let () =
+  let options = Hashtbl.create 64 in
+  let described ?docv ?doc ?env names =
+    let long = List.fold_left (fun best name -> if String.length name > String.length best then name else best) "" names in
+    let variable =
+      Option.value env ~default:("QUIVER_" ^ String.uppercase_ascii (String.map (function '-' -> '_' | c -> c) long))
+    in
+    Hashtbl.replace options long (names, variable);
+    Cmdliner.Arg.info ?docv ?doc ~env:(Cmdliner.Cmd.Env.info variable) names
+  in
   let told message =
     Format.eprintf "quiver: %s@." message;
     1
@@ -100,6 +109,17 @@ let () =
           Core.Time_ns.Span.pp spent.reading Core.Time_ns.Span.pp spent.waiting
           Core.Time_ns.Span.pp spent.rendering written Core.Time_ns.Span.pp
           spent.writing Core.Time_ns.Span.pp spent.committing holding;
+        let { Quiver_core.Manifest.connected; planned; snapshot; first_part; read; committed } =
+          manifest.phases
+        in
+        Format.printf
+          "since the start: sessions open %a, planned %a, in the snapshot %a, %s, reading ended \
+           %a, every part taken %a@."
+          Core.Time_ns.Span.pp connected Core.Time_ns.Span.pp planned Core.Time_ns.Span.pp snapshot
+          (Option.fold ~none:"no rows"
+             ~some:(Format.asprintf "first part %a" Core.Time_ns.Span.pp)
+             first_part)
+          Core.Time_ns.Span.pp read Core.Time_ns.Span.pp committed;
         Format.printf
           "%d readers at the start, %d at most, %d sessions, %d renderers, %d \
            cores to use@."
@@ -215,10 +235,13 @@ let () =
     List.iter
       (fun (name, (way : Quiver_load.Copy.way), size) ->
         match way with
-        | Imported { importing; keys } ->
-            Format.printf "imported %a as a built tablespace%s; import %a, secondary keys %a@."
-              Quiver_core.Schema.Name.pp name (amount size) Core.Time_ns.Span.pp importing
-              Core.Time_ns.Span.pp keys
+        | Imported { preparing; queued; checking; importing; keys } ->
+            Format.printf
+              "imported %a as a built tablespace%s; prepared %a, waited %a for a session, check \
+               %a, import %a, secondary keys %a@."
+              Quiver_core.Schema.Name.pp name (amount size) Core.Time_ns.Span.pp preparing
+              Core.Time_ns.Span.pp queued Core.Time_ns.Span.pp checking Core.Time_ns.Span.pp
+              importing Core.Time_ns.Span.pp keys
         | Loaded why ->
             Format.printf "loaded %a with LOAD DATA%s: %s@." Quiver_core.Schema.Name.pp name (amount size)
               (Sexplib0.Sexp.to_string (Quiver_load.Physical.sexp_of_unsuitable why)))
@@ -235,22 +258,51 @@ let () =
     let built, loaded =
       List.partition_map
         (fun ((_, (way : Quiver_load.Copy.way), _) as table) ->
-          match way with Imported { importing; keys } -> Left (table, importing, keys) | Loaded why -> Right (table, why))
+          match way with Imported imported -> Left (table, imported) | Loaded why -> Right (table, why))
         ways
     in
     let () =
       match built with
       | [] -> ()
       | _ :: _ ->
-          let sum f = List.fold_left (fun acc x -> Core.Time_ns.Span.( + ) acc (f x)) Core.Time_ns.Span.zero built in
-          let tables = List.map (fun (table, _, _) -> table) built in
+          let sum f =
+            List.fold_left (fun acc (_, imported) -> Core.Time_ns.Span.( + ) acc (f imported)) Core.Time_ns.Span.zero built
+          in
+          let tables = List.map fst built in
           Format.printf
-            "built tablespaces: %s%s; parts: %s; after the last part, over all tables: import %a, \
-             secondary keys %a@."
+            "built tablespaces: %s%s; parts: %s; over all tables: prepared %a; after the last \
+             part: waited %a for a session, check %a, import %a, secondary keys %a@."
             (count built) (amount (total tables)) (spent tables) Core.Time_ns.Span.pp
-            (sum (fun (_, importing, _) -> importing))
+            (sum (fun { preparing; _ } -> preparing))
             Core.Time_ns.Span.pp
-            (sum (fun (_, _, keys) -> keys))
+            (sum (fun { queued; _ } -> queued))
+            Core.Time_ns.Span.pp
+            (sum (fun { checking; _ } -> checking))
+            Core.Time_ns.Span.pp
+            (sum (fun { importing; _ } -> importing))
+            Core.Time_ns.Span.pp
+            (sum (fun { keys; _ } -> keys));
+          let after ({ queued; checking; importing; keys; _ } : Quiver_load.Copy.imported) =
+            Core.Time_ns.Span.(queued + checking + importing + keys)
+          in
+          List.iter
+            (fun ((name, _, _), imported) ->
+              Format.printf "longest after the last part: %a, %a@." Quiver_core.Schema.Name.pp name
+                Core.Time_ns.Span.pp (after imported))
+            (Base.List.take
+               (List.stable_sort
+                  (fun (_, a) (_, b) -> Core.Time_ns.Span.compare (after b) (after a))
+                  built)
+               5)
+    in
+    let () =
+      match Quiver_load.Copy.finishing sink with
+      | Unfinished -> ()
+      | Finished { built; foreign_keys; objects } ->
+          Format.printf
+            "after the parts: waited %a for imports and keys, foreign keys %a, objects %a@."
+            Core.Time_ns.Span.pp built Core.Time_ns.Span.pp foreign_keys Core.Time_ns.Span.pp
+            objects
     in
     match loaded with
     | [] -> ()
@@ -551,7 +603,7 @@ let () =
           & opt
               (some (enum [ ("verified", `Verified); ("disabled", `Disabled) ]))
               None
-          & info (names [] "tls") ~docv:"MODE"
+          & described (names [] "tls") ~docv:"MODE"
               ~doc:
                 "$(b,verified) encrypts the connection and verifies the \
                  server: by the system's CAs (on 127.0.0.1 only the \
@@ -562,7 +614,7 @@ let () =
         Arg.(
           value
           & opt (some file) None
-          & info (names [] "tls-ca") ~docv:"FILE"
+          & described (names [] "tls-ca") ~docv:"FILE"
               ~doc:
                 "PEM file of the CAs the server's chain must lead to; the host \
                  name is checked too, on every host.")
@@ -622,7 +674,7 @@ let () =
       Arg.(
         value
         & opt (some string) None
-        & info (names [ "h" ] "host") ~docv:"HOST"
+        & described (names [ "h" ] "host") ~docv:"HOST"
             ~doc:
               "The server's host. As for the mysql client, without it or with \
                $(b,localhost) quiver connects to this machine's Unix socket: \
@@ -633,29 +685,28 @@ let () =
       Arg.(
         value
         & opt (some int) None
-        & info (names [ "P" ] "port") ~docv:"PORT"
+        & described (names [ "P" ] "port") ~docv:"PORT"
             ~doc:"The server's TCP port; 3306 unless given.")
     and socket =
       Arg.(
         value
         & opt (some string) None
-        & info (names [ "S" ] "socket") ~docv:"PATH"
+        & described (names [ "S" ] "socket") ~docv:"PATH"
             ~doc:
               "Connect over this Unix socket instead of TCP, as to a server \
                started with $(b,skip_networking); there is no TLS on it, and \
                it takes no $(b,--host), $(b,--port) or $(b,--tls) options.")
     and user =
-      Arg.(value & opt string "root" & info (names [ "u" ] "user") ~docv:"USER")
+      Arg.(value & opt string "root" & described (names [ "u" ] "user") ~docv:"USER")
     and password =
       Arg.(
         value
         & opt (some string) None
-        & info (names [ "p" ] "password") ~docv:"PASSWORD"
+        & described (names [ "p" ] "password") ~docv:"PASSWORD"
             ~env:
-              (Cmd.Env.info
-                 (match side with
-                 | `Source -> "MYSQL_PWD"
-                 | `Target -> "QUIVER_TO_PWD")))
+              (match side with
+              | `Source -> "MYSQL_PWD"
+              | `Target -> "QUIVER_TO_PWD"))
     and timeouts =
       Term.(
         const (fun connecting silence ->
@@ -666,13 +717,13 @@ let () =
             })
         $ Arg.(
             value & opt int 10
-            & info (names [] "connect-timeout") ~docv:"SECONDS"
+            & described (names [] "connect-timeout") ~docv:"SECONDS"
                 ~doc:
                   "Fail when connecting, TLS or authentication waits for the \
                    server so long.")
         $ Arg.(
             value & opt int 600
-            & info (names [] "net-timeout") ~docv:"SECONDS"
+            & described (names [] "net-timeout") ~docv:"SECONDS"
                 ~doc:
                   "Fail when a connection sends and receives nothing for so \
                    long. A global read lock can wait for long queries, so \
@@ -687,7 +738,7 @@ let () =
                 (choices Quiver_mysql.Provider.string_of_zero_dates
                    Quiver_mysql.Provider.all_of_zero_dates)
                 Quiver_mysql.Provider.Reject
-            & info [ "zero-dates" ] ~docv:"MODE"
+            & described [ "zero-dates" ] ~docv:"MODE"
                 ~doc:
                   "$(b,reject) fails on a zero or invalid date such as \
                    0000-00-00 or 2020-02-30, which has no exact value; \
@@ -767,7 +818,7 @@ let () =
             (choices Quiver_mysql.Provider.string_of_snapshot_mode
                Quiver_mysql.Provider.all_of_snapshot_mode)
             Quiver_mysql.Provider.Ftwrl
-        & info [ "snapshot" ] ~docv:"MODE"
+        & described [ "snapshot" ] ~docv:"MODE"
             ~doc:
               "$(b,ftwrl) and $(b,backup-stage) (MariaDB) give one consistent \
                snapshot; $(b,trx-only) takes no lock and is only best effort.")
@@ -800,11 +851,11 @@ let () =
             | first :: rest -> Only (first, rest))
         $ Arg.(
             value & opt_all database_rule []
-            & info [ "B"; "database" ] ~docv:"DB"
+            & described [ "B"; "database" ] ~docv:"DB"
                 ~doc:"Dump only $(docv); repeatable.")
         $ Arg.(
             value & opt_all table_rule []
-            & info [ "T"; "table" ] ~docv:"DB.TABLE"
+            & described [ "T"; "table" ] ~docv:"DB.TABLE"
                 ~doc:
                   "Dump only $(docv); repeatable. Its database's views, \
                    triggers, routines and events still come along unless \
@@ -825,18 +876,18 @@ let () =
               & vflag `Rows
                   [
                     ( `No_data,
-                      info [ "no-data" ]
+                      described [ "no-data" ]
                         ~doc:"Take every table's schema and no rows." );
                   ])
           $ Arg.(
               value & opt_all database_rule []
-              & info [ "data-database" ] ~docv:"DB"
+              & described [ "data-database" ] ~docv:"DB"
                   ~doc:
                     "Take rows only of $(docv)'s tables, repeatable; the other \
                      tables of the dump give only their schema.")
           $ Arg.(
               value & opt_all table_rule []
-              & info [ "data-table" ] ~docv:"DB.TABLE"
+              & described [ "data-table" ] ~docv:"DB.TABLE"
                   ~doc:
                     "Take rows only of $(docv), repeatable; the other tables of \
                      the dump give only their schema.")))
@@ -850,7 +901,7 @@ let () =
                  ("none", Without_objects);
                ])
             With_objects
-        & info [ "objects" ] ~docv:"WHICH"
+        & described [ "objects" ] ~docv:"WHICH"
             ~doc:
               "$(b,all) takes the dumped databases' views, triggers, routines \
                and events; $(b,none) takes none of them.")
@@ -859,7 +910,7 @@ let () =
       Arg.(
         value
         & opt (some int) None
-        & info [ "t"; "threads" ] ~docv:"N"
+        & described [ "t"; "threads" ] ~docv:"N"
             ~doc:
               "Database sessions reading in parallel, one domain each; by \
                default half the cores quiver may use (at least 4), fewer when \
@@ -871,7 +922,7 @@ let () =
       Arg.(
         value
         & opt (some int) None
-        & info [ "render-threads" ] ~docv:"N"
+        & described [ "render-threads" ] ~docv:"N"
             ~doc:
               "Domains turning batches into output; by default half the \
                readers, within the cores quiver may use.")
@@ -880,10 +931,10 @@ let () =
       Arg.(
         value
         & opt int (64 * 1024 * 1024)
-        & info [ "chunk-bytes" ] ~docv:"BYTES" ~doc:"Target size of one chunk.")
+        & described [ "chunk-bytes" ] ~docv:"BYTES" ~doc:"Target size of one chunk.")
     in
     let batch_bytes =
-      Arg.(value & opt int (256 * 1024) & info [ "batch-bytes" ] ~docv:"BYTES")
+      Arg.(value & opt int (256 * 1024) & described [ "batch-bytes" ] ~docv:"BYTES")
     in
     Term.(
       term_result
@@ -921,7 +972,7 @@ let () =
       Arg.(
         value
         & opt (enum [ ("sql", `Sql); ("csv", `Csv) ]) `Sql
-        & info [ "format" ] ~docv:"FORMAT")
+        & described [ "format" ] ~docv:"FORMAT")
     and dialect =
       Arg.(
         value
@@ -929,17 +980,17 @@ let () =
             (choices Quiver_core.Output_format.string_of_dialect
                Quiver_core.Output_format.all_of_dialect)
             Quiver_core.Output_format.Rfc4180
-        & info [ "csv-dialect" ] ~docv:"DIALECT")
+        & described [ "csv-dialect" ] ~docv:"DIALECT")
     and compress =
       Arg.(
         value
         & opt (enum [ ("none", `None); ("zstd", `Zstd) ]) `None
-        & info [ "compress" ] ~docv:"CODEC")
-    and level = Arg.(value & opt int 3 & info [ "zstd-level" ] ~docv:"LEVEL")
+        & described [ "compress" ] ~docv:"CODEC")
+    and level = Arg.(value & opt int 3 & described [ "zstd-level" ] ~docv:"LEVEL")
     and statement_bytes =
       Arg.(
         value & opt int 1_000_000
-        & info [ "statement-bytes" ] ~docv:"BYTES"
+        & described [ "statement-bytes" ] ~docv:"BYTES"
             ~doc:"Approximate size of one INSERT statement.")
     in
     Term.(
@@ -959,7 +1010,7 @@ let () =
   let outputdir ~doc =
     Cmdliner.Arg.(
       opt (some (conv (file_path, File_path.pp))) None
-      & info [ "o"; "outputdir" ] ~docv:"DIR" ~doc)
+      & described [ "o"; "outputdir" ] ~docv:"DIR" ~doc)
   in
   let dump_cmd =
     let open Cmdliner in
@@ -978,7 +1029,7 @@ let () =
       & opt
           (choices Quiver_load.Load.string_of_keys Quiver_load.Load.all_of_keys)
           Quiver_load.Load.With_table
-      & info [ "secondary-keys" ] ~docv:"WHEN"
+      & described [ "secondary-keys" ] ~docv:"WHEN"
           ~doc:
             "$(b,with-table) creates tables as dumped; $(b,after-data) creates \
              them with their primary key only and adds secondary and foreign \
@@ -988,14 +1039,14 @@ let () =
   let ingest =
     let open Cmdliner in
     Term.(
-      const (fun way datadir ->
+      const (fun way datadir builder sorting threads ->
           match way with
           | `Load_data -> Quiver_load.Copy.Load_data
-          | `Tablespace -> Tablespaces { datadir })
+          | `Tablespace -> Tablespaces { datadir; builder; sorting; threads })
       $ Arg.(
           value
           & opt (enum [ ("load-data", `Load_data); ("tablespace", `Tablespace) ]) `Load_data
-          & info [ "ingest" ] ~docv:"WAY"
+          & described [ "ingest" ] ~docv:"WAY"
               ~doc:
                 "$(b,tablespace) builds each table it can as an InnoDB tablespace beside the \
                  target and imports it (MySQL 8.4 only, with $(b,--binlog skip), quiver on the \
@@ -1004,10 +1055,33 @@ let () =
       $ Arg.(
           value
           & opt (some string) None
-          & info [ "datadir" ] ~docv:"DIR"
+          & described [ "datadir" ] ~docv:"DIR"
               ~doc:
                 "The target's data directory as this machine sees it, for $(b,--ingest \
-                 tablespace); the server's own when not given."))
+                 tablespace); the server's own when not given.")
+      $ Arg.(
+          value
+          & opt (enum [ ("quiver", Quiver_load.Physical.Quiver); ("server", Server) ]) Quiver_load.Physical.Quiver
+          & described [ "tablespace-keys" ] ~docv:"WHO"
+              ~doc:
+                "Who builds the secondary keys of a table built as a tablespace: $(b,quiver) builds \
+                 those ordered by bytes (integers, dates and times, decimals, binary strings) into \
+                 the file, the server adds the others after the import; $(b,server) adds them all \
+                 after the import.")
+      $ Arg.(
+          value
+          & opt (some dir) None
+          & described [ "sort-dir" ] ~docv:"DIR"
+              ~doc:
+                "Where a table's secondary records wait, sorted, until its file is finished; beside \
+                 the file in the target's data directory when not given.")
+      $ Arg.(
+          value
+          & opt (some int) None
+          & described [ "build-threads" ] ~docv:"N"
+              ~doc:
+                "Threads merging a table's secondary indexes when its file is finished; half the \
+                 fast cores when not given."))
   in
   let binlog =
     let open Cmdliner in
@@ -1016,7 +1090,7 @@ let () =
       & opt
           (choices Quiver_load.Load.string_of_binlog Quiver_load.Load.all_of_binlog)
           Quiver_load.Load.Write_binlog
-      & info [ "binlog" ] ~docv:"MODE"
+      & described [ "binlog" ] ~docv:"MODE"
           ~doc:
             "$(b,skip) keeps the load out of the server's binlog (less work \
              for the server, but replicas never see the data; needs the right \
@@ -1028,17 +1102,17 @@ let () =
       Arg.(
         required
         & opt (some dir) None
-        & info [ "d"; "directory" ] ~docv:"DIR" ~doc:"The dump to load.")
+        & described [ "d"; "directory" ] ~docv:"DIR" ~doc:"The dump to load.")
     and into =
       Arg.(
         value
         & opt (some ident) None
-        & info [ "B"; "database" ] ~docv:"DB"
+        & described [ "B"; "database" ] ~docv:"DB"
             ~doc:"Load the dump's only database under this name.")
     and threads =
       Arg.(
         value & opt int 4
-        & info [ "t"; "threads" ] ~docv:"N"
+        & described [ "t"; "threads" ] ~docv:"N"
             ~doc:"Sessions loading in parallel, one domain each.")
     in
     Cmd.v
@@ -1051,7 +1125,7 @@ let () =
       Arg.(
         value
         & opt (some ident) None
-        & info [ "to-database" ] ~docv:"DB"
+        & described [ "to-database" ] ~docv:"DB"
             ~doc:"Copy the only database read under this name.")
     in
     Cmd.v
@@ -1064,7 +1138,7 @@ let () =
         $ Arg.(
             value
             & opt (some int) None
-            & info [ "target-threads" ] ~docv:"N"
+            & described [ "target-threads" ] ~docv:"N"
                 ~doc:
                   "Sessions loading into the target, one chunk each; defaults \
                    to $(b,--threads). Readers wait for a free one, so loading \
@@ -1073,7 +1147,7 @@ let () =
   let wire =
     let open Cmdliner in
     let file name ~doc =
-      Arg.(value & opt (some file) None & info [ name ] ~docv:"FILE" ~doc)
+      Arg.(value & opt (some file) None & described [ name ] ~docv:"FILE" ~doc)
     in
     Term.(
       term_result
@@ -1105,7 +1179,7 @@ let () =
             & opt
                 (enum [ ("verified", `Verified); ("disabled", `Disabled) ])
                 `Verified
-            & info [ "wire-tls" ] ~docv:"MODE"
+            & described [ "wire-tls" ] ~docv:"MODE"
                 ~doc:
                   "$(b,verified): TLS 1.3 on every connection of quiver's \
                    protocol, and each side must present a certificate the \
@@ -1125,7 +1199,7 @@ let () =
   let reconnect =
     Cmdliner.Arg.(
       value & opt float 60.
-      & info [ "reconnect" ] ~docv:"SECONDS"
+      & described [ "reconnect" ] ~docv:"SECONDS"
           ~doc:
             "How long a broken control connection may take to be replaced \
              before the session fails; the agent keeps its snapshot and \
@@ -1137,7 +1211,7 @@ let () =
       Arg.(
         required
         & opt (some string) None
-        & info [ "collector" ] ~docv:"HOST:PORT"
+        & described [ "collector" ] ~docv:"HOST:PORT"
             ~doc:"The collector that receives the dump ($(b,quiver collect)).")
     and level =
       Arg.(
@@ -1154,7 +1228,7 @@ let () =
                    | `Auto -> Format.pp_print_string ppf "auto"
                    | `Level level -> Format.pp_print_int ppf level ))
             `Auto
-        & info [ "zstd-level" ] ~docv:"LEVEL"
+        & described [ "zstd-level" ] ~docv:"LEVEL"
             ~doc:
               "Compression of batches on the wire: a zstd level, or $(b,auto) \
                to move between none and zstd -5, 1 and 3 by what holds the \
@@ -1171,14 +1245,14 @@ let () =
         $ Arg.(
             value
             & opt (some int) None
-            & info [ "streams" ] ~docv:"N"
+            & described [ "streams" ] ~docv:"N"
                 ~doc:
                   "Data connections; defaults to $(b,--threads). Every \
                    connection carries batches of any chunk, so more of them \
                    than readers fill a long or lossy path.")
         $ Arg.(
             value & opt int 64
-            & info [ "most-streams" ] ~docv:"N"
+            & described [ "most-streams" ] ~docv:"N"
                 ~doc:
                   "While the network holds the dump back, open more data \
                    connections, up to so many, keeping those that carry \
@@ -1186,7 +1260,7 @@ let () =
         $ Arg.(
             value
             & opt (some int) None
-            & info [ "chunks-in-flight" ] ~docv:"N"
+            & described [ "chunks-in-flight" ] ~docv:"N"
                 ~doc:
                   "Chunks begun and not yet committed by the collector; \
                    defaults to twice $(b,--threads), so readers go on while \
@@ -1195,7 +1269,7 @@ let () =
         $ Arg.(
             value
             & opt (some float) None
-            & info [ "max-rate" ] ~docv:"MB/S"
+            & described [ "max-rate" ] ~docv:"MB/S"
                 ~doc:
                   "Megabytes a second that all data connections together \
                    send at most, so the dump leaves room on a shared path.")
@@ -1213,14 +1287,14 @@ let () =
                         fun ppf traffic ->
                           Format.pp_print_int ppf (traffic :> int) )))
                 None
-            & info [ "dscp" ] ~docv:"N"
+            & described [ "dscp" ] ~docv:"N"
                 ~doc:
                   "The DSCP every packet of the dump carries; 8 (CS1) asks \
                    routers to let other traffic go first.")
         $ reconnect
         $ Arg.(
             value & opt float 2.
-            & info [ "stall" ] ~docv:"SECONDS"
+            & described [ "stall" ] ~docv:"SECONDS"
                 ~doc:
                   "A data connection whose oldest frame waits this long for its \
                    acknowledgement, while another connection waits for none or \
@@ -1231,7 +1305,7 @@ let () =
     Cmdliner.Arg.(
       required
       & opt (some string) None
-      & info [ "listen" ] ~docv:"HOST:PORT"
+      & described [ "listen" ] ~docv:"HOST:PORT"
           ~doc:"Where to wait for the agent or the hop before.")
   in
   let relay protection reconnect listen next =
@@ -1267,7 +1341,7 @@ let () =
         $ Arg.(
             required
             & opt (some string) None
-            & info [ "forward" ] ~docv:"HOST:PORT" ~doc:"The next hop."))
+            & described [ "forward" ] ~docv:"HOST:PORT" ~doc:"The next hop."))
   in
   let collect_cmd =
     let open Cmdliner in
@@ -1275,7 +1349,7 @@ let () =
       Arg.(
         value
         & opt (some ident) None
-        & info [ "to-database" ] ~docv:"DB"
+        & described [ "to-database" ] ~docv:"DB"
             ~doc:"Load the only database received under this name.")
     in
     Cmd.v
@@ -1294,7 +1368,7 @@ let () =
         $ Arg.(
             value
             & opt (some string) None
-            & info [ "forward" ] ~docv:"HOST:PORT"
+            & described [ "forward" ] ~docv:"HOST:PORT"
                 ~doc:
                   "Also pass everything on to this collector as it arrives, so \
                    one read of the source reaches a chain of targets; a chunk \
@@ -1303,9 +1377,95 @@ let () =
             (outputdir ~doc:"Write files here instead of loading into a server.")
         $ output $ conn `Target $ into $ keys $ binlog $ ingest)
   in
-  exit
-    (Cmdliner.Cmd.eval'
-       (Cmdliner.Cmd.group
-          (Cmdliner.Cmd.info "quiver" ~version:Version.number
-             ~doc:"Parallel consistent logical database dumper")
-          [ dump_cmd; load_cmd; copy_cmd; agent_cmd; collect_cmd; relay_cmd ]))
+  let commands = [ dump_cmd; load_cmd; copy_cmd; agent_cmd; collect_cmd; relay_cmd ] in
+  let given = Array.to_list Sys.argv in
+  let chosen, argv =
+    let rec go acc = function
+      | "--quiverfile" :: path :: rest -> (Some path, List.rev_append acc rest)
+      | arg :: rest when String.starts_with ~prefix:"--quiverfile=" arg ->
+          (Some (String.sub arg 13 (String.length arg - 13)), List.rev_append acc rest)
+      | arg :: rest -> go (arg :: acc) rest
+      | [] -> (None, List.rev acc)
+    in
+    go [] given
+  in
+  let path =
+    match (chosen, Sys.getenv_opt "QUIVERFILE") with
+    | Some path, _ | None, Some path -> Some path
+    | None, None -> if Sys.file_exists "quiverfile.yaml" then Some "quiverfile.yaml" else None
+  in
+  let settled =
+    match (path, argv) with
+    | None, _ | _, ([] | [ _ ]) -> Ok (argv, [])
+    | Some path, program :: command :: rest -> (
+        let read =
+          match In_channel.with_open_bin path In_channel.input_all with
+          | text -> Ok text
+          | exception Sys_error message -> Error message
+        in
+        match read with
+        | Error message -> Error ("quiverfile: " ^ message)
+        | Ok text -> (
+            match
+              Quiver_quiverfile.Quiverfile.of_string ~file:path
+                ~commands:(List.map Cmdliner.Cmd.name commands)
+                ~scoped:[ "database" ] text
+            with
+            | Error (`Quiverfile error) ->
+                Error
+                  ("quiverfile " ^ path ^ ": "
+                  ^
+                  match error with
+                  | Unreadable message -> message
+                  | Not_settings where -> where ^ " is not a map of options and commands"
+                  | Unusable name -> name ^ " takes a value or a list of values"
+                  | Scoped name ->
+                      name ^ " means different things to different commands: put it under the command's name")
+            | Ok file ->
+                Format.eprintf "quiver: settings from %s@." path;
+                Base.List.fold_result (Quiver_quiverfile.Quiverfile.settings file ~command)
+                  ~init:(program :: command :: rest, []) ~f:(fun (argv, variables) (name, value) ->
+                    match (Hashtbl.find_opt options name, value) with
+                    | None, _ -> Error ("quiverfile " ^ path ^ ": quiver has no option --" ^ name)
+                    | Some (_, variable), Text text -> Ok (argv, (variable, text) :: variables)
+                    | Some (names, _), Texts texts ->
+                        let spelled name = if String.length name = 1 then "-" ^ name else "--" ^ name in
+                        let mentioned arg =
+                          List.exists
+                            (fun name ->
+                              String.equal arg (spelled name) || String.starts_with ~prefix:(spelled name ^ "=") arg
+                              || (String.length name = 1 && String.starts_with ~prefix:(spelled name) arg))
+                            names
+                        in
+                        if List.exists mentioned argv then Ok (argv, variables)
+                        else Ok (argv @ List.map (fun text -> "--" ^ name ^ "=" ^ text) texts, variables))))
+  in
+  match settled with
+  | Error message -> exit (told message)
+  | Ok (argv, variables) ->
+      let code =
+        Cmdliner.Cmd.eval' ~argv:(Array.of_list argv)
+           ~env:(fun variable ->
+             match Sys.getenv_opt variable with
+             | Some text -> Some text
+             | None -> List.assoc_opt variable variables)
+           (Cmdliner.Cmd.group
+              (Cmdliner.Cmd.info "quiver" ~version:Version.number
+                 ~doc:"Parallel consistent logical database dumper"
+                 ~man:
+                   [
+                     `S "QUIVERFILE";
+                     `P
+                       "Defaults for any option can live in a YAML file: $(b,--quiverfile) FILE (before or after the \
+                        command), the $(b,QUIVERFILE) variable, or $(b,quiverfile.yaml) in the current directory. \
+                        Keys are long option names; those at the top hold for every command, those under a \
+                        command's name ($(b,dump:), $(b,copy:), …) for it alone; a list gives an option once per \
+                        item. The command line and each option's environment variable win over the file.";
+                   ])
+              commands)
+      in
+      if code = Cmdliner.Cmd.Exit.cli_error && not (List.is_empty variables) then
+        Option.iter
+          (fun path -> Format.eprintf "quiver: the values in %s are read as the QUIVER_* variables they name@." path)
+          path;
+      exit code

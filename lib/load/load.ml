@@ -412,7 +412,7 @@ let run config ~dir target ~keys ~binlog ~threads =
               match keys with
               | With_table -> statement
               | After_data -> (
-                  let { Deferred_keys.create; later; foreign } =
+                  let { Deferred_keys.create; later; foreign; _ } =
                     Deferred_keys.split All_keys table statement
                   in
                   match later @ foreign with

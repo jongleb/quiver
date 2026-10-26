@@ -490,6 +490,15 @@ let localized =
       let manifest =
         Quiver_core.Manifest.make ~level:(Any Snapshot) ~format:Sql
           ~position:`Null ~threads:{ sessions = 1; readers = 1; peak = 1; renderers = 1 }
+          ~phases:
+            {
+              connected = Core.Time_ns.Span.zero;
+              planned = Core.Time_ns.Span.zero;
+              snapshot = Core.Time_ns.Span.zero;
+              first_part = None;
+              read = Core.Time_ns.Span.zero;
+              committed = Core.Time_ns.Span.zero;
+            }
           ~schema:(Support.get_ok (Quiver_core.Schema.make tables))
           interleaved
       in

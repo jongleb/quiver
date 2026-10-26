@@ -18,12 +18,19 @@ type error =
   | Pointer of int  (** A node pointer disagrees with the child it names. *)
   | Lob of int  (** A column stored off the record, on this page, is malformed. *)
   | Space of string  (** Extent and segment bookkeeping disagrees with the pages used. *)
+  | Duplicate of int  (** A [UNIQUE] key repeats on this page. *)
+  | Entries of int  (** The index with this id holds another number of records than the table's rows. *)
 [@@deriving sexp_of ~portable]
 
 type t = private { pages : int; rows : int }
-(** A file that passed: its length in pages and the rows of its index. *)
+(** A file that passed: its length in pages and the rows of its clustered index. *)
 
 val tablespace :
-  Layout.t -> pages:int -> read:(int -> Bytes.t) -> (t, [> `Check of error ]) result
+  Layout.t ->
+  secondary:Layout.t list ->
+  pages:int ->
+  read:(int -> Bytes.t) @ portable ->
+  (t, [> `Check of error ]) result
   @@ portable
+(** The clustered index and the [secondary] ones, each with a record per row. *)
 (** [read n] is page [n] of the file, zeros if never written. *)

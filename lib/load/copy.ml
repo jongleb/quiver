@@ -1,6 +1,7 @@
 open Base.Result.Let_syntax
 
-type need = Mysql_8_4 | Skipped_binlog | Local_datadir of string [@@deriving sexp_of ~portable]
+type need = Mysql_8_4 | Skipped_binlog | Local_datadir of string | Sort_directory of string
+[@@deriving sexp_of ~portable]
 
 type error =
   | Unreachable of Load.cause
@@ -18,7 +19,14 @@ type error =
   | Mismatched_render
 [@@deriving sexp_of ~portable]
 
-type ingest = Load_data | Tablespaces of { datadir : string option }
+type tablespaces = {
+  datadir : string option;
+  builder : Physical.builder;
+  sorting : string option;
+  threads : int option;
+}
+
+type ingest = Load_data | Tablespaces of tablespaces
 
 (** Rows of a batch kept out of [LOAD DATA]: a JSON number in them the server
     would misread from text, so an [INSERT] sets it apart ({!Quiver_sink.Json_numbers}). *)
@@ -49,11 +57,27 @@ type renderer =
   | Images of { space : Quiver_innodb.Tablespace.t; table : Quiver_core.Schema.Name.t }
 
 (** Whether a built table reached the server. *)
-type progress = Pending | Imported of { importing : Core.Time_ns.Span.t; keys : Core.Time_ns.Span.t }
+type imported = {
+  preparing : Core.Time_ns.Span.t;
+  queued : Core.Time_ns.Span.t;
+  checking : Core.Time_ns.Span.t;
+  importing : Core.Time_ns.Span.t;
+  keys : Core.Time_ns.Span.t;
+}
+
+type progress = Pending | Imported of imported
 
 type way =
-  | Imported of { importing : Core.Time_ns.Span.t; keys : Core.Time_ns.Span.t }
+  | Imported of imported
   | Loaded of Physical.unsuitable
+
+type finishing =
+  | Unfinished
+  | Finished of {
+      built : Core.Time_ns.Span.t;
+      foreign_keys : Core.Time_ns.Span.t;
+      objects : Core.Time_ns.Span.t;
+    }
 
 type built = {
   physical : Physical.table;
@@ -64,13 +88,20 @@ type built = {
   finished : Quiver_innodb.Tablespace.finished list Portable.Atomic.t;
   sent : int Portable.Atomic.t;  (** Rows of its closed parts. *)
   progress : progress Portable.Atomic.t;
+  preparing : Core.Time_ns.Span.t;  (** Creating its empty table and exporting the template. *)
 }
 (** A table built as a tablespace. *)
 
 (** Where tables go. *)
 type mode =
   | Plain
-  | Physical_at of { datadir : string; collations : (int * Quiver_innodb.Layout.charset) list }
+  | Physical_at of {
+      datadir : string;
+      collations : (int * Quiver_innodb.Layout.charset) list;
+      builder : Physical.builder;
+      sorting : string option;
+      threads : int;
+    }
       (** The data directory as this machine sees it, and the server's collations of the character sets stored. *)
 
 type deferred = {
@@ -108,6 +139,12 @@ type t = {
   increments : Load.increments;
   turns : (Quiver_core.Schema.Name.t, Await.Await.Semaphore.t) Portable_lockfree_htbl.t;
       (** Tables loaded one part at a time, each part waiting for its turn. *)
+  finishing : finishing Portable.Atomic.t;
+  declared :
+    (Quiver_core.Schema.Name.t, (unit, error) result Await.Await.Ivar.t) Portable_lockfree_htbl.t;
+      (** Each table once it is created or prepared, on a thread of its own. *)
+  declaring : (unit, error) result Await.Await.Ivar.t list Portable.Atomic.t;
+  broken : error option Portable.Atomic.t;  (** The first table that could not be declared. *)
 }
 
 (** Whether a part waited for its table's turn, given back once its statement ends. *)
@@ -190,7 +227,8 @@ let create config target ~keys ~binlog ~ingest ~sessions =
        let%map mode =
          match ingest with
          | Load_data -> Ok Plain
-         | Tablespaces { datadir } ->
+         | Tablespaces { datadir; builder; sorting; threads } ->
+             let threads = Option.value threads ~default:(Quiver_core.Cores.budget Same_machine) in
              Quiver_core.Guarded.hold control (fun link ->
                  let%bind () =
                    match Quiver_mysql.Link.server link with
@@ -217,6 +255,11 @@ let create config target ~keys ~binlog ~ingest ~sessions =
                    | Ok _ -> Ok ()
                    | Error (`File _) -> Error (Tablespaces_need (Local_datadir datadir))
                  in
+                 let%bind () =
+                   match Option.map Quiver_innodb.File.size sorting with
+                   | None | Some (Ok _) -> Ok ()
+                   | Some (Error (`File _)) -> Error (Tablespaces_need (Sort_directory (Option.get sorting)))
+                 in
                  let%map collations =
                    rejected "SELECT ID, CHARACTER_SET_NAME FROM information_schema.COLLATIONS"
                      (Quiver_mysql.Link.run_query link Text_collations)
@@ -224,6 +267,9 @@ let create config target ~keys ~binlog ~ingest ~sessions =
                  Physical_at
                    {
                      datadir;
+                     builder;
+                     sorting;
+                     threads;
                      collations =
                        List.filter_map
                          (function
@@ -271,9 +317,17 @@ let create config target ~keys ~binlog ~ingest ~sessions =
              fallbacks = Portable.Atomic.make [];
              increments;
              turns = Portable_lockfree_htbl.create (module Quiver_core.Schema.Name);
+             finishing = Portable.Atomic.make Unfinished;
+             declared = Portable_lockfree_htbl.create (module Quiver_core.Schema.Name);
+             declaring = Portable.Atomic.make [];
+             broken = Portable.Atomic.make None;
            })
 
 let shutdown t =
+  List.iter
+    (fun declared ->
+      match Await.Await.Ivar.read Quiver_core.Blocking.await declared with Ok () | Error _ -> ())
+    (Portable.Atomic.get t.declaring);
   List.iter
     (fun built ->
       match Portable.Atomic.get built.progress with
@@ -290,12 +344,13 @@ let ways t =
   List.filter_map
     (fun built ->
       match Portable.Atomic.get built.progress with
-      | Imported { importing; keys } -> Some (built.source, Imported { importing; keys })
+      | Imported imported -> Some (built.source, Imported imported)
       | Pending -> None)
     (Portable.Atomic.get t.builds)
   @ List.rev_map (fun (name, reason) -> (name, Loaded reason)) (Portable.Atomic.get t.fallbacks)
 
 let advice t = t.advice
+let finishing t = Portable.Atomic.get t.finishing
 let format _ = Quiver_core.Output_format.Csv dialect
 
 let database t database ~ddl =
@@ -327,7 +382,7 @@ let table t ({ name; _ } as table : Quiver_core.Schema.Table.t) ~ddl ~parts =
     let deferral : Deferred_keys.deferral =
       match t.keys with With_table -> Foreign_keys | After_data -> All_keys
     in
-    let { Deferred_keys.create; later; foreign } = Deferred_keys.split deferral name.table ddl in
+    let { Deferred_keys.create; later; foreign; _ } = Deferred_keys.split deferral name.table ddl in
     let increments = t.increments in
     let%map sharing =
       on_idle_loader t (fun link ->
@@ -358,13 +413,14 @@ let table t ({ name; _ } as table : Quiver_core.Schema.Table.t) ~ddl ~parts =
              ~data:{ into; later = (first, rest); remaining = Portable.Atomic.make parts })
     | [] | _ :: _ -> ()
   in
-  let physical datadir collations =
-    let { Deferred_keys.create; later; foreign } = Deferred_keys.split All_keys name.table ddl in
+  let physical datadir collations builder sorting threads =
+    let definition = Deferred_keys.split All_keys name.table ddl in
+    let started = Quiver_core.Stopwatch.start () in
     let%bind prepared =
       on_idle_loader t (fun link ->
           Result.map_error
             (fun (#Physical.cause as cause) -> Built { table = name; cause })
-            (Physical.prepare link ~datadir ~collations ~into table ~create))
+            (Physical.prepare link ~datadir ~collations ~into table ~definition ~builder ~sorting ~threads))
     in
     match prepared with
     | Unsuitable reason ->
@@ -376,24 +432,40 @@ let table t ({ name; _ } as table : Quiver_core.Schema.Table.t) ~ddl ~parts =
             physical;
             source = name;
             into;
-            later;
+            later = Deferred_keys.adding name.table (Physical.left physical) @ definition.special;
             remaining = Portable.Atomic.make parts;
             finished = Portable.Atomic.make [];
             sent = Portable.Atomic.make 0;
             progress = Portable.Atomic.make Pending;
+            preparing = Quiver_core.Stopwatch.elapsed started;
           }
         in
         ignore (Portable_lockfree_htbl.set t.built ~key:name ~data:state);
         Portable.Atomic.update t.builds ~pure_f:(fun builds -> state :: builds);
-        remember foreign;
+        remember definition.foreign;
         Ok ()
   in
-  let created =
-    match t.mode with
-    | Physical_at { datadir; collations } when parts > 0 -> physical datadir collations
-    | Physical_at _ | Plain -> plain ()
+  let declared = Await.Await.Ivar.create () in
+  ignore (Portable_lockfree_htbl.set t.declared ~key:name ~data:declared);
+  Portable.Atomic.update t.declaring ~pure_f:(fun declaring -> declared :: declaring);
+  let declare () =
+    let created =
+      match t.mode with
+      | Physical_at { datadir; collations; builder; sorting; threads } when parts > 0 ->
+          physical datadir collations builder sorting threads
+      | Physical_at _ | Plain -> plain ()
+    in
+    Result.iter_error
+      (fun error ->
+        ignore (Portable.Atomic.compare_and_set t.broken ~if_phys_equal_to:None ~replace_with:(Some error)))
+      created;
+    Await.Await.Ivar.fill_if_empty declared created
   in
-  Result.map_error (fun error -> `Sink error) created
+  match Quiver_core.Concurrent.start declare with
+  | Ok _ -> Ok ()
+  | Error (`Concurrent _) ->
+      declare ();
+      Result.map_error (fun error -> `Sink error) (Await.Await.Ivar.read Quiver_core.Blocking.await declared)
 
 let objects t database definitions =
   Result.map_error
@@ -506,6 +578,15 @@ let loading t
            })
 
 let part t (table : Quiver_core.Schema.Table.t) ~index =
+  let declared =
+    Option.fold
+      ~none:
+        (match Portable_lockfree_htbl.find t.declared table.name with
+        | Null -> Ok ()
+        | This declared -> Await.Await.Ivar.read Quiver_core.Blocking.await declared)
+      ~some:Result.error (Portable.Atomic.get t.broken)
+  in
+  let%bind () = Result.map_error (fun error -> `Sink error) declared in
   match Portable_lockfree_htbl.find t.built table.name with
   | Null -> loading t table ~index
   | This state ->
@@ -671,21 +752,30 @@ let close_building (part : building) answer =
       let (_ : int) = Portable.Atomic.fetch_and_add state.sent part.rows in
       match Portable.Atomic.fetch_and_add state.remaining (-1) with
       | 1 ->
-          let imported = Await.Await.Ivar.create () and table = part.table in
+          let imported = Await.Await.Ivar.create () and table = part.table
+          and closed = Quiver_core.Stopwatch.start () in
           Portable.Atomic.update t.building ~pure_f:(fun building -> imported :: building);
           let started =
             Quiver_core.Concurrent.start (fun () ->
                 Await.Await.Ivar.fill_if_empty imported
                   (on_idle_loader t (fun link ->
-                     let started = Quiver_core.Stopwatch.start () in
+                     let queued = Quiver_core.Stopwatch.elapsed closed
+                     and started = Quiver_core.Stopwatch.start () in
+                     let%bind checked =
+                       Result.map_error
+                         (fun (#Physical.cause as cause) -> Built { table; cause })
+                         (Physical.check link state.physical (Portable.Atomic.get state.finished))
+                     in
+                     let checking = Quiver_core.Stopwatch.elapsed started
+                     and imports = Quiver_core.Stopwatch.start () in
                      let%bind built =
                        Result.map_error
                          (fun (#Physical.cause as cause) -> Built { table; cause })
-                         (Physical.import link state.physical (Portable.Atomic.get state.finished))
+                         (Physical.import link checked)
                      in
                      let sent = Portable.Atomic.get state.sent in
                      let%bind () = if built = sent then Ok () else Error (Lost_rows { table; sent; built }) in
-                     let importing = Quiver_core.Stopwatch.elapsed started in
+                     let importing = Quiver_core.Stopwatch.elapsed imports in
                      let keying = Quiver_core.Stopwatch.start () in
                      let%map () =
                        match state.later with
@@ -693,7 +783,14 @@ let close_building (part : building) answer =
                        | first :: rest -> add_keys link state.into (first, rest)
                      in
                      Portable.Atomic.set state.progress
-                       (Imported { importing; keys = Quiver_core.Stopwatch.elapsed keying }))))
+                       (Imported
+                          {
+                            preparing = state.preparing;
+                            queued;
+                            checking;
+                            importing;
+                            keys = Quiver_core.Stopwatch.elapsed keying;
+                          }))))
           in
           let built =
             Result.map_error
@@ -724,13 +821,21 @@ let discard = function Loading loading -> discard_loading loading | Building _ -
 let finish t ~source:_ ~tables:_ ~manifest:_ =
   Result.map_error
     (fun error -> `Sink error)
-    (let%bind () =
+    (let began = Quiver_core.Stopwatch.start () in
+     let%bind () =
+       Base.List.fold_result
+         (List.rev (Portable.Atomic.get t.declaring))
+         ~init:()
+         ~f:(fun () declared -> Await.Await.Ivar.read Quiver_core.Blocking.await declared)
+     in
+     let%bind () =
        Base.List.fold_result
          (List.rev (Portable.Atomic.get t.building))
          ~init:()
          ~f:(fun () added ->
            Await.Await.Ivar.read Quiver_core.Blocking.await added)
      in
+     let built = Quiver_core.Stopwatch.elapsed began and adding = Quiver_core.Stopwatch.start () in
      let%bind () =
        Base.Result.all_unit
          (Quiver_core.Concurrent.spread ~workers:(Iarray.length t.loaders)
@@ -738,14 +843,19 @@ let finish t ~source:_ ~tables:_ ~manifest:_ =
             (fun (into, keys) ->
               on_idle_loader t (fun link -> add_keys link into keys)))
      in
+     let foreign_keys = Quiver_core.Stopwatch.elapsed adding and creating = Quiver_core.Stopwatch.start () in
      let target = t.target and objects = Portable.Atomic.get t.objects in
-     Base.Result.all_unit
-       (Quiver_core.Concurrent.spread ~workers:(Iarray.length t.loaders)
-          (Iarray.of_list objects)
-          (fun (database, scripts) ->
-            on_idle_loader t (fun link ->
-                let%bind () = execute link (Use (Load.renamed target database)) in
-                Base.List.fold_result scripts ~init:()
-                  ~f:(fun () ({ statements; _ } : Quiver_sink.Layout.script) ->
-                    Base.List.fold_result statements ~init:()
-                      ~f:(fun () statement -> run link statement))))))
+     let%map () =
+       Base.Result.all_unit
+         (Quiver_core.Concurrent.spread ~workers:(Iarray.length t.loaders)
+            (Iarray.of_list objects)
+            (fun (database, scripts) ->
+              on_idle_loader t (fun link ->
+                  let%bind () = execute link (Use (Load.renamed target database)) in
+                  Base.List.fold_result scripts ~init:()
+                    ~f:(fun () ({ statements; _ } : Quiver_sink.Layout.script) ->
+                      Base.List.fold_result statements ~init:()
+                        ~f:(fun () statement -> run link statement)))))
+     in
+     Portable.Atomic.set t.finishing
+       (Finished { built; foreign_keys; objects = Quiver_core.Stopwatch.elapsed creating }))

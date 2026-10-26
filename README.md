@@ -287,14 +287,22 @@ quiver copy -B shop --to-database shop_copy --ingest tablespace --binlog skip
 wait on that table's index latch. With `--ingest tablespace`, quiver builds the clustered index
 itself.
 
-1. The target creates the table under a name of quiver's, with its primary key alone.
+1. The target creates the table under a name of quiver's, with its primary key and the secondary
+   keys quiver can build.
 2. `FLUSH TABLES … FOR EXPORT` gives quiver the server's own empty tablespace and `.cfg` file as a
    template.
-3. Renderers turn batches into InnoDB records, and runs of each table fill pages on threads of
-   their own.
+3. Renderers turn batches into InnoDB records of every index. Runs of each table fill clustered
+   pages on threads of their own, and sort their secondary records into a scratch file.
+   When the table's last part closes, each secondary index is merged by key ranges on several
+   threads.
 4. Before the server sees the file, quiver checks it the way `IMPORT` and the server read it.
-5. `IMPORT TABLESPACE` takes the file. quiver checks the row count, renames the table and adds
-   its secondary keys.
+5. `IMPORT TABLESPACE` takes the file. quiver checks the row count and any warning, renames the
+   table and has the server add the secondary keys it did not build.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/keys-dark.svg">
+  <img src="assets/keys.svg" alt="quiver 1.3.2: parts, .ibd and Check, IMPORT of one tree, then the server's ALTER TABLE ADD KEY scans, sorts and loads each index. quiver 1.3.3: parts give records of every index on the renderers, each part is sorted on a thread by a 14-byte key prefix into a scratch file, each index is merged by ranges of key prefixes over several threads, Check walks every tree and checks entries and UNIQUE keys, then IMPORT takes all indexes. Keys over collated text, floats or DESC columns, of a table without a primary key, SPATIAL and FULLTEXT stay with ALTER. After the last part of a 10 M-row table with three keys on a laptop: 1.3.2 check 2.1 s, import 1.5 s, ALTER 7.4 s, 11.0 s; 1.3.3 merge 1.6 s, check 3.2 s, import 3.8 s, 8.6 s; the other pair 11.1 s and 9.9 s; the whole copy within noise on the laptop" width="100%">
+</picture>
 
 - **Types.** Every type a dump reads is stored, including JSON in the server's binary form and
   columns too long for their page (LOB pages). Text in `utf8mb4`, `utf8mb3` and `latin1` is
@@ -305,13 +313,21 @@ itself.
   stored in the order the source sorted them, and the target checks that order in its own
   collation when it imports the table: a table out of order is refused, not stored. A table without a primary key works too; its
   hidden row ids are numbered by quiver.
-- **Checks.** Each stored field is compared byte for byte with records the server wrote itself.
+- **Secondary keys.** quiver builds keys over integers, dates and times, decimals and binary
+  strings (prefixes too) into the file, and checks `UNIQUE` keys itself, since `IMPORT` does
+  not. Keys over text in a collation, floats or `DESC` columns, keys of a table without a primary
+  key, `SPATIAL` and `FULLTEXT` keys are added by the server after the import, in their places,
+  so `SHOW CREATE TABLE` matches the source. `--tablespace-keys server` leaves them all to the
+  server.
+- **Checks.** Each stored field and every secondary index record is compared byte for byte with
+  records the server wrote itself.
 - **Fallback.** A table the writer cannot build goes through `LOAD DATA`, and quiver says why.
   Partitions and other character sets are such cases. At the end, quiver sums up rows and bytes
   by way and by reason, and times each table's import and secondary keys.
-- **What it saves.** Only the writing of rows gets faster. Secondary keys are still built by the
-  server after the import, and tables that fall back load as before. On a schema where those
-  dominate, the whole copy speeds up much less.
+- **What it saves.** Writing rows and building byte-ordered keys moves to the client's cores; the
+  import then has more pages to take. Tables that fall back load as before.
+- **Settings.** `--tablespace-keys quiver|server`, `--sort-dir` (where sorted secondary records
+  wait; beside the file by default), `--build-threads` (threads merging a table's indexes).
 - **Requirements.** MySQL 8.4 or Percona Server 8.4, and the target's data directory on the same
   machine (`--datadir` if quiver sees it under another path).
 - **Binlog.** `--binlog skip` is required: an import writes no rows to the binlog, so replicas
@@ -358,6 +374,30 @@ quiver dump -h 127.0.0.1 -o ./dump                                 # local serve
   socket, MariaDB `unix_socket`.
 - TLS against system roots by default, your CA with `--tls-ca`, or a pinned certificate with
   `--tls-fingerprint`. `--connect-timeout` bounds connecting, `--net-timeout` bounds silence.
+
+### Settings in a quiverfile
+
+```yaml
+# quiverfile.yaml
+socket: /var/run/mysqld/mysqld.sock     # every command
+to-socket: /var/run/mysqld/mysqld.sock
+
+copy:                                   # quiver copy alone
+  database: shop
+  to-database: shop_copy
+  threads: 8
+  ingest: tablespace
+  binlog: skip
+  data-table: [shop.orders, shop.items]
+```
+
+Any option can live in a YAML file, under its long name. Options at the top hold for every
+command; those under a command's name hold for it alone, and a list gives the option once per
+item. quiver reads `--quiverfile FILE`, else the file in `QUIVERFILE`, else `quiverfile.yaml` in
+the current directory, and says which. The command line wins over the environment, and both win
+over the file: each option also reads `QUIVER_<NAME>` (`QUIVER_THREADS`, `QUIVER_TO_HOST`, …).
+An unknown key is an error, as is a key whose meaning differs between commands (`database`) at
+the top. See [quiverfile.example.yaml](quiverfile.example.yaml).
 
 ## Across the network
 
@@ -478,6 +518,6 @@ Run `quiver <command> --help` for every option.
 quiver is free software under the [GNU Affero General Public License v3.0](LICENSE) or any later
 version. You may use, change and share it. If you distribute a modified quiver, or run one as a
 service that others reach over a network, you must offer them its source under the same licence.
-The vendored zmij (`vendor/zmij`, MIT) and xxHash (`vendor/xxhash`, BSD-2-Clause) keep their own
-licences. Release binaries also carry OpenSSL (Apache-2.0) and zstd (BSD-3-Clause), whose
+The vendored zmij (`vendor/zmij`, MIT), xxHash (`vendor/xxhash`, BSD-2-Clause) and YAMLx
+(`vendor/yamlx`, AGPL-3.0-only) keep their own licences. Release binaries also carry OpenSSL (Apache-2.0) and zstd (BSD-3-Clause), whose
 licences ship next to the binary in `licenses/`.

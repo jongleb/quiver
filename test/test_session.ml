@@ -672,6 +672,15 @@ let property
     Manifest.yojson_of_t
       (Manifest.make ~level:(Any Best_effort) ~format:Sql ~position:`Null
          ~threads:{ sessions = 1; readers = 1; peak = 1; renderers = 1 }
+          ~phases:
+            {
+              connected = Core.Time_ns.Span.zero;
+              planned = Core.Time_ns.Span.zero;
+              snapshot = Core.Time_ns.Span.zero;
+              first_part = None;
+              read = Core.Time_ns.Span.zero;
+              committed = Core.Time_ns.Span.zero;
+            }
          ~schema:(Support.get_ok (Schema.make schema))
          (Base.List.concat_mapi tables ~f:(fun n parts ->
               Base.List.filter_mapi parts ~f:(fun index _ ->

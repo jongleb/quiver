@@ -28,6 +28,7 @@ let () =
       ("width", Test_width.tests);
       ("encoding", Test_encoding.tests);
       ("deferred keys", Test_deferred_keys.tests);
+      ("quiverfile", Test_quiverfile.tests);
       ("moment", Test_moment.tests);
       ("assembly", Test_assembly.tests);
       ("concurrency", Test_concurrency.tests);

@@ -15,6 +15,8 @@ type error =
   | Pointer of int
   | Lob of int
   | Space of string
+  | Duplicate of int
+  | Entries of int
 [@@deriving sexp_of ~portable]
 
 type t = { pages : int; rows : int }
@@ -24,12 +26,15 @@ let group = 16384
 (** Which list of the space or of a segment an extent belongs to. *)
 type list_kind = Free | Free_frag | Full_frag | Segment_free | Not_full | Full
 
-let tablespace (layout : Layout.t) ~pages ~read =
-  let fail error = Error (`Check error) in
+(** A key as a node pointer holds it: the NULL bits of its fields, the lengths of its variable
+    fields, then its bytes. *)
+type key = { nulls : string; lengths : string; data : string }
+
+let tablespace (clustered : Layout.t) ~(secondary : Layout.t list) ~pages ~read =
+  let fail error = Error error in
   let u8 bytes at = Bytes.get_uint8 bytes at in
   let u16 bytes at = Bytes.get_uint16_be bytes at in
   let u32 bytes at = Int32.to_int (Bytes.get_int32_be bytes at) land 0xFFFF_FFFF in
-  let fields = Array.of_list layout.fields in
   let page n =
     if n < 0 || n >= pages then fail (Number n)
     else
@@ -45,7 +50,6 @@ let tablespace (layout : Layout.t) ~pages ~read =
   let%bind header = page 0 in
   let size = u32 header 46 in
   let%bind () = if size = pages then Ok () else fail (Size (pages * Page.size)) in
-  let%bind root = page layout.root in
   let used = Hashtbl.create 1024 in
   List.iter (fun n -> Hashtbl.replace used n ()) [ 0; 1; 2; 3 ];
   Base.Fn.apply_n_times ~n:((size + group - 1) / group)
@@ -56,143 +60,8 @@ let tablespace (layout : Layout.t) ~pages ~read =
       g + 1)
     0
   |> ignore;
-  let leaf_sizes bytes n origin =
-    let rec go j lengths data =
-      if j = Array.length fields then Ok (origin - 5 - (lengths + 1), data)
-      else
-        let field = fields.(j) in
-        let null =
-          match field.nullability with
-          | Not_null -> 0
-          | Null_bit bit -> u8 bytes (origin - 6 - (bit / 8)) land (1 lsl (bit mod 8))
-        in
-        if null <> 0 then go (j + 1) lengths data
-        else
-          match Layout.length field.storage with
-          | Varying _ when lengths < 120 -> fail (Records n)
-          | Varying { big } ->
-              let first = u8 bytes lengths in
-              if big && first land 0x80 <> 0 then
-                let length = ((first land 0x3F) lsl 8) lor u8 bytes (lengths - 1) in
-                if lengths < 121 || (first land 0x40 <> 0 && length <> 20) then fail (Records n)
-                else go (j + 1) (lengths - 2) (data + length)
-              else go (j + 1) (lengths - 1) (data + first)
-          | Fixed size -> go (j + 1) lengths (data + size)
-    in
-    go 0 (origin - 6 - layout.null_bytes) 0
-  in
-  let key_span bytes n origin =
-    let header = origin - 5 - layout.null_bytes in
-    let rec go j at data =
-      if j = layout.key then Ok (header - at, data)
-      else
-        match Layout.length fields.(j).storage with
-        | Fixed size -> go (j + 1) at (data + size)
-        | Varying _ when at <= 120 -> fail (Records n)
-        | Varying { big } ->
-            let first = u8 bytes (at - 1) in
-            if big && first land 0x80 <> 0 then
-              if first land 0x40 <> 0 || at <= 121 then fail (Records n)
-              else go (j + 1) (at - 2) (data + (((first land 0x3F) lsl 8) lor u8 bytes (at - 2)))
-            else go (j + 1) (at - 1) (data + first)
-    in
-    go 0 header 0
-  in
-  let key_at bytes n origin =
-    let%map lengths, data = key_span bytes n origin in
-    (Bytes.sub_string bytes (origin - 5 - layout.null_bytes - lengths) lengths, Bytes.sub_string bytes origin data)
-  in
-  let node_sizes bytes n origin =
-    let rec zero k =
-      if k = layout.null_bytes then
-        let%map lengths, data = key_span bytes n origin in
-        (layout.null_bytes + lengths, data + 4)
-      else if u8 bytes (origin - 6 - k) = 0 then zero (k + 1)
-      else fail (Records n)
-    in
-    zero 0
-  in
-  let records bytes n ~level ~leftmost =
-    let count = u16 bytes 54 and top = u16 bytes 40 in
-    let%bind () =
-      if
-        u16 bytes 42 = 0x8000 lor (2 + count)
-        && top >= 120
-        && top <= Page.size - 8 - (2 * u16 bytes 38)
-        && Bytes.sub_string bytes 99 8 = "infimum\000"
-        && Bytes.sub_string bytes 112 8 = "supremum"
-        && u16 bytes 95 = 2
-        && u16 bytes 110 = 0
-        && u16 bytes 108 = (1 lsl 3) lor 3
-      then Ok ()
-      else fail (Records n)
-    in
-    let rec walk origin k stop acc =
-      let next = (origin + u16 bytes (origin - 2)) land 0xFFFF in
-      if next = 112 then if k = count && stop = top then Ok (List.rev acc) else fail (Records n)
-      else if k >= count || next < 125 || next >= top then fail (Records n)
-      else
-        let status = u16 bytes (next - 4) in
-        let info = u8 bytes (next - 5) lsr 4 in
-        let expected = if level = 0 then 0 else 1 in
-        let%bind () =
-          if status lsr 3 = 2 + k && status land 7 = expected then Ok () else fail (Records n)
-        in
-        let%bind () =
-          match (info, level > 0 && leftmost && k = 0) with
-          | 0, false | 1, true -> Ok ()
-          | _ -> fail (Leftmost n)
-        in
-        let%bind extra, data = if level = 0 then leaf_sizes bytes n next else node_sizes bytes n next in
-        let start = next - 5 - extra and finish = next + data in
-        if start < stop || finish > top then fail (Records n)
-        else walk next (k + 1) finish (next :: acc)
-    in
-    walk 99 0 120 []
-  in
-  let directory bytes n origins =
-    let slots = u16 bytes 38 in
-    let slot s = u16 bytes (Page.size - 8 - (2 * (s + 1))) in
-    let owned origin = u8 bytes (origin - 5) land 0x0F in
-    let rec go list s pending =
-      match list with
-      | [] -> if s = slots then Ok () else fail (Directory n)
-      | origin :: rest ->
-          let pending = pending + 1 in
-          if s < slots && slot s = origin then
-            let low = if s = 0 then 1 else if s = slots - 1 then 1 else 4 in
-            let high = if s = 0 then 1 else 8 in
-            if owned origin = pending && pending >= low && pending <= high then go rest (s + 1) 0
-            else fail (Directory n)
-          else if owned origin = 0 then go rest s pending
-          else fail (Directory n)
-    in
-    if slots < 2 then fail (Directory n) else go ((99 :: origins) @ [ 112 ]) 0 0
-  in
-  let references bytes origin =
-    let rec go j lengths data acc =
-      if j = Array.length fields then acc
-      else
-        let field = fields.(j) in
-        let null =
-          match field.nullability with
-          | Not_null -> 0
-          | Null_bit bit -> u8 bytes (origin - 6 - (bit / 8)) land (1 lsl (bit mod 8))
-        in
-        if null <> 0 then go (j + 1) lengths data acc
-        else
-          match Layout.length field.storage with
-          | Varying { big } ->
-              let first = u8 bytes lengths in
-              if big && first land 0x80 <> 0 then
-                let length = ((first land 0x3F) lsl 8) lor u8 bytes (lengths - 1) in
-                let acc = if first land 0x40 <> 0 then (origin + data) :: acc else acc in
-                go (j + 1) (lengths - 2) (data + length) acc
-              else go (j + 1) (lengths - 1) (data + first) acc
-          | Fixed size -> go (j + 1) lengths (data + size) acc
-    in
-    go 0 (origin - 6 - layout.null_bytes) 0 []
-  in
+  let%bind clustered_root = page clustered.root in
+  let space = u32 clustered_root 34 in
   let lobs = Hashtbl.create 64 in
   let claim n =
     if Hashtbl.mem used n then fail (Lob n)
@@ -201,7 +70,6 @@ let tablespace (layout : Layout.t) ~pages ~read =
       Hashtbl.replace lobs n ();
       Ok ())
   in
-  let space = u32 root 34 in
   let lob bytes at n =
     let first_no = u32 bytes (at + 4) and length = u32 bytes (at + 16) in
     let%bind () =
@@ -265,85 +133,315 @@ let tablespace (layout : Layout.t) ~pages ~read =
     let%bind (_ : int) = walk 80 0 ~entry:(fun _ _ _ total -> Ok total) in
     if total = length && Hashtbl.length seen = 10 + (272 * List.length index) then Ok () else fail (Lob first_no)
   in
-  let tree = Hashtbl.create 1024 in
-  let rec level height numbers expected last rows =
-    let numbers = Array.of_list numbers in
-    let%bind children, last, rows =
-      Base.List.fold_result (List.init (Array.length numbers) Fun.id) ~init:([], last, rows)
-        ~f:(fun (children, last, rows) j ->
-          let n = numbers.(j) in
-          let%bind bytes = if n = layout.root then Ok root else page n in
-          let%bind () =
-            if Hashtbl.mem tree n then fail (Links n)
-            else (
-              Hashtbl.replace tree n height;
-              Hashtbl.replace used n ();
-              Ok ())
-          in
-          let%bind () =
-            if u16 bytes 24 = 17855 && Int64.to_int (Bytes.get_int64_be bytes 66) = layout.index then Ok ()
-            else fail (Not_index n)
-          in
-          let%bind () = if u16 bytes 64 = height then Ok () else fail (Level n) in
-          let prev = if j > 0 then numbers.(j - 1) else Page.null in
-          let next = if j + 1 < Array.length numbers then numbers.(j + 1) else Page.null in
-          let%bind () = if u32 bytes 8 = prev && u32 bytes 12 = next then Ok () else fail (Links n) in
-          let%bind origins = records bytes n ~level:height ~leftmost:(j = 0) in
-          let%bind () = directory bytes n origins in
-          let%bind () =
-            match (origins, height, Array.length numbers) with
-            | [], 0, 1 when n = layout.root -> Ok ()
-            | [], _, _ -> fail (Empty n)
-            | _ -> Ok ()
-          in
-          let%bind keys = Base.Result.all (List.map (fun origin -> key_at bytes n origin) origins) in
-          let%bind () =
-            match (expected, keys) with
-            | Some expected, first :: _ when expected.(j) <> first -> fail (Pointer n)
-            | _ -> Ok ()
-          in
-          let%bind last =
-            Base.List.fold_result keys ~init:last ~f:(fun last key ->
-                match last with
-                | Some (_, previous) when layout.order = Bytes_order && String.compare previous (snd key) >= 0 ->
-                    fail (Order n)
-                | _ -> Ok (Some key))
-          in
-          let children =
-            if height = 0 then children
-            else
-              List.rev_append
-                (List.map2 (fun origin ((_, data) as key) -> (u32 bytes (origin + String.length data), key)) origins keys)
-                children
-          in
-          let rows = if height = 0 then rows + List.length origins else rows in
-          let%bind () =
-            if height > 0 then Ok ()
-            else
-              Base.List.fold_result origins ~init:() ~f:(fun () origin ->
-                  Base.List.fold_result (references bytes origin) ~init:() ~f:(fun () at -> lob bytes at n))
-          in
-          Ok (children, last, rows))
+  let index (layout : Layout.t) ~lob =
+    let tree = Hashtbl.create 1024 in
+    let fields = Array.of_list layout.fields in
+    let mask = Bytes.make layout.null_bytes '\000' in
+    Array.iteri
+      (fun j (field : Layout.field) ->
+        match field.nullability with
+        | Null_bit bit when j < layout.key ->
+            let k = layout.null_bytes - 1 - (bit / 8) in
+            Bytes.set_uint8 mask k (Bytes.get_uint8 mask k lor (1 lsl (bit mod 8)))
+        | Null_bit _ | Not_null -> ())
+      fields;
+    let is_null bytes origin (field : Layout.field) =
+      match field.nullability with
+      | Not_null -> false
+      | Null_bit bit -> u8 bytes (origin - 6 - (bit / 8)) land (1 lsl (bit mod 8)) <> 0
     in
-    if height = 0 then Ok rows
-    else
-      let children = List.rev children in
-      let expected = Array.of_list (List.map snd children) in
-      let%bind () =
-        Base.List.fold_result children ~init:() ~f:(fun () (child, _) ->
-            if child < pages then Ok () else fail (Pointer child))
+    let leaf_sizes bytes n origin =
+      let rec go j lengths data =
+        if j = Array.length fields then Ok (origin - 5 - (lengths + 1), data)
+        else
+          let field = fields.(j) in
+          if is_null bytes origin field then go (j + 1) lengths data
+          else
+            match Layout.length field.storage with
+            | Varying _ when lengths < 120 -> fail (Records n)
+            | Varying { big } ->
+                let first = u8 bytes lengths in
+                if big && first land 0x80 <> 0 then
+                  let length = ((first land 0x3F) lsl 8) lor u8 bytes (lengths - 1) in
+                  if lengths < 121 || (first land 0x40 <> 0 && length <> 20) then fail (Records n)
+                  else go (j + 1) (lengths - 2) (data + length)
+                else go (j + 1) (lengths - 1) (data + first)
+            | Fixed size -> go (j + 1) lengths (data + size)
       in
-      ignore last;
-      level (height - 1) (List.map fst children) (Some expected) None rows
+      go 0 (origin - 6 - layout.null_bytes) 0
+    in
+    let key_span bytes n origin =
+      let header = origin - 5 - layout.null_bytes in
+      let rec go j at data =
+        if j = layout.key then Ok (header - at, data)
+        else if is_null bytes origin fields.(j) then go (j + 1) at data
+        else
+          match Layout.length fields.(j).storage with
+          | Fixed size -> go (j + 1) at (data + size)
+          | Varying _ when at <= 120 -> fail (Records n)
+          | Varying { big } ->
+              let first = u8 bytes (at - 1) in
+              if big && first land 0x80 <> 0 then
+                if first land 0x40 <> 0 || at <= 121 then fail (Records n)
+                else go (j + 1) (at - 2) (data + (((first land 0x3F) lsl 8) lor u8 bytes (at - 2)))
+              else go (j + 1) (at - 1) (data + first)
+      in
+      go 0 header 0
+    in
+    let key_at bytes n origin =
+      let%map lengths, data = key_span bytes n origin in
+      let nulls =
+        String.init layout.null_bytes (fun k ->
+            Char.chr (u8 bytes (origin - 5 - layout.null_bytes + k) land Bytes.get_uint8 mask k))
+      in
+      {
+        nulls;
+        lengths = Bytes.sub_string bytes (origin - 5 - layout.null_bytes - lengths) lengths;
+        data = Bytes.sub_string bytes origin data;
+      }
+    in
+    let node_sizes bytes n origin =
+      let rec bits k =
+        if k = layout.null_bytes then
+          let%map lengths, data = key_span bytes n origin in
+          (layout.null_bytes + lengths, data + 4)
+        else if u8 bytes (origin - 5 - layout.null_bytes + k) land lnot (Bytes.get_uint8 mask k) = 0 then bits (k + 1)
+        else fail (Records n)
+      in
+      bits 0
+    in
+    let compare_records ~upto (a, oa) (b, ob) =
+      let rec bytes x y size k =
+        if k = size then 0
+        else
+          let c = Int.compare (u8 a (x + k)) (u8 b (y + k)) in
+          if c <> 0 then c else bytes x y size (k + 1)
+      in
+      let length s at big =
+        let first = u8 s at in
+        if big && first land 0x80 <> 0 then (((first land 0x3F) lsl 8) lor u8 s (at - 1), 2) else (first, 1)
+      in
+      let rec go j la lb da db =
+        if j = upto then 0
+        else
+          let field = fields.(j) in
+          match (is_null a oa field, is_null b ob field) with
+          | true, true -> go (j + 1) la lb da db
+          | true, false -> -1
+          | false, true -> 1
+          | false, false -> (
+              match Layout.length field.storage with
+              | Fixed size ->
+                  let c = bytes (oa + da) (ob + db) size 0 in
+                  if c <> 0 then c else go (j + 1) la lb (da + size) (db + size)
+              | Varying { big } ->
+                  let na, used_a = length a la big and nb, used_b = length b lb big in
+                  let c = bytes (oa + da) (ob + db) (Int.min na nb) 0 in
+                  if c <> 0 then c
+                  else
+                    let c = Int.compare na nb in
+                    if c <> 0 then c else go (j + 1) (la - used_a) (lb - used_b) (da + na) (db + nb))
+      in
+      go 0 (oa - 6 - layout.null_bytes) (ob - 6 - layout.null_bytes) 0 0
+    in
+    let has_null ~upto (bytes, origin) = Base.Array.existsi fields ~f:(fun j field -> j < upto && is_null bytes origin field) in
+    let in_order n last record =
+      match (layout.order, last) with
+      | _, None | Source_order, Some _ -> Ok ()
+      | (Bytes_order | Fields_order), Some previous -> (
+          if compare_records ~upto:layout.key previous record >= 0 then fail (Order n)
+          else
+            match layout.distinct with
+            | Leading upto when compare_records ~upto previous record = 0 && not (has_null ~upto record) -> fail (Duplicate n)
+            | Leading _ | Key -> Ok ())
+    in
+    let records bytes n ~level ~leftmost =
+      let count = u16 bytes 54 and top = u16 bytes 40 in
+      let%bind () =
+        if
+          u16 bytes 42 = 0x8000 lor (2 + count)
+          && top >= 120
+          && top <= Page.size - 8 - (2 * u16 bytes 38)
+          && Bytes.sub_string bytes 99 8 = "infimum\000"
+          && Bytes.sub_string bytes 112 8 = "supremum"
+          && u16 bytes 95 = 2
+          && u16 bytes 110 = 0
+          && u16 bytes 108 = (1 lsl 3) lor 3
+        then Ok ()
+        else fail (Records n)
+      in
+      let rec walk origin k stop acc =
+        let next = (origin + u16 bytes (origin - 2)) land 0xFFFF in
+        if next = 112 then if k = count && stop = top then Ok (List.rev acc) else fail (Records n)
+        else if k >= count || next < 125 || next >= top then fail (Records n)
+        else
+          let status = u16 bytes (next - 4) in
+          let info = u8 bytes (next - 5) lsr 4 in
+          let expected = if level = 0 then 0 else 1 in
+          let%bind () =
+            if status lsr 3 = 2 + k && status land 7 = expected then Ok () else fail (Records n)
+          in
+          let%bind () =
+            match (info, level > 0 && leftmost && k = 0) with
+            | 0, false | 1, true -> Ok ()
+            | _ -> fail (Leftmost n)
+          in
+          let%bind extra, data = if level = 0 then leaf_sizes bytes n next else node_sizes bytes n next in
+          let start = next - 5 - extra and finish = next + data in
+          if start < stop || finish > top then fail (Records n)
+          else walk next (k + 1) finish (next :: acc)
+      in
+      walk 99 0 120 []
+    in
+    let directory bytes n origins =
+      let slots = u16 bytes 38 in
+      let slot s = u16 bytes (Page.size - 8 - (2 * (s + 1))) in
+      let owned origin = u8 bytes (origin - 5) land 0x0F in
+      let rec go list s pending =
+        match list with
+        | [] -> if s = slots then Ok () else fail (Directory n)
+        | origin :: rest ->
+            let pending = pending + 1 in
+            if s < slots && slot s = origin then
+              let low = if s = 0 then 1 else if s = slots - 1 then 1 else 4 in
+              let high = if s = 0 then 1 else 8 in
+              if owned origin = pending && pending >= low && pending <= high then go rest (s + 1) 0
+              else fail (Directory n)
+            else if owned origin = 0 then go rest s pending
+            else fail (Directory n)
+      in
+      if slots < 2 then fail (Directory n) else go ((99 :: origins) @ [ 112 ]) 0 0
+    in
+    let references bytes origin =
+      let rec go j lengths data acc =
+        if j = Array.length fields then acc
+        else
+          let field = fields.(j) in
+          if is_null bytes origin field then go (j + 1) lengths data acc
+          else
+            match Layout.length field.storage with
+            | Varying { big } ->
+                let first = u8 bytes lengths in
+                if big && first land 0x80 <> 0 then
+                  let length = ((first land 0x3F) lsl 8) lor u8 bytes (lengths - 1) in
+                  let acc = if first land 0x40 <> 0 then (origin + data) :: acc else acc in
+                  go (j + 1) (lengths - 2) (data + length) acc
+                else go (j + 1) (lengths - 1) (data + first) acc
+            | Fixed size -> go (j + 1) lengths (data + size) acc
+      in
+      go 0 (origin - 6 - layout.null_bytes) 0 []
+    in
+    let%bind root = page layout.root in
+    let rec level height numbers expected last rows =
+      let numbers = Array.of_list numbers in
+      let%bind children, _, rows =
+        Base.List.fold_result (List.init (Array.length numbers) Fun.id) ~init:([], last, rows)
+          ~f:(fun (children, last, rows) j ->
+            let n = numbers.(j) in
+            let%bind bytes = if n = layout.root then Ok root else page n in
+            let%bind () =
+              if Hashtbl.mem tree n then fail (Links n)
+              else (
+                Hashtbl.replace tree n height;
+                Ok ())
+            in
+            let%bind () =
+              if u16 bytes 24 = 17855 && Int64.to_int (Bytes.get_int64_be bytes 66) = layout.index then Ok ()
+              else fail (Not_index n)
+            in
+            let%bind () = if u16 bytes 64 = height then Ok () else fail (Level n) in
+            let prev = if j > 0 then numbers.(j - 1) else Page.null in
+            let next = if j + 1 < Array.length numbers then numbers.(j + 1) else Page.null in
+            let%bind () = if u32 bytes 8 = prev && u32 bytes 12 = next then Ok () else fail (Links n) in
+            let%bind origins = records bytes n ~level:height ~leftmost:(j = 0) in
+            let%bind () = directory bytes n origins in
+            let%bind () =
+              match (origins, height, Array.length numbers) with
+              | [], 0, 1 when n = layout.root -> Ok ()
+              | [], _, _ -> fail (Empty n)
+              | _ -> Ok ()
+            in
+            let%bind keys =
+              if height > 0 then Base.Result.all (List.map (fun origin -> key_at bytes n origin) origins)
+              else Base.Result.all (List.map (fun origin -> key_at bytes n origin) (Base.List.take origins 1))
+            in
+            let%bind () =
+              match (expected, keys) with
+              | Some expected, first :: _
+                when not
+                       (String.equal expected.(j).nulls first.nulls
+                       && String.equal expected.(j).lengths first.lengths
+                       && String.equal expected.(j).data first.data) ->
+                  fail (Pointer n)
+              | _ -> Ok ()
+            in
+            let%bind last =
+              Base.List.fold_result origins ~init:last ~f:(fun last origin ->
+                  let%map () = in_order n last (bytes, origin) in
+                  Some (bytes, origin))
+            in
+            let children =
+              if height = 0 then children
+              else
+                List.rev_append
+                  (List.map2 (fun origin key -> (u32 bytes (origin + String.length key.data), key)) origins keys)
+                  children
+            in
+            let rows = if height = 0 then rows + List.length origins else rows in
+            let%bind () =
+              if height > 0 then Ok ()
+              else
+                Base.List.fold_result origins ~init:() ~f:(fun () origin ->
+                    Base.List.fold_result (references bytes origin) ~init:() ~f:(fun () at -> lob bytes at n))
+            in
+            Ok (children, last, rows))
+      in
+      if height = 0 then Ok rows
+      else
+        let children = List.rev children in
+        let expected = Array.of_list (List.map snd children) in
+        let%bind () =
+          Base.List.fold_result children ~init:() ~f:(fun () (child, _) ->
+              if child < pages then Ok () else fail (Pointer child))
+        in
+        level (height - 1) (List.map fst children) (Some expected) None rows
+    in
+    let%bind rows = level (u16 root 64) [ layout.root ] None None 0 in
+    let inode_of offset =
+      if u32 root (offset + 4) = 2 then Ok (u16 root (offset + 8))
+      else fail (Space "a segment's inode is not on page 2")
+    in
+    let%bind leaf_inode = inode_of 74 in
+    let%map top_inode = inode_of 84 in
+    (layout, rows, leaf_inode, top_inode, List.of_seq (Hashtbl.to_seq tree))
   in
-  let%bind rows = level (u16 root 64) [ layout.root ] None None 0 in
+  let%bind first = index clustered ~lob in
+  let%bind others =
+    Base.Result.all (Quiver_core.Concurrent.each (List.length secondary) (fun j -> index (List.nth secondary j) ~lob:(fun _ _ n -> fail (Lob n))))
+  in
+  let indexes = first :: others in
+  let tree = Hashtbl.create 1024 in
+  let%bind () =
+    Base.List.fold_result indexes ~init:() ~f:(fun () (layout, _, _, _, walked) ->
+        Base.List.fold_result walked ~init:() ~f:(fun () (n, height) ->
+            if Hashtbl.mem used n then fail (Links n)
+            else (
+              Hashtbl.replace used n ();
+              Hashtbl.replace tree n (layout, height);
+              Ok ())))
+  in
+  let indexes = List.map (fun (layout, rows, leaf_inode, top_inode, _) -> (layout, rows, leaf_inode, top_inode)) indexes in
+  let%bind rows, leaf_inode =
+    match indexes with
+    | (_, rows, leaf_inode, _) :: others ->
+        let%map () =
+          Base.List.fold_result others ~init:() ~f:(fun () ((layout : Layout.t), entries, _, _) ->
+              if entries = rows then Ok () else fail (Entries layout.index))
+        in
+        (rows, leaf_inode)
+    | [] -> fail (Space "no clustered index")
+  in
   let%bind inode = page 2 in
-  let inode_of offset =
-    if u32 root (offset + 4) = 2 then Ok (u16 root (offset + 8))
-    else fail (Space "a segment's inode is not on page 2")
-  in
-  let%bind leaf_inode = inode_of 74 in
-  let%bind top_inode = inode_of 84 in
   let segment at = Int64.to_int (Bytes.get_int64_be inode at) in
   let extents = (size + 63) / 64 in
   let%bind xdes =
@@ -372,23 +470,22 @@ let tablespace (layout : Layout.t) ~pages ~read =
           fail (Space (Printf.sprintf "page %d is %s by its extent" p marked)))
   in
   let frag_arr at = List.filter (fun n -> n <> Page.null) (List.init 32 (fun j -> u32 inode (at + 64 + (4 * j)))) in
-  let leaf_frags = frag_arr leaf_inode and top_frags = frag_arr top_inode in
+  let in_segment n ~inode_at =
+    match state (n / 64) with
+    | 4 when owner (n / 64) = segment inode_at -> Ok ()
+    | (2 | 3) when List.mem n (frag_arr inode_at) -> Ok ()
+    | _ -> fail (Space (Printf.sprintf "page %d is not in its segment" n))
+  in
   let%bind () =
-    Base.List.fold_result (List.of_seq (Hashtbl.to_seq tree)) ~init:() ~f:(fun () (n, height) ->
-        let segment, frags =
-          if height = 0 && n <> layout.root then (segment leaf_inode, leaf_frags) else (segment top_inode, top_frags)
+    Base.List.fold_result (List.of_seq (Hashtbl.to_seq tree)) ~init:() ~f:(fun () (n, ((layout : Layout.t), height)) ->
+        let _, _, leaf_inode, top_inode =
+          List.find (fun ((other : Layout.t), _, _, _) -> other.index = layout.index) indexes
         in
-        match state (n / 64) with
-        | 4 when owner (n / 64) = segment -> Ok ()
-        | (2 | 3) when List.mem n frags -> Ok ()
-        | _ -> fail (Space (Printf.sprintf "page %d is not in its segment" n)))
+        if height = 0 && n <> layout.root then in_segment n ~inode_at:leaf_inode else in_segment n ~inode_at:top_inode)
   in
   let%bind () =
     Base.List.fold_result (List.of_seq (Hashtbl.to_seq_keys lobs)) ~init:() ~f:(fun () n ->
-        match state (n / 64) with
-        | 4 when owner (n / 64) = segment leaf_inode -> Ok ()
-        | (2 | 3) when List.mem n leaf_frags -> Ok ()
-        | _ -> fail (Space (Printf.sprintf "page %d is not in its segment" n)))
+        in_segment n ~inode_at:leaf_inode)
   in
   let listed = Hashtbl.create 64 in
   let walk bytes at kind ~segment =
@@ -417,7 +514,8 @@ let tablespace (layout : Layout.t) ~pages ~read =
             | Free, 1, 0 -> Ok ()
             | Free_frag, 2, u when u < 64 -> Ok ()
             | Full_frag, 3, 64 -> Ok ()
-            | Segment_free, 4, 0 | Full, 4, 64 -> if owner k_extent = segment then Ok () else fail (Space "an extent of another segment")
+            | Segment_free, 4, 0 | Full, 4, 64 ->
+                if owner k_extent = segment then Ok () else fail (Space "an extent of another segment")
             | Not_full, 4, u when u > 0 && u < 64 ->
                 if owner k_extent = segment then Ok () else fail (Space "an extent of another segment")
             | _ -> fail (Space (Printf.sprintf "extent %d in the wrong list" k_extent))
@@ -430,7 +528,9 @@ let tablespace (layout : Layout.t) ~pages ~read =
   let%bind () = walk header 78 Free_frag ~segment:0 in
   let%bind () = walk header 94 Full_frag ~segment:0 in
   let%bind () =
-    Base.List.fold_result [ leaf_inode; top_inode ] ~init:() ~f:(fun () at ->
+    Base.List.fold_result
+      (List.concat_map (fun (_, _, leaf_inode, top_inode) -> [ leaf_inode; top_inode ]) indexes)
+      ~init:() ~f:(fun () at ->
         let segment = segment at in
         let%bind () = walk inode (at + 12) Segment_free ~segment in
         let%bind () = walk inode (at + 28) Not_full ~segment in
@@ -441,12 +541,13 @@ let tablespace (layout : Layout.t) ~pages ~read =
         in
         if u32 inode (at + 8) = not_full then Ok () else fail (Space "a segment's count of used pages"))
   in
-  let%bind () =
-    if Hashtbl.length listed = extents then Ok () else fail (Space "an extent in no list")
-  in
+  let%bind () = if Hashtbl.length listed = extents then Ok () else fail (Space "an extent in no list") in
   let frag_used =
     Base.List.sum (module Base.Int) (List.of_seq (Hashtbl.to_seq listed)) ~f:(fun (k, kind) ->
         match kind with Free_frag -> count k | _ -> 0)
   in
   let%bind () = if u32 header 58 = frag_used then Ok () else fail (Space "the space's count of fragment pages") in
   Ok { pages; rows }
+
+let tablespace clustered ~secondary ~pages ~read =
+  Result.map_error (fun error -> `Check error) (tablespace clustered ~secondary ~pages ~read)

@@ -21,6 +21,7 @@
   quiver.mysql
   quiver.load
   quiver.innodb
+  quiver.quiverfile
   quiver.net
   quiver.openssl
   threads.posix

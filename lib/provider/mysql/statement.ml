@@ -22,6 +22,7 @@ type t =
   | Import_tablespace of Quiver_core.Schema.Name.t
   | Rename_table of { from : Quiver_core.Schema.Name.t; into : Quiver_core.Schema.Name.t }
   | Drop_table of Quiver_core.Schema.Name.t
+  | Drop_indexes of { table : Quiver_core.Schema.Name.t; indexes : Quiver_core.Ident.t list }
   | Load_local of {
       table : Quiver_core.Ident.t;
       dialect : Quiver_core.Output_format.dialect;
@@ -79,6 +80,11 @@ let sql = function
   | Import_tablespace name -> [%string "ALTER TABLE %{Query.qualified name} IMPORT TABLESPACE"]
   | Rename_table { from; into } -> [%string "RENAME TABLE %{Query.qualified from} TO %{Query.qualified into}"]
   | Drop_table name -> [%string "DROP TABLE IF EXISTS %{Query.qualified name}"]
+  | Drop_indexes { table; indexes } ->
+      let dropped =
+        String.concat ", " (List.map (fun index -> "DROP INDEX " ^ Quiver_core.Ident.backquoted index) indexes)
+      in
+      [%string "ALTER TABLE %{Query.qualified table} %{dropped}"]
   | Commit -> "COMMIT"
   | Rollback -> "ROLLBACK"
   | Load_local { table; dialect; columns } ->

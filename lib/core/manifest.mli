@@ -70,12 +70,23 @@ type threads = {
 [@@deriving yojson_of]
 (** How many threads read and rendered. *)
 
+type phases = {
+  connected : Core.Time_ns.Span.t;  (** Every session open, since the dump began. *)
+  planned : Core.Time_ns.Span.t;  (** Schema read and chunks planned. *)
+  snapshot : Core.Time_ns.Span.t;  (** Every session in the snapshot. *)
+  first_part : Core.Time_ns.Span.t option;  (** The first chunk's query; none without rows. *)
+  read : Core.Time_ns.Span.t;  (** The last reader stopped. *)
+  committed : Core.Time_ns.Span.t;  (** The sink took every part. *)
+}
+(** When the dump reached each phase, since it began. *)
+
 type t = private {
   version : int;
   level : Consistency.any;
   format : Output_format.t;
   position : Yojson.Safe.t;
   threads : threads;
+  phases : phases;
   schema : Schema.t;
   chunks : entry list;
 }
@@ -88,6 +99,7 @@ val make :
   format:Output_format.t ->
   position:Yojson.Safe.t ->
   threads:threads ->
+  phases:phases ->
   schema:Schema.t ->
   (Chunk.t * state) list ->
   t

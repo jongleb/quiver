@@ -132,17 +132,37 @@ type threads = {
 }
 [@@deriving yojson_of]
 
+type phases = {
+  connected : Core.Time_ns.Span.t;
+  planned : Core.Time_ns.Span.t;
+  snapshot : Core.Time_ns.Span.t;
+  first_part : Core.Time_ns.Span.t option;
+  read : Core.Time_ns.Span.t;
+  committed : Core.Time_ns.Span.t;
+}
+
 type t = {
   version : int;
   level : Consistency.any;
   format : Output_format.t;
   position : Yojson.Safe.t;
   threads : threads;
+  phases : phases;
   schema : Schema.t;
   chunks : entry list;
 }
 
-let yojson_of_t { version; level; format; position; threads; schema; chunks } =
+let yojson_of_t
+    {
+      version;
+      level;
+      format;
+      position;
+      threads;
+      phases = { connected; planned; snapshot; first_part; read; committed };
+      schema;
+      chunks;
+    } =
   `Assoc
     [
       ("version", `Int version);
@@ -150,17 +170,28 @@ let yojson_of_t { version; level; format; position; threads; schema; chunks } =
       ("format", Output_format.yojson_of_t format);
       ("position", position);
       ("threads", yojson_of_threads threads);
+      ( "phases",
+        `Assoc
+          [
+            ("connected_ns", Codec.yojson_of_span connected);
+            ("planned_ns", Codec.yojson_of_span planned);
+            ("snapshot_ns", Codec.yojson_of_span snapshot);
+            ("first_part_ns", Option.fold ~none:`Null ~some:Codec.yojson_of_span first_part);
+            ("read_ns", Codec.yojson_of_span read);
+            ("committed_ns", Codec.yojson_of_span committed);
+          ] );
       ("schema", Schema.yojson_of_t schema);
       ("chunks", `List (List.map yojson_of_entry chunks));
     ]
 
-let make ~level ~format ~position ~threads ~schema chunks =
+let make ~level ~format ~position ~threads ~phases ~schema chunks =
   {
     version = 1;
     level;
     format;
     position;
     threads;
+    phases;
     schema;
     chunks =
       List.map

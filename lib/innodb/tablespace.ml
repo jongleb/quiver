@@ -10,6 +10,7 @@ type error =
   | Overlapping_runs
   | Too_many_extents
   | Too_many_rows
+  | Duplicate of int
 [@@deriving sexp_of ~portable]
 
 let group = 16384
@@ -21,70 +22,100 @@ let largest_record = 8125
 (** Bytes of a reference to a column stored off the record. *)
 let reference = 20
 
-(** A record's key as a node pointer holds it: the lengths of its variable fields as they
-    precede the record, then the fields' bytes. *)
-type key = { lengths : string; data : string }
+(** A record's key as a node pointer holds it: the NULL bits and the lengths of its variable
+    fields as they precede the record, then the fields' bytes. *)
+type key : immutable_data = { nulls : string; lengths : string; data : string }
+
+let no_key = { nulls = ""; lengths = ""; data = "" }
 
 (** Where a record's key comes from. *)
 type keys = Stored  (** The record's own fields. *) | Numbered  (** The run numbers its rows. *)
 
-type t = {
+(** One of the table's indexes: how its records are laid out and the segments its pages go to. *)
+type tree = {
   layout : Layout.t;
   fields : Layout.field iarray;
-  key_fields : Layout.storage list;
-  keys : keys;
-  runs : int Portable.Atomic.t;  (** Runs started, numbering their rows apart. *)
-  file : File.t;
-  template : string;
-  space : int;
-  segments : string;
+  key_fields : Layout.field list;  (** The fields a node pointer holds. *)
+  segments : string;  (** Its root's headers of its leaf and upper segments. *)
   leaf_inode : int;
   top_inode : int;
   leaf_segment : int;
   top_segment : int;
+}
+
+type t = {
+  clustered : tree;
+  secondary : tree list;
+  keys : keys;
+  runs : int Portable.Atomic.t;  (** Runs started, numbering their rows apart. *)
+  file : File.t;
+  scratch : File.t;  (** Each run's secondary records, sorted, until [finish] merges them. *)
+  blocks : int Portable.Atomic.t;  (** Pages of [scratch] taken. *)
+  threads : int;  (** Most threads merging secondary indexes at once. *)
+  template : string;
+  space : int;
   template_size : int;
   extents : int Portable.Atomic.t;
 }
 
-let create ~template (layout : Layout.t) file =
+let create ~template (layout : Layout.t) ~secondary file ~scratch ~threads =
   let u16 at = String.get_uint16_be template at in
   let u32 at = Int32.to_int (String.get_int32_be template at) land 0xFFFF_FFFF in
+  let template_size = u32 46 in
   let%bind () =
-    if String.length template < 5 * Page.size then Error (`Tablespace (Template "shorter than 5 pages"))
-    else Ok ()
-  in
-  let root = layout.root * Page.size in
-  let%bind () =
-    match (layout.root, u16 (root + 24), u16 (root + 54), u16 ((2 * Page.size) + 24)) with
-    | 4, 17855, 0, 3 -> Ok ()
-    | _ -> Error (`Tablespace (Template "no empty root on page 4 or no inode page 2"))
+    if String.length template >= 5 * Page.size && String.length template >= template_size * Page.size then Ok ()
+    else Error (`Tablespace (Template "shorter than its header says"))
   in
   let%bind () =
-    if Int64.to_int (String.get_int64_be template (root + 66)) = layout.index then Ok ()
-    else Error (`Tablespace (Template "the root belongs to another index"))
+    match (layout.root, u16 ((2 * Page.size) + 24)) with
+    | 4, 3 -> Ok ()
+    | _ -> Error (`Tablespace (Template "no clustered root on page 4 or no inode page 2"))
   in
-  let leaf_inode = u16 (root + 74 + 8) and top_inode = u16 (root + 84 + 8) in
-  let segment offset = Int64.to_int (String.get_int64_be template ((2 * Page.size) + offset)) in
-  Ok
+  let tree (layout : Layout.t) =
+    let root = layout.root * Page.size in
+    let%bind () =
+      if layout.root < template_size && u16 (root + 24) = 17855 && u16 (root + 54) = 0 && u16 (root + 64) = 0 then Ok ()
+      else Error (`Tablespace (Template "an index's root is not an empty page"))
+    in
+    let%bind () =
+      if Int64.to_int (String.get_int64_be template (root + 66)) = layout.index then Ok ()
+      else Error (`Tablespace (Template "a root belongs to another index"))
+    in
+    let leaf_inode = u16 (root + 74 + 8) and top_inode = u16 (root + 84 + 8) in
+    let segment offset = Int64.to_int (String.get_int64_be template ((2 * Page.size) + offset)) in
+    let%map () =
+      if u32 (root + 74 + 4) = 2 && u32 (root + 84 + 4) = 2 then Ok ()
+      else Error (`Tablespace (Template "a segment's inode is not on page 2"))
+    in
     {
       layout;
       fields = Iarray.of_list layout.fields;
-      key_fields = Base.List.take (List.map (fun (field : Layout.field) -> field.storage) layout.fields) layout.key;
-      keys = (match layout.fields with { storage = Row_id; _ } :: _ -> Numbered | _ -> Stored);
-      runs = Portable.Atomic.make 0;
-      file;
-      template;
-      space = u32 34;
+      key_fields = Base.List.take layout.fields layout.key;
       segments = String.sub template (root + 74) 20;
       leaf_inode;
       top_inode;
       leaf_segment = segment leaf_inode;
       top_segment = segment top_inode;
-      template_size = u32 46;
-      extents = Portable.Atomic.make 1;
     }
+  in
+  let%bind clustered = tree layout in
+  let%map secondary = Base.Result.all (List.map tree secondary) in
+  {
+    clustered;
+    secondary;
+    keys = (match layout.fields with { storage = Row_id; _ } :: _ -> Numbered | _ -> Stored);
+    runs = Portable.Atomic.make 0;
+    file;
+    scratch;
+    blocks = Portable.Atomic.make 0;
+    threads = Int.max 1 threads;
+    template;
+    space = u32 34;
+    template_size;
+    extents = Portable.Atomic.make 1;
+  }
 
-type records = { image : string; rows : int }
+type records = { image : string; rows : int; secondary : string list  (** Each secondary index's, in its order. *) }
 
 let put_int bytes pos n v =
   let rec go k =
@@ -96,9 +127,9 @@ let put_int bytes pos n v =
 
 let shaped t (columns @ local) =
   let rec go j =
-    if j = Iarray.length t.fields then Ok ()
+    if j = Iarray.length t.clustered.fields then Ok ()
     else
-      let field = Iarray.get t.fields j in
+      let field = Iarray.get t.clustered.fields j in
       if field.source < 0 then go (j + 1)
       else if field.source >= Iarray.length columns then Error (`Tablespace (Shape field.source))
       else
@@ -181,7 +212,9 @@ let text_offset (field : Layout.field) (columns @ local) i =
 let text_length (field : Layout.field) (columns @ local) i =
   let (Quiver_core.Column.Any column) = Iarray.get columns field.source in
   match Quiver_core.Column.repr column with
-  | Text -> Quiver_core.Column.text_length column i [@nontail]
+  | Text -> (
+      let length = Quiver_core.Column.text_length column i in
+      match field.part with Whole -> length | Prefix prefix -> Int.min length prefix)
   | Bool | Int | Int64 | Float -> 0
 
 let put_fraction bytes pos fsp fraction =
@@ -420,12 +453,13 @@ let put_field bytes pos (field : Layout.field) (columns @ local) i =
       | _ -> pos)
 
 let encode t (columns @ local) ~rows =
-  let n_fields = Iarray.length t.fields in
+  let images (tree : tree) =
+  let n_fields = Iarray.length tree.fields in
   let encoded = Array.make n_fields "" in
   let rec sizes j i extra data =
     if j = n_fields then Ok (extra, data)
     else
-      let field = Iarray.get t.fields j in
+      let field = Iarray.get tree.fields j in
       match present field columns i with
       | Null -> sizes (j + 1) i extra data
       | Present -> (
@@ -504,7 +538,7 @@ let encode t (columns @ local) ~rows =
   in
   let outside = Bytes.make n_fields '\000' in
   let value_length j i =
-    let field = Iarray.get t.fields j in
+    let field = Iarray.get tree.fields j in
     match field.storage with
     | Json -> String.length (Array.get encoded j)
     | Text { charset = Latin1; _ } -> (
@@ -515,7 +549,7 @@ let encode t (columns @ local) ~rows =
   in
   let rec fill bytes start origin j pos lengths tail i =
     if j < n_fields then
-      let field = Iarray.get t.fields j in
+      let field = Iarray.get tree.fields j in
       match (present field columns i, field.nullability) with
       | Null, Null_bit bit ->
           let at = origin - 6 - (bit / 8) in
@@ -568,7 +602,7 @@ let encode t (columns @ local) ~rows =
           fill bytes start origin (j + 1) next lengths tail i
   in
   let length_outside j i =
-    let field = Iarray.get t.fields j in
+    let field = Iarray.get tree.fields j in
     match (field.storage, present field columns i) with
     | (Variable { big = true } | Text { big = true; _ } | Json), Present when Bytes.get outside j = '\000' -> value_length j i
     | _ -> 0
@@ -584,7 +618,7 @@ let encode t (columns @ local) ~rows =
     let size = extra + 5 + data in
     if size <= largest_record then Ok sized
     else
-      match longest t.layout.key (-1) i with
+      match longest tree.layout.key (-1) i with
       | -1 -> Error (`Tablespace (Row_too_long size))
       | j ->
           let length = length_outside j i in
@@ -599,10 +633,10 @@ let encode t (columns @ local) ~rows =
     else moved (j + 1) i count bytes
   in
   let rec row bytes pos i =
-    if i = rows then Ok { image = Bytes.sub_string bytes 0 pos; rows }
+    if i = rows then Ok (Bytes.sub_string bytes 0 pos)
     else (
       Bytes.fill outside 0 n_fields '\000';
-      let fitted = match sizes 0 i t.layout.null_bytes 0 with Error _ as failed -> failed | Ok sized -> fit sized i in
+      let fitted = match sizes 0 i tree.layout.null_bytes 0 with Error _ as failed -> failed | Ok sized -> fit sized i in
       match fitted with
       | Error _ as failed -> failed
       | Ok (extra, data) ->
@@ -618,12 +652,24 @@ let encode t (columns @ local) ~rows =
           let start = pos + 6 in
           let origin = start + extra + 5 in
           Bytes.fill bytes start (extra + 5) '\000';
-          fill bytes start origin 0 origin (origin - 6 - t.layout.null_bytes) (start + size) i;
+          fill bytes start origin 0 origin (origin - 6 - tree.layout.null_bytes) (start + size) i;
           row bytes (start + size + tail) (i + 1))
+  in
+  row (Bytes.create (Int.max 64 (rows * 32))) 0 0 [@nontail]
   in
   match shaped t columns with
   | Error _ as failed -> failed
-  | Ok () -> row (Bytes.create (Int.max 64 (rows * 32))) 0 0 [@nontail]
+  | Ok () -> (
+      match images t.clustered with
+      | Error _ as failed -> failed
+      | Ok image -> (
+          let rec others trees acc =
+            match trees with
+            | [] -> Ok { image; rows; secondary = List.rev acc }
+            | tree :: rest -> (
+                match images tree with Error _ as failed -> failed | Ok other -> others rest (other :: acc))
+          in
+          others t.secondary [] [@nontail]))
 
 let image records = records.image
 
@@ -640,6 +686,7 @@ type seen = Nothing | Key
 
 type run = {
   owner : t;
+  tree : tree;
   base : int;  (** The first row number of a [Numbered] run. *)
   rank : int;  (** Its place among the table's runs, for keys of [Source_order]. *)
   mutable numbered : int;  (** Rows it numbered. *)
@@ -653,25 +700,31 @@ type run = {
   mutable extent : (int * int) option;  (** Extent and the pages used in it. *)
   mutable used : (int * int) list;
   mutable pointers : (key * int) list;  (** First key and number of each page, last first. *)
+  sorting : Buffer.t array;  (** Each secondary index's records of the run, as they came. *)
 }
 
-let run owner ~rank =
+let started owner tree ~rank ~sorting =
   {
     owner;
+    tree;
     base = (Portable.Atomic.fetch_and_add owner.runs 1 lsl 32) + 1;
     rank;
     numbered = 0;
-    last = { lengths = ""; data = "" };
+    last = no_key;
     seen = Nothing;
     page = None;
     number = Page.null;
     previous = Page.null;
     first = Page.null;
-    low = { lengths = ""; data = "" };
+    low = no_key;
     extent = None;
     used = [];
     pointers = [];
+    sorting;
   }
+
+let run owner ~rank =
+  started owner owner.clustered ~rank ~sorting:(Array.of_list (List.map (fun _ -> Buffer.create 4096) owner.secondary))
 
 let next_number run =
   let%map k, used =
@@ -783,24 +836,79 @@ let store run image ~pos ~length =
   let%map () = File.write t.file first first_page in
   first
 
-let add run { image; rows } =
-  let t = run.owner in
-  let stored origin =
-    let header = origin - 5 - t.layout.null_bytes in
-    let rec go fields at data =
-      match fields with
-      | [] -> { lengths = String.sub image at (header - at); data = String.sub image origin data }
-      | storage :: rest -> (
-          match Layout.length storage with
-          | Fixed n -> go rest at (data + n)
-          | Varying { big } ->
-              let first = String.get_uint8 image (at - 1) in
-              if big && first land 0x80 <> 0 then
-                go rest (at - 2) (data + (((first land 0x3F) lsl 8) lor String.get_uint8 image (at - 2)))
-              else go rest (at - 1) (data + first))
-    in
-    go t.key_fields header 0
+let compare_images (tree : tree) a pa b pb ~fields =
+  let origin s p = p + 6 + String.get_uint16_be s (p + 2) in
+  let oa = origin a pa and ob = origin b pb in
+  let null_bytes = tree.layout.null_bytes in
+  let null (field : Layout.field) s o =
+    match field.nullability with
+    | Not_null -> 0
+    | Null_bit bit -> String.get_uint8 s (o - 6 - (bit / 8)) land (1 lsl (bit mod 8))
   in
+  let rec bytes x y n k =
+    if k = n then 0
+    else
+      let c = Int.compare (String.get_uint8 a (x + k)) (String.get_uint8 b (y + k)) in
+      if c <> 0 then c else bytes x y n (k + 1)
+  in
+  let length s at big =
+    let first = String.get_uint8 s at in
+    if big && first land 0x80 <> 0 then (((first land 0x3F) lsl 8) lor String.get_uint8 s (at - 1), 2) else (first, 1)
+  in
+  let rec go j la lb da db =
+    if j = fields then 0
+    else
+      let field = Iarray.get tree.fields j in
+      match (null field a oa, null field b ob) with
+      | 0, 0 -> (
+          match Layout.length field.storage with
+          | Fixed n ->
+              let c = bytes (oa + da) (ob + db) n 0 in
+              if c <> 0 then c else go (j + 1) la lb (da + n) (db + n)
+          | Varying { big } ->
+              let na, used_a = length a la big and nb, used_b = length b lb big in
+              let c = bytes (oa + da) (ob + db) (Int.min na nb) 0 in
+              if c <> 0 then c
+              else
+                let c = Int.compare na nb in
+                if c <> 0 then c else go (j + 1) (la - used_a) (lb - used_b) (da + na) (db + nb))
+      | 0, _ -> 1
+      | _, 0 -> -1
+      | _, _ -> go (j + 1) la lb da db
+  in
+  go 0 (oa - 6 - null_bytes) (ob - 6 - null_bytes) 0 0
+
+let put run image pos =
+  let t = run.owner and tree = run.tree in
+  let key_of (tree : tree) image origin =
+    let null_bytes = tree.layout.null_bytes in
+    let header = origin - 5 - null_bytes in
+    let nulls = Bytes.make null_bytes '\000' in
+    let rec go (fields : Layout.field list) at data =
+      match fields with
+      | [] -> { nulls = Bytes.to_string nulls; lengths = String.sub image at (header - at); data = String.sub image origin data }
+      | field :: rest -> (
+          let null =
+            match field.nullability with
+            | Not_null -> 0
+            | Null_bit bit -> String.get_uint8 image (origin - 6 - (bit / 8)) land (1 lsl (bit mod 8))
+          in
+          match (field.nullability, null) with
+          | Null_bit bit, flag when flag <> 0 ->
+              let k = null_bytes - 1 - (bit / 8) in
+              Bytes.set_uint8 nulls k (Bytes.get_uint8 nulls k lor flag);
+              go rest at data
+          | _ -> (
+              match Layout.length field.storage with
+              | Fixed n -> go rest at (data + n)
+              | Varying { big } ->
+                  let first = String.get_uint8 image (at - 1) in
+                  if big && first land 0x80 <> 0 then
+                    go rest (at - 2) (data + (((first land 0x3F) lsl 8) lor String.get_uint8 image (at - 2)))
+                  else go rest (at - 1) (data + first)))
+    in
+    go tree.key_fields header 0
+    in
   let rec page_for size =
     match run.page with
     | Some page when Page.room page size = Fits -> Ok page
@@ -819,61 +927,72 @@ let add run { image; rows } =
             run.first <- number)
           else Ok ()
         in
-        let page = Page.create ~level:0 ~index:t.layout.index in
+        let page = Page.create ~level:0 ~index:tree.layout.index in
         run.page <- Some page;
         page
   in
+  let length = String.get_uint16_be image pos and origin = String.get_uint16_be image (pos + 2) in
+  let count = String.get_uint16_be image (pos + 4) in
+  let start = pos + 6 in
+  let%bind page = page_for length in
+  let%bind key =
+    match (t.keys, tree.layout.order, Page.count page) with
+    | Numbered, _, _ when tree == t.clustered ->
+        if run.numbered < 0xFFFF_FFFF && run.base < 1 lsl 48 then (
+          let id = Bytes.create 6 in
+          Bytes.set_uint16_be id 0 ((run.base + run.numbered) lsr 32);
+          Bytes.set_int32_be id 2 (Int32.of_int ((run.base + run.numbered) land 0xFFFF_FFFF));
+          run.numbered <- run.numbered + 1;
+          Ok { no_key with data = Bytes.to_string id })
+        else Error (`Tablespace Too_many_rows)
+    | (Numbered | Stored), Bytes_order, _ | (Numbered | Stored), (Source_order | Fields_order), 0 ->
+        Ok (key_of tree image (start + origin))
+    | (Numbered | Stored), (Source_order | Fields_order), _ -> Ok run.last
+  in
+  let%bind () =
+    match (tree.layout.order, run.seen) with
+    | Bytes_order, Key when String.compare key.data run.last.data <= 0 -> Error (`Tablespace Out_of_order)
+    | Bytes_order, (Key | Nothing) | Source_order, _ | Fields_order, _ -> Ok ()
+  in
+  let () =
+    match (Page.count page, run.seen) with
+    | 0, Nothing ->
+        run.low <- key;
+        run.pointers <- (key, run.number) :: run.pointers
+    | 0, Key -> run.pointers <- (key, run.number) :: run.pointers
+    | _ -> ()
+  in
+  let placed = Page.place page image ~pos:start ~length ~origin - origin in
+  let () =
+    match t.keys with
+    | Numbered when tree == t.clustered -> Bytes.blit_string key.data 0 (Page.bytes page) (placed + origin) 6
+    | Numbered | Stored -> ()
+  in
+  let rec outside k at =
+    if k = count then Ok at
+    else
+      let reference = String.get_uint16_be image at and bytes = String.get_int32_be image (at + 2) in
+      let bytes = Int32.to_int bytes land 0xFFFF_FFFF in
+      let%bind first = store run image ~pos:(at + 6) ~length:bytes in
+      Bytes.set_int32_be (Page.bytes page) (placed + reference + 4) (Int32.of_int first);
+      outside (k + 1) (at + 6 + bytes)
+  in
+  let%map next = outside 0 (start + length) in
+  run.last <- key;
+  run.seen <- Key;
+  next
+
+let add run { image; rows; secondary } =
   let rec record pos i =
     if i = rows then Ok ()
     else
-      let length = String.get_uint16_be image pos and origin = String.get_uint16_be image (pos + 2) in
-      let count = String.get_uint16_be image (pos + 4) in
-      let start = pos + 6 in
-      let%bind key =
-        match t.keys with
-        | Stored -> Ok (stored (start + origin))
-        | Numbered ->
-            if run.numbered < 0xFFFF_FFFF && run.base < 1 lsl 48 then (
-              let id = Bytes.create 6 in
-              Bytes.set_uint16_be id 0 ((run.base + run.numbered) lsr 32);
-              Bytes.set_int32_be id 2 (Int32.of_int ((run.base + run.numbered) land 0xFFFF_FFFF));
-              run.numbered <- run.numbered + 1;
-              Ok { lengths = ""; data = Bytes.to_string id })
-            else Error (`Tablespace Too_many_rows)
-      in
-      let%bind () =
-        match (t.layout.order, run.seen) with
-        | Bytes_order, Key when String.compare key.data run.last.data <= 0 -> Error (`Tablespace Out_of_order)
-        | Bytes_order, (Key | Nothing) | Source_order, _ -> Ok ()
-      in
-      let%bind page = page_for length in
-      let () =
-        match (Page.count page, run.seen) with
-        | 0, Nothing ->
-            run.low <- key;
-            run.pointers <- (key, run.number) :: run.pointers
-        | 0, Key -> run.pointers <- (key, run.number) :: run.pointers
-        | _ -> ()
-      in
-      let placed = Page.place page image ~pos:start ~length ~origin - origin in
-      let () = match t.keys with Stored -> () | Numbered -> Bytes.blit_string key.data 0 (Page.bytes page) (placed + origin) 6 in
-      let rec outside k at =
-        if k = count then Ok at
-        else
-          let reference = String.get_uint16_be image at and bytes = String.get_int32_be image (at + 2) in
-          let bytes = Int32.to_int bytes land 0xFFFF_FFFF in
-          let%bind first = store run image ~pos:(at + 6) ~length:bytes in
-          Bytes.set_int32_be (Page.bytes page) (placed + reference + 4) (Int32.of_int first);
-          outside (k + 1) (at + 6 + bytes)
-      in
-      let%bind next = outside 0 (start + length) in
-      run.last <- key;
-      run.seen <- Key;
+      let%bind next = put run image pos in
       record next (i + 1)
   in
-  record 0 0
+  let%map () = record 0 0 in
+  List.iteri (fun j other -> Buffer.add_string run.sorting.(j) other) secondary
 
-type pages = {
+type pages : immutable_data = {
   first : int;
   last : int;
   rank : int;
@@ -883,9 +1002,20 @@ type pages = {
   used : (int * int) list;  (** Extents and the pages used in each. *)
 }
 
-type finished = Empty | Pages of pages
+(** A run's leaves, if it had rows. *)
+type leaves : immutable_data = Empty | Pages of pages
 
-let close run =
+(** A page of [scratch] and the key prefix of its first record. *)
+type block : immutable_data = { number : int; first : int * int }
+
+(** For each secondary index, the pages of [scratch] its records went to, in order. *)
+type sorting : value mod contended portable =
+  | Sorted of block list list
+  | Sorting of (block list list, File.error) result Quiver_core.Concurrent.task  (** Still sorting on a thread. *)
+
+type finished : value mod contended portable = { leaves : leaves; sorting : sorting }
+
+let leaves_of run =
   match run.page with
   | None -> Ok Empty
   | Some page ->
@@ -901,75 +1031,225 @@ let close run =
           used = Option.fold ~none:run.used ~some:(fun current -> current :: run.used) run.extent;
         }
 
+let close run =
+  let t = run.owner in
+  let prefix (tree : tree) image pos =
+    let origin = pos + 6 + String.get_uint16_be image (pos + 2) in
+    let null_bytes = tree.layout.null_bytes in
+    let n = Iarray.length tree.fields in
+    let finish high low k =
+      if k >= 14 then (high, low)
+      else if k >= 7 then (high, low lsl (8 * (14 - k)))
+      else (high lsl (8 * (7 - k)), 0)
+    in
+    let push high low k byte = if k < 7 then ((high lsl 8) lor byte, low) else (high, (low lsl 8) lor byte) in
+    let rec bytes high low k at stop next =
+      if k >= 14 then (high, low)
+      else if at = stop then next high low k
+      else
+        let high, low = push high low k (String.get_uint8 image at) in
+        bytes high low (k + 1) (at + 1) stop next
+    in
+    let rec walk j high low k lengths data =
+      if j = n || k >= 14 then finish high low k
+      else
+        let (field : Layout.field) = Iarray.get tree.fields j in
+        let null =
+          match field.nullability with
+          | Not_null -> false
+          | Null_bit bit -> String.get_uint8 image (origin - 6 - (bit / 8)) land (1 lsl (bit mod 8)) <> 0
+        in
+        let high, low, k =
+          match field.nullability with
+          | Not_null -> (high, low, k)
+          | Null_bit _ ->
+              let high, low = push high low k (if null then 0 else 1) in
+              (high, low, k + 1)
+        in
+        if null then walk (j + 1) high low k lengths data
+        else
+          match Layout.length field.storage with
+          | Fixed size ->
+              bytes high low k (origin + data) (origin + data + size) (fun high low k ->
+                  walk (j + 1) high low k lengths (data + size))
+          | Varying { big } ->
+              let first = String.get_uint8 image lengths in
+              let length =
+                if big && first land 0x80 <> 0 then ((first land 0x3F) lsl 8) lor String.get_uint8 image (lengths - 1)
+                else first
+              in
+              bytes high low k (origin + data) (origin + data + length) (fun high low k -> finish high low k)
+    in
+    walk 0 0 0 0 (origin - 6 - null_bytes) 0
+    in
+  let spill (tree : tree) image : (block list, File.error) result =
+    let rec starts pos acc =
+      if pos >= String.length image then acc else starts (pos + 6 + String.get_uint16_be image pos) (pos :: acc)
+    in
+    let positions = Array.of_list (starts 0 []) in
+    let n = Array.length positions in
+    let high = Array.make n 0 and low = Array.make n 0 in
+    Array.iteri
+      (fun k pos ->
+        let h, l = prefix tree image pos in
+        high.(k) <- h;
+        low.(k) <- l)
+      positions;
+    let order = Array.init n Fun.id and spare = Array.make n 0 and counts = Array.make 257 0 in
+    let pass keys shift =
+      Array.fill counts 0 257 0;
+      Array.iter
+        (fun i ->
+          let b = ((keys.(i) lsr shift) land 255) + 1 in
+          counts.(b) <- counts.(b) + 1)
+        order;
+      if not (Array.exists (fun count -> count = n) counts) then (
+        let (_ : int) =
+          Base.Fn.apply_n_times ~n:256
+            (fun b ->
+              counts.(b + 1) <- counts.(b + 1) + counts.(b);
+              b + 1)
+            0
+        in
+        Array.iter
+          (fun i ->
+            let b = (keys.(i) lsr shift) land 255 in
+            spare.(counts.(b)) <- i;
+            counts.(b) <- counts.(b) + 1)
+          order;
+        Array.blit spare 0 order 0 n)
+    in
+    List.iter (fun shift -> pass low shift) [ 0; 8; 16; 24; 32; 40; 48 ];
+    List.iter (fun shift -> pass high shift) [ 0; 8; 16; 24; 32; 40; 48 ];
+    let fields = Iarray.length tree.fields in
+    let rec ties i =
+      if i < n then (
+        let rec stop j =
+          if j < n && high.(order.(j)) = high.(order.(i)) && low.(order.(j)) = low.(order.(i)) then stop (j + 1) else j
+        in
+        let j = stop (i + 1) in
+        if j - i > 1 then (
+          let group = Array.sub order i (j - i) in
+          Array.stable_sort (fun a b -> compare_images tree image positions.(a) image positions.(b) ~fields) group;
+          Array.blit group 0 order i (j - i));
+        ties j)
+    in
+    ties 0;
+    let block = Bytes.make Page.size '\000' in
+    let flush used acc =
+      if used = 2 then Ok acc
+      else
+        let number = Portable.Atomic.fetch_and_add t.blocks 1 in
+        Bytes.set_uint16_be block 0 used;
+        let%map () = Result.map_error (fun (`File error) -> error) (File.write t.scratch number block) in
+        { number; first = (Int64.to_int (Bytes.get_int64_be block 2), Int64.to_int (Bytes.get_int64_be block 10)) } :: acc
+    in
+    let%bind used, acc =
+      Base.Array.fold_result order ~init:(2, []) ~f:(fun (used, acc) k ->
+          let pos = positions.(k) in
+          let size = 6 + String.get_uint16_be image pos in
+          let%map used, acc =
+            if used + 16 + size > Page.size then Result.map (fun acc -> (2, acc)) (flush used acc) else Ok (used, acc)
+          in
+          Bytes.set_int64_be block used (Int64.of_int high.(k));
+          Bytes.set_int64_be block (used + 8) (Int64.of_int low.(k));
+          Bytes.blit_string image pos block (used + 16) size;
+          (used + 16 + size, acc))
+    in
+    let%map blocks = flush used acc in
+    List.rev blocks
+  in
+  let%bind leaves = leaves_of run in
+  let images = List.mapi (fun j tree -> (tree, Buffer.contents run.sorting.(j))) run.owner.secondary in
+  let work () =
+    Base.Result.all
+      (Quiver_core.Concurrent.each (List.length images) (fun j ->
+           let tree, image = List.nth images j in
+           spill tree image))
+  in
+  match images with
+  | [] -> Ok { leaves; sorting = Sorted [] }
+  | _ :: _ -> (
+      match Quiver_core.Concurrent.start work with
+      | Ok task -> Ok { leaves; sorting = Sorting task }
+      | Error (`Concurrent _) -> (
+          match work () with
+          | Ok sorted -> Ok { leaves; sorting = Sorted sorted }
+          | Error error -> Error (`File error)))
+
 let stamp bytes =
   let sum = Int32.of_int (Page.checksum bytes ~pos:0) in
   Bytes.set_int32_be bytes 0 sum;
   Bytes.set_int32_be bytes (Page.size - 8) sum
 
 let finish t finished =
-  let filled = List.filter_map (function Empty -> None | Pages pages -> Some pages) finished in
-  let%bind runs =
-    match t.layout.order with
-    | Source_order -> Ok (List.sort (fun a b -> Int.compare a.rank b.rank) filled)
-    | Bytes_order ->
-        let runs = List.sort (fun a b -> String.compare a.low.data b.low.data) filled in
-        let rec apart = function
-          | a :: (b :: _ as rest) ->
-              if String.compare a.high.data b.low.data < 0 then apart rest else Error (`Tablespace Overlapping_runs)
-          | [ _ ] | [] -> Ok runs
-        in
-        apart runs
+  let%bind finished =
+    Base.Result.all
+      (List.map
+         (fun { leaves; sorting } ->
+           match sorting with
+           | Sorted sorted -> Ok (leaves, sorted)
+           | Sorting task -> (
+               match Quiver_core.Concurrent.join task with
+               | Ok sorted -> Ok (leaves, sorted)
+               | Error error -> Error (`File error)))
+         finished)
   in
-  let leaves = Base.List.sum (module Base.Int) runs ~f:(fun pages -> List.length pages.pointers) in
-  let u32 bytes at = Int32.to_int (Bytes.get_int32_be bytes at) land 0xFFFF_FFFF in
-  let read n =
+  let read file n =
     let bytes = Bytes.create Page.size in
-    let%map () = File.read t.file n bytes in
+    let%map () = File.read file n bytes in
     bytes
   in
+  let u32 bytes at = Int32.to_int (Bytes.get_int32_be bytes at) land 0xFFFF_FFFF in
   let seal bytes ~number ~prev ~next =
     Page.seal bytes ~kind:Index ~number ~prev ~next ~space:t.space;
     File.write t.file number bytes
   in
-  let%bind leaf_used =
-    match runs with
-    | [ { first; last; used; _ } ] when first = last ->
-        let%bind bytes = read first in
-        let%bind () = File.write t.file first (Bytes.make Page.size '\000') in
-        Bytes.blit_string t.segments 0 bytes 74 20;
-        let%map () = seal bytes ~number:t.layout.root ~prev:Page.null ~next:Page.null in
-        List.map
-          (fun (k, n) ->
-            let pages = List.init n Fun.id in
-            if k = first / 64 then (k, List.filter (fun page -> page <> first mod 64) pages) else (k, pages))
-          used
-    | _ ->
-        let edges = Array.of_list runs in
-        let relink r =
-          let pages = edges.(r) in
-          let prev = if r > 0 then edges.(r - 1).last else Page.null in
-          let next = if r + 1 < Array.length edges then edges.(r + 1).first else Page.null in
-          if pages.first = pages.last then
-            let%bind bytes = read pages.first in
-            seal bytes ~number:pages.first ~prev ~next
-          else
-            let%bind first = read pages.first in
-            let%bind () = seal first ~number:pages.first ~prev ~next:(u32 first 12) in
-            let%bind last = read pages.last in
-            seal last ~number:pages.last ~prev:(u32 last 8) ~next
-        in
-        let%map () =
-          Base.List.fold_result (List.init (Array.length edges) Fun.id) ~init:() ~f:(fun () r -> relink r)
-        in
-        List.concat_map (fun pages -> List.map (fun (k, n) -> (k, List.init n Fun.id)) pages.used) runs
-  in
-  let frags = ref [] and top_used = ref [] and top_extent = ref None in
-  let upper_number () =
-    match List.length !frags with
-    | n when n < 31 ->
-        frags := (5 + n) :: !frags;
-        Ok (5 + n)
-    | _ ->
+  let trees = t.clustered :: t.secondary in
+  let roots = List.map (fun (tree : tree) -> tree.layout.root) trees in
+  let pool = ref (1 + Base.List.fold roots ~init:4 ~f:Int.max) in
+  let build (tree : tree) runs =
+    let leaves = Base.List.sum (module Base.Int) runs ~f:(fun pages -> List.length pages.pointers) in
+    let%bind leaf_used =
+      match runs with
+      | [ { first; last; used; _ } ] when first = last ->
+          let%bind bytes = read t.file first in
+          let%bind () = File.write t.file first (Bytes.make Page.size '\000') in
+          Bytes.blit_string tree.segments 0 bytes 74 20;
+          let%map () = seal bytes ~number:tree.layout.root ~prev:Page.null ~next:Page.null in
+          List.map
+            (fun (k, n) ->
+              let pages = List.init n Fun.id in
+              if k = first / 64 then (k, List.filter (fun page -> page <> first mod 64) pages) else (k, pages))
+            used
+      | _ ->
+          let edges = Array.of_list runs in
+          let relink r =
+            let pages = edges.(r) in
+            let prev = if r > 0 then edges.(r - 1).last else Page.null in
+            let next = if r + 1 < Array.length edges then edges.(r + 1).first else Page.null in
+            if pages.first = pages.last then
+              let%bind bytes = read t.file pages.first in
+              seal bytes ~number:pages.first ~prev ~next
+            else
+              let%bind first = read t.file pages.first in
+              let%bind () = seal first ~number:pages.first ~prev ~next:(u32 first 12) in
+              let%bind last = read t.file pages.last in
+              seal last ~number:pages.last ~prev:(u32 last 8) ~next
+          in
+          let%map () =
+            Base.List.fold_result (List.init (Array.length edges) Fun.id) ~init:() ~f:(fun () r -> relink r)
+          in
+          List.concat_map (fun pages -> List.map (fun (k, n) -> (k, List.init n Fun.id)) pages.used) runs
+    in
+    let frags = ref [] and top_used = ref [] and top_extent = ref None in
+    let upper_number () =
+      if List.length !frags < 31 && !pool < 64 then (
+        let page = !pool in
+        pool := page + 1;
+        frags := page :: !frags;
+        Ok page)
+      else
         let%map k, used =
           match !top_extent with
           | Some (k, used) when used < 64 -> Ok (k, used)
@@ -983,63 +1263,245 @@ let finish t finished =
         in
         top_extent := Some (k, used + 1);
         (64 * k) + used
-  in
-  let root page =
-    Page.close page;
-    Bytes.blit_string t.segments 0 (Page.bytes page) 74 20;
-    seal (Page.bytes page) ~number:t.layout.root ~prev:Page.null ~next:Page.null
-  in
-  let rec level height pointers =
-    let firsts =
-      List.rev
-        (List.fold_left
-           (fun pages ({ lengths; data } as key, child) ->
-             let extra = String.length lengths + t.layout.null_bytes and size = String.length data + 4 in
-             let pages =
-               match pages with
-               | (page, _) :: _ when Page.room page (extra + 5 + size) = Fits -> pages
-               | _ -> (Page.create ~level:height ~index:t.layout.index, key) :: pages
-             in
-             let page, _ = List.hd pages in
-             let flag : Page.flag = if List.length pages = 1 && Page.count page = 0 then Leftmost else Plain in
-             let origin = Page.append page ~extra ~data:size Node_pointer flag in
-             Bytes.blit_string lengths 0 (Page.bytes page) (origin - 5 - extra) (String.length lengths);
-             Bytes.blit_string data 0 (Page.bytes page) origin (String.length data);
-             Bytes.set_int32_be (Page.bytes page) (origin + String.length data) (Int32.of_int child);
-             pages)
-           [] pointers)
     in
-    let pages = List.map fst firsts in
-    match pages with
-    | [ top ] -> root top
-    | _ ->
-        let%bind numbers = Base.Result.all (List.map (fun _ -> upper_number ()) pages) in
-        let numbers = Array.of_list numbers in
+    let root page =
+      Page.close page;
+      Bytes.blit_string tree.segments 0 (Page.bytes page) 74 20;
+      seal (Page.bytes page) ~number:tree.layout.root ~prev:Page.null ~next:Page.null
+    in
+    let rec level height pointers =
+      let firsts =
+        List.rev
+          (List.fold_left
+             (fun pages ({ nulls; lengths; data } as key, child) ->
+               let extra = String.length lengths + tree.layout.null_bytes and size = String.length data + 4 in
+               let pages =
+                 match pages with
+                 | (page, _) :: _ when Page.room page (extra + 5 + size) = Fits -> pages
+                 | _ -> (Page.create ~level:height ~index:tree.layout.index, key) :: pages
+               in
+               let page, _ = List.hd pages in
+               let flag : Page.flag = if List.length pages = 1 && Page.count page = 0 then Leftmost else Plain in
+               let origin = Page.append page ~extra ~data:size Node_pointer flag in
+               Bytes.blit_string lengths 0 (Page.bytes page) (origin - 5 - extra) (String.length lengths);
+               Bytes.blit_string nulls 0 (Page.bytes page) (origin - 5 - String.length nulls) (String.length nulls);
+               Bytes.blit_string data 0 (Page.bytes page) origin (String.length data);
+               Bytes.set_int32_be (Page.bytes page) (origin + String.length data) (Int32.of_int child);
+               pages)
+             [] pointers)
+      in
+      let pages = List.map fst firsts in
+      match pages with
+      | [ top ] -> root top
+      | _ ->
+          let%bind numbers = Base.Result.all (List.map (fun _ -> upper_number ()) pages) in
+          let numbers = Array.of_list numbers in
+          let%bind () =
+            Base.List.fold_result (List.mapi (fun j page -> (j, page)) pages) ~init:() ~f:(fun () (j, page) ->
+                Page.close page;
+                let prev = if j > 0 then numbers.(j - 1) else Page.null in
+                let next = if j + 1 < Array.length numbers then numbers.(j + 1) else Page.null in
+                seal (Page.bytes page) ~number:numbers.(j) ~prev ~next)
+          in
+          level (height + 1) (List.mapi (fun j (_, key) -> (key, numbers.(j))) firsts)
+    in
+    let%map () =
+      match leaves with
+      | 0 -> root (Page.create ~level:0 ~index:tree.layout.index)
+      | 1 -> Ok ()
+      | _ -> level 1 (List.concat_map (fun pages -> pages.pointers) runs)
+    in
+    let top_used =
+      List.map
+        (fun (k, n) -> (k, List.init n Fun.id))
+        (Option.fold ~none:!top_used ~some:(fun current -> current :: !top_used) !top_extent)
+    in
+    (tree, leaf_used, top_used, List.rev !frags)
+  in
+  let null_among (tree : tree) image pos ~fields =
+    let origin = pos + 6 + String.get_uint16_be image (pos + 2) in
+    let rec go j =
+      j < fields
+      &&
+      match (Iarray.get tree.fields j).nullability with
+      | Not_null -> go (j + 1)
+      | Null_bit bit -> String.get_uint8 image (origin - 6 - (bit / 8)) land (1 lsl (bit mod 8)) <> 0 || go (j + 1)
+    in
+    go 0
+    in
+  let merged j (tree : tree) ~from ~until : (pages list, [ `Tablespace of error | `File of File.error ]) result =
+    let fields = Iarray.length tree.fields in
+    let before (h, l) high low = h < high || (h = high && l < low) in
+    let below bound high low = Option.fold bound ~none:false ~some:(fun bound -> before (high, low) (fst bound) (snd bound)) in
+    let reached bound high low = Option.fold bound ~none:false ~some:(fun bound -> not (before (high, low) (fst bound) (snd bound))) in
+    let lists =
+      List.filter_map
+        (fun finished ->
+          let blocks = List.nth (snd finished) j in
+          let rec skip = function
+            | _ :: (next :: _ as rest) when below from (fst next.first) (snd next.first) -> skip rest
+            | blocks -> blocks
+          in
+          match skip blocks with [] -> None | blocks -> Some blocks)
+        finished
+    in
+    let k = List.length lists in
+    let blocks = Array.make k "" and pos = Array.make k 2 and rest = Array.of_list (List.map List.tl lists) in
+    let high = Array.make k 0 and low = Array.make k 0 in
+    let load c (block : block) =
+      let%map bytes = read t.scratch block.number in
+      blocks.(c) <- Bytes.to_string bytes;
+      pos.(c) <- 2
+    in
+    let current c =
+      high.(c) <- Int64.to_int (String.get_int64_be blocks.(c) pos.(c));
+      low.(c) <- Int64.to_int (String.get_int64_be blocks.(c) (pos.(c) + 8))
+    in
+    let advance c =
+      let image = blocks.(c) in
+      let after = pos.(c) + 16 + 6 + String.get_uint16_be image (pos.(c) + 16) in
+      if after < String.get_uint16_be image 0 then (
+        pos.(c) <- after;
+        current c;
+        Ok `Live)
+      else
+        match rest.(c) with
+        | block :: others ->
+            let%map () = load c block in
+            rest.(c) <- others;
+            current c;
+            `Live
+        | [] -> Ok `Spent
+    in
+    let rec start c =
+      if below from high.(c) low.(c) then
+        let%bind state = advance c in
+        match state with `Live -> start c | `Spent -> Ok `Spent
+      else Ok (if reached until high.(c) low.(c) then `Spent else `Live)
+    in
+    let%bind live =
+      Base.List.fold_result (List.mapi (fun c blocks -> (c, List.hd blocks)) lists) ~init:[] ~f:(fun live (c, block) ->
+          let%bind () = load c block in
+          current c;
+          let%map state = start c in
+          match state with `Live -> c :: live | `Spent -> live)
+    in
+    let heap = Array.of_list (List.rev live) in
+    let size = ref (Array.length heap) in
+    let less x y =
+      if high.(x) <> high.(y) then high.(x) < high.(y)
+      else if low.(x) <> low.(y) then low.(x) < low.(y)
+      else compare_images tree blocks.(x) (pos.(x) + 16) blocks.(y) (pos.(y) + 16) ~fields < 0
+    in
+    let rec down i =
+      let l = (2 * i) + 1 in
+      if l < !size then (
+        let r = l + 1 in
+        let smallest = if r < !size && less heap.(r) heap.(l) then r else l in
+        if less heap.(smallest) heap.(i) then (
+          let x = heap.(i) in
+          heap.(i) <- heap.(smallest);
+          heap.(smallest) <- x;
+          down smallest))
+    in
+    let rec heapify i =
+      if i >= 0 then (
+        down i;
+        heapify (i - 1))
+    in
+    heapify ((!size / 2) - 1);
+    let run = started t tree ~rank:0 ~sorting:[||] in
+    let leading = match tree.layout.distinct with Key -> fields | Leading n -> n in
+    let rec next previous =
+      if !size = 0 then Ok ()
+      else
+        let c = heap.(0) in
+        let image = blocks.(c) and at = pos.(c) + 16 and h = high.(c) and l = low.(c) in
         let%bind () =
-          Base.List.fold_result (List.mapi (fun j page -> (j, page)) pages) ~init:() ~f:(fun () (j, page) ->
-              Page.close page;
-              let prev = if j > 0 then numbers.(j - 1) else Page.null in
-              let next = if j + 1 < Array.length numbers then numbers.(j + 1) else Page.null in
-              seal (Page.bytes page) ~number:numbers.(j) ~prev ~next)
+          match previous with
+          | None -> Ok ()
+          | Some (before_image, before_at, before_high, before_low) ->
+              if
+                (not (before (before_high, before_low) h l))
+                && compare_images tree before_image before_at image at ~fields >= 0
+              then Error (`Tablespace Out_of_order)
+              else if
+                leading < fields
+                && compare_images tree before_image before_at image at ~fields:leading = 0
+                && not (null_among tree image at ~fields:leading)
+              then Error (`Tablespace (Duplicate tree.layout.index))
+              else Ok ()
         in
-        level (height + 1)
-          (List.mapi
-             (fun j (_, key) -> (key, numbers.(j)))
-             firsts)
+        let%bind (_ : int) = put run image at in
+        let%bind state = advance c in
+        let () =
+          match state with
+          | `Live when not (reached until high.(c) low.(c)) -> ()
+          | `Live | `Spent ->
+              size := !size - 1;
+              heap.(0) <- heap.(!size)
+        in
+        down 0;
+        next (Some (image, at, h, l))
+    in
+    let%bind () = next None in
+    let%map leaves = leaves_of run in
+    match leaves with Empty -> [] | Pages pages -> [ pages ]
   in
-  let%bind () =
-    match leaves with
-    | 0 -> root (Page.create ~level:0 ~index:t.layout.index)
-    | 1 -> Ok ()
-    | _ -> level 1 (List.concat_map (fun pages -> pages.pointers) runs)
+  let filled = List.filter_map (fun (leaves, _) -> match leaves with Empty -> None | Pages pages -> Some pages) finished in
+  let%bind runs =
+    match t.clustered.layout.order with
+    | Source_order | Fields_order -> Ok (List.sort (fun a b -> Int.compare a.rank b.rank) filled)
+    | Bytes_order ->
+        let runs = List.sort (fun a b -> String.compare a.low.data b.low.data) filled in
+        let rec apart = function
+          | a :: (b :: _ as rest) ->
+              if String.compare a.high.data b.low.data < 0 then apart rest else Error (`Tablespace Overlapping_runs)
+          | [ _ ] | [] -> Ok runs
+        in
+        apart runs
   in
-  let top_used =
-    List.map
-      (fun (k, n) -> (k, List.init n Fun.id))
-      (Option.fold ~none:!top_used ~some:(fun current -> current :: !top_used) !top_extent)
+  let%bind clustered = build t.clustered runs in
+  let%bind merges =
+    let ranges =
+      List.concat
+        (List.mapi
+           (fun j _ ->
+             let firsts =
+               List.sort compare
+                 (List.concat_map
+                    (fun (_, sorted) -> List.map (fun (block : block) -> block.first) (List.nth sorted j))
+                    finished)
+             in
+             let count = List.length firsts in
+             let share = (t.threads + List.length t.secondary - 1) / Int.max 1 (List.length t.secondary) in
+             let parts = Int.max 1 (Int.min share (count / 8)) in
+             let splitters = List.sort_uniq compare (List.init (parts - 1) (fun p -> List.nth firsts ((p + 1) * count / parts))) in
+             List.map2
+               (fun from until -> (j, from, until))
+               (None :: List.map Option.some splitters)
+               (List.map Option.some splitters @ [ None ]))
+           t.secondary)
+      |> Iarray.of_list
+    in
+    let%map pieces =
+      Result.map_error
+        (function `Tablespace error -> `Tablespace error | `File error -> `File error)
+        (Base.Result.all
+           (Quiver_core.Concurrent.spread ~workers:t.threads ranges (fun (j, from, until) ->
+                merged j (List.nth t.secondary j) ~from ~until)))
+    in
+    let pieces = List.combine (Iarray.to_list ranges) pieces in
+    List.mapi
+      (fun j _ -> List.concat_map (fun ((owner, _, _), pages) -> if owner = j then pages else []) pieces)
+      t.secondary
   in
-  let frags = List.rev !frags in
-  let extents = List.map fst leaf_used @ List.map fst top_used in
+  let%bind secondary = Base.Result.all (List.map2 build t.secondary merges) in
+  let built = clustered :: secondary in
+  let frags = List.concat_map (fun (_, _, _, frags) -> frags) built in
+  let extents =
+    List.concat_map (fun (_, leaf_used, top_used, _) -> List.map fst leaf_used @ List.map fst top_used) built
+  in
   let size =
     match extents with
     | [] -> Base.List.fold frags ~init:t.template_size ~f:(fun size page -> Int.max size (page + 1))
@@ -1098,7 +1560,7 @@ let finish t finished =
   in
   let firsts =
     List.init groups (fun g ->
-        let used = if g = 0 then [ 0; 1; 2; 3; 4 ] @ List.map (fun page -> page mod 64) frags else [ 0; 1 ] in
+        let used = if g = 0 then [ 0; 1; 2; 3 ] @ roots @ frags else [ 0; 1 ] in
         (256 * g, used))
   in
   let free_frag = List.filter (fun (_, used) -> List.length used < 64) firsts in
@@ -1117,9 +1579,14 @@ let finish t finished =
       (Int32.of_int (Base.List.sum (module Base.Int) partial ~f:(fun (_, pages) -> List.length pages)));
     List.map fst empty
   in
-  let leaf_empty = segment_extents (List.sort compare leaf_used) ~segment:t.leaf_segment ~inode_at:t.leaf_inode in
-  let top_empty = segment_extents (List.sort compare top_used) ~segment:t.top_segment ~inode_at:t.top_inode in
-  let free = List.sort compare (leaf_empty @ top_empty) in
+  let free =
+    List.sort compare
+      (List.concat_map
+         (fun ((tree : tree), leaf_used, top_used, _) ->
+           segment_extents (List.sort compare leaf_used) ~segment:tree.leaf_segment ~inode_at:tree.leaf_inode
+           @ segment_extents (List.sort compare top_used) ~segment:tree.top_segment ~inode_at:tree.top_inode)
+         built)
+  in
   List.iter (fun k -> describe k ~segment:0 ~state:1 []) free;
   let header = xdes.(0) in
   link header 62 free;
@@ -1129,7 +1596,10 @@ let finish t finished =
   Bytes.set_int32_be header 50 (Int32.of_int (Int.max 64 size));
   Bytes.set_int32_be header 58
     (Int32.of_int (Base.List.sum (module Base.Int) free_frag ~f:(fun (_, used) -> List.length used)));
-  List.iteri (fun j page -> Bytes.set_int32_be inode (t.top_inode + 64 + (4 * (j + 1))) (Int32.of_int page)) frags;
+  List.iter
+    (fun ((tree : tree), _, _, frags) ->
+      List.iteri (fun j page -> Bytes.set_int32_be inode (tree.top_inode + 64 + (4 * (j + 1))) (Int32.of_int page)) frags)
+    built;
   let%bind () =
     Base.List.fold_result (List.init groups Fun.id) ~init:() ~f:(fun () g ->
         let page = xdes.(g) in

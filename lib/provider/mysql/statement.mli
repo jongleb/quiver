@@ -35,6 +35,7 @@ type t =
   | Import_tablespace of Quiver_core.Schema.Name.t
   | Rename_table of { from : Quiver_core.Schema.Name.t; into : Quiver_core.Schema.Name.t }
   | Drop_table of Quiver_core.Schema.Name.t  (** If it exists. *)
+  | Drop_indexes of { table : Quiver_core.Schema.Name.t; indexes : Quiver_core.Ident.t list }
   | Load_local of {
       table : Quiver_core.Ident.t;
       dialect : Quiver_core.Output_format.dialect;

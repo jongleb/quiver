@@ -5,7 +5,6 @@ type error =
   | Unsupported of { column : string; mtype : int; prtype : int }
   | Mismatch of { column : string; ltype : Quiver_core.Ltype.t }
   | Prefix_key of string
-  | Secondary_indexes
   | Row_format of { table_flags : int; space_flags : int }
   | Key_type of string
   | Descending_key of string
@@ -42,11 +41,23 @@ type storage =
 type length = Fixed of int | Varying of { big : bool } [@@deriving sexp_of ~portable]
 
 type nullability = Not_null | Null_bit of int [@@deriving sexp_of ~portable]
-type field = { source : int; storage : storage; nullability : nullability } [@@deriving sexp_of ~portable]
+type part = Whole | Prefix of int [@@deriving sexp_of ~portable]
 
-type order = Bytes_order | Source_order [@@deriving sexp_of ~portable]
+type field = { source : int; storage : storage; nullability : nullability; part : part }
+[@@deriving sexp_of ~portable]
 
-type t = { fields : field list; key : int; order : order; null_bytes : int; index : int; root : int }
+type order = Bytes_order | Source_order | Fields_order [@@deriving sexp_of ~portable]
+type distinct = Key | Leading of int [@@deriving sexp_of ~portable]
+
+type t = {
+  fields : field list;
+  key : int;
+  order : order;
+  distinct : distinct;
+  null_bytes : int;
+  index : int;
+  root : int;
+}
 [@@deriving sexp_of ~portable]
 
 let decimal_bytes ~precision ~scale =
@@ -73,9 +84,6 @@ let of_cfg (cfg : Cfg.t) ~collations dumped =
     match (cfg.table_flags, cfg.space_flags) with
     | 33, 0x4021 -> Ok ()
     | table_flags, space_flags -> Error (`Layout (Row_format { table_flags; space_flags }))
-  in
-  let%bind () =
-    match cfg.secondary with [] -> Ok () | _ :: _ -> Error (`Layout Secondary_indexes)
   in
   let storage (field : Cfg.Index.field) =
     let%bind (column : Cfg.Column.t) =
@@ -153,8 +161,8 @@ let of_cfg (cfg : Cfg.t) ~collations dumped =
   let fields, _ =
     List.fold_left
       (fun (fields, nulls) (source, storage, nullable) ->
-        if nullable then ({ source; storage; nullability = Null_bit nulls } :: fields, nulls + 1)
-        else ({ source; storage; nullability = Not_null } :: fields, nulls))
+        if nullable then ({ source; storage; nullability = Null_bit nulls; part = Whole } :: fields, nulls + 1)
+        else ({ source; storage; nullability = Not_null; part = Whole } :: fields, nulls))
       ([], 0) stored
   in
   Ok
@@ -162,7 +170,51 @@ let of_cfg (cfg : Cfg.t) ~collations dumped =
       fields = List.rev fields;
       key = cfg.clustered.n_uniq;
       order;
+      distinct = Key;
       null_bytes = (cfg.clustered.n_nullable + 7) / 8;
       index = cfg.clustered.id;
       root = cfg.clustered.root;
+    }
+
+let secondary clustered (cfg : Cfg.t) (index : Cfg.Index.t) =
+  let columns = List.combine (List.map (fun (field : Cfg.Index.field) -> field.column) cfg.clustered.fields) clustered.fields in
+  let%bind stored =
+    Base.Result.all
+      (List.map
+         (fun (field : Cfg.Index.field) ->
+           let%bind (column : field) =
+             Option.to_result ~none:(`Layout (Missing_column field.column)) (List.assoc_opt field.column columns)
+           in
+           let%bind part =
+             match (field.prefix, column.storage) with
+             | 0, _ -> Ok Whole
+             | prefix, Variable _ -> Ok (Prefix prefix)
+             | _, _ -> Error (`Layout (Prefix_key field.column))
+           in
+           match (field.order, column.storage) with
+           | Descending, _ -> Error (`Layout (Descending_key field.column))
+           | Ascending, (Integer _ | Decimal _ | Datetime _ | Timestamp _ | Time _ | Binary _ | Variable _) ->
+               Ok (column, part)
+           | Ascending, (Float | Double | Char _ | Text _ | Json | Row_id | Trx_id | Roll_ptr) ->
+               Error (`Layout (Key_type field.column)))
+         index.fields)
+  in
+  let fields, nulls =
+    List.fold_left
+      (fun (fields, nulls) ((column : field), part) ->
+        match column.nullability with
+        | Null_bit _ -> ({ column with nullability = Null_bit nulls; part } :: fields, nulls + 1)
+        | Not_null -> ({ column with part } :: fields, nulls))
+      ([], 0) stored
+  in
+  let n = List.length fields in
+  Ok
+    {
+      fields = List.rev fields;
+      key = n;
+      order = Fields_order;
+      distinct = (if index.n_uniq < n then Leading index.n_uniq else Key);
+      null_bytes = (nulls + 7) / 8;
+      index = index.id;
+      root = index.root;
     }

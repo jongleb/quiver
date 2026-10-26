@@ -1,0 +1,36 @@
+# A quiverfile: defaults for quiver's options, by their long names (quiver <command> --help).
+# Copy it to quiverfile.yaml in the directory you run quiver from, or pass --quiverfile FILE,
+# or set QUIVERFILE. The command line and QUIVER_<NAME> variables win over it.
+
+# At the top: every command that has the option.
+host: db1.internal            # the source; without host, the local socket as mysql finds it
+user: dumper
+tls-ca: /etc/ssl/db-ca.pem
+net-timeout: 600
+
+# Under a command's name: that command alone.
+dump:
+  database: [shop, billing]   # a list gives the option once per item
+  outputdir: /backups/today
+  threads: 16
+  compress: zstd
+  objects: all
+
+copy:
+  database: shop
+  to-host: db2.internal
+  to-user: loader
+  to-database: shop_copy
+  threads: 8
+  target-threads: 16
+  secondary-keys: after-data
+  ingest: tablespace          # MySQL 8.4 target on this machine
+  binlog: skip
+  tablespace-keys: quiver     # or server: every secondary key by ALTER after the import
+  sort-dir: /fast/scratch
+  build-threads: 8
+  data-table: [shop.orders, shop.items]
+
+load:
+  directory: /backups/today
+  threads: 8

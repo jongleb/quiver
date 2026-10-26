@@ -72,12 +72,13 @@ let tests =
              ^ String.concat ",\n" definitions
              ^ "\n) ENGINE=InnoDB"
            in
-           let { Quiver_load.Deferred_keys.create; later; foreign } =
+           let { Quiver_load.Deferred_keys.create; later; foreign; _ } =
              Quiver_load.Deferred_keys.split All_keys table text
            and {
              Quiver_load.Deferred_keys.create = with_keys;
              later = none_later;
              foreign = only_foreign;
+             _;
            } =
              Quiver_load.Deferred_keys.split Foreign_keys table text
            in
@@ -118,7 +119,7 @@ let tests =
       (fun () ->
         List.iter
           (fun text ->
-            let { Quiver_load.Deferred_keys.create; later; foreign } =
+            let { Quiver_load.Deferred_keys.create; later; foreign; _ } =
               Quiver_load.Deferred_keys.split All_keys table text
             in
             Alcotest.(check string) "create" text create;
@@ -130,3 +131,54 @@ let tests =
             "CREATE TABLE `t` (\n  `a` int,\n  KEY `k` (`a`)";
           ]);
   ]
+
+let tests =
+  tests
+  @ [
+      QCheck_alcotest.to_alcotest
+        (QCheck2.Test.make ~count:500
+           ~name:"keys go back in their places, and plain keys after a spatial one wait with it"
+           ~print:(fun (definitions, seed) -> Printf.sprintf "seed %d\n%s" seed (String.concat "\n" definitions))
+           QCheck2.Gen.(
+             let* _, _, lines = statement in
+             let* spatial = option (pair (int_range 0 (List.length lines)) (int_range 0 99)) in
+             let+ seed = int in
+             let lines =
+               Option.fold spatial ~none:lines ~some:(fun (at, n) ->
+                   Base.List.take lines at @ [ Printf.sprintf "  SPATIAL KEY `s%d` (`c0`)" n ] @ Base.List.drop lines at)
+             in
+             let named line = List.nth_opt (String.split_on_char '`' line) 1 in
+             (Base.List.stable_dedup lines ~compare:(fun a b -> Option.compare String.compare (named a) (named b)), seed))
+           (fun (definitions, seed) ->
+             let text = "CREATE TABLE `t` (\n" ^ String.concat ",\n" definitions ^ "\n) ENGINE=InnoDB" in
+             let t = Quiver_load.Deferred_keys.split All_keys table text in
+             let random = Random.State.make [| seed |] in
+             let chosen = List.filter (fun _ -> Random.State.bool random) t.keys in
+             let names = List.map (fun (key : Quiver_load.Deferred_keys.key) -> key.definition) chosen in
+             let kept = lines t.create in
+             let original = List.map String.trim definitions in
+             let expected = List.filter (fun line -> List.mem line kept || List.mem line names) original in
+             let keys = List.map (fun (key : Quiver_load.Deferred_keys.key) -> key.definition) t.keys in
+             let spatial =
+               List.find_index
+                 (fun line -> Base.String.is_prefix line ~prefix:"SPATIAL KEY " && not (List.mem line kept))
+                 original
+             in
+             let position line = Option.get (List.find_index (String.equal line) original) in
+             let deferred_keys =
+               List.filter
+                 (fun line ->
+                   (not (List.mem line kept))
+                   && List.exists (fun prefix -> Base.String.is_prefix line ~prefix) [ "KEY "; "UNIQUE KEY "; "SPATIAL KEY "; "FULLTEXT KEY " ])
+                 original
+             in
+             let sorted = List.sort compare in
+             lines (Quiver_load.Deferred_keys.with_keys t chosen) = expected
+             && sorted (keys @ added t.special) = sorted deferred_keys
+             && List.for_all
+                  (fun (key : Quiver_load.Deferred_keys.key) ->
+                    match (key.group, spatial) with
+                    | Unique, _ | Plain, None -> true
+                    | Plain, Some first -> position key.definition < first)
+                  t.keys));
+    ]

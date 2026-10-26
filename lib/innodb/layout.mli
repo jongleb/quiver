@@ -1,4 +1,4 @@
-(** How a dumped table's rows become records of its clustered index: the
+(** How a dumped table's rows become records of one of its indexes: the
     index's fields in record order, each tied to a column of the dump's batches
     and stored the way InnoDB stores its type. *)
 
@@ -8,8 +8,7 @@ type error =
       (** A stored type this writer does not encode yet. *)
   | Mismatch of { column : string; ltype : Quiver_core.Ltype.t }
       (** The dump's type cannot be the one stored. *)
-  | Prefix_key of string  (** The key indexes a column's prefix. *)
-  | Secondary_indexes  (** Only a table with its primary key alone is built. *)
+  | Prefix_key of string  (** The key indexes a prefix of a column that is not raw bytes. *)
   | Row_format of { table_flags : int; space_flags : int }
       (** Not [DYNAMIC] in a plain 16 KiB tablespace: compressed, encrypted, … *)
   | Key_type of string
@@ -75,10 +74,17 @@ type length : immutable_data =
 (** Whether a field can hold NULL, and which bit of the record says so. *)
 type nullability : immutable_data = Not_null | Null_bit of int [@@deriving sexp_of ~portable]
 
+(** How much of the column a field stores. *)
+type part : immutable_data =
+  | Whole
+  | Prefix of int  (** Its first bytes. *)
+[@@deriving sexp_of ~portable]
+
 type field : immutable_data = {
   source : int;  (** The batch column, or -1 for a system field. *)
   storage : storage;
   nullability : nullability;
+  part : part;
 }
 [@@deriving sexp_of ~portable]
 
@@ -88,14 +94,23 @@ type order : immutable_data =
   | Source_order
       (** By a collation or a float's value: as the source reads them; the server checks
           the order in the target's collation on import. *)
+  | Fields_order
+      (** Field by field: NULL first, then by bytes, a value before a longer one it begins. *)
+[@@deriving sexp_of ~portable]
+
+(** Which leading fields no two records share. *)
+type distinct : immutable_data =
+  | Key  (** The key's: a primary key, or a secondary key with the primary key after it. *)
+  | Leading of int  (** A [UNIQUE] key's own fields, unless one of them is NULL. *)
 [@@deriving sexp_of ~portable]
 
 type t : immutable_data = private {
   fields : field list;  (** In record order: the key first. *)
-  key : int;  (** How many leading fields make the key. *)
+  key : int;  (** How many leading fields make the key a node pointer holds. *)
   order : order;
+  distinct : distinct;
   null_bytes : int;  (** Of every record, node pointers included. *)
-  index : int;  (** The clustered index's id. *)
+  index : int;  (** The index's id. *)
   root : int;  (** Its root page. *)
 }
 [@@deriving sexp_of ~portable]
@@ -106,7 +121,11 @@ val of_cfg :
   (string * Quiver_core.Ltype.t) list ->
   (t, [> `Layout of error ]) result
   @@ portable
-(** For the dump's columns, by name and type, in batch order; [collations]
-    are the server's collations of the character sets stored, by id. *)
+(** The clustered index's, for the dump's columns, by name and type, in batch order;
+    [collations] are the server's collations of the character sets stored, by id. *)
+
+val secondary : t -> Cfg.t -> Cfg.Index.t -> (t, [> `Layout of error ]) result @@ portable
+(** One of [cfg]'s secondary indexes, from its clustered layout: only keys ordered by bytes,
+    ascending, over whole columns or a raw-bytes column's first bytes, after a primary key. *)
 
 val length : storage -> length @@ portable

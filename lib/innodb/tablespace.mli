@@ -1,10 +1,11 @@
-(** A table's clustered index built bottom-up into a copy of the empty
-    tablespace the server created for it, for [ALTER TABLE … IMPORT
-    TABLESPACE]. Batches become record images on any thread; a run takes the
-    images of one key range in order and fills leaf pages in extents of its
-    own, so runs go on at once; [finish] links the runs in key order, builds
-    the levels above, moves the top into the server's root page and writes the
-    space's bookkeeping. *)
+(** A table's indexes built bottom-up into a copy of the empty tablespace the
+    server created for it, for [ALTER TABLE … IMPORT TABLESPACE]. Batches become
+    record images of every index on any thread; a run takes the images of one
+    key range in order and fills clustered leaf pages in extents of its own, so
+    runs go on at once, and sorts its secondary records into a scratch file;
+    [finish] links the runs in key order, merges each secondary index's sorted
+    records into its leaves, builds the levels above each, moves each top into
+    the server's root page and writes the space's bookkeeping. *)
 
 type error =
   | Template of string  (** The empty tablespace is not what this writer expects. *)
@@ -15,20 +16,30 @@ type error =
   | Unstorable of int
       (** The batch column holds a value its field cannot: no such [ENUM] or
           [SET] member, a decimal past the column's digits. *)
-  | Out_of_order  (** A run's keys do not ascend. *)
+  | Out_of_order  (** A run's keys do not ascend, or a secondary index's records repeat. *)
   | Overlapping_runs  (** Two runs share a key range. *)
   | Too_many_extents  (** Past the 4 GiB a 32-bit page number reaches. *)
   | Too_many_rows  (** More rows than six-byte row ids number, for a table without a primary key. *)
+  | Duplicate of int  (** Two records of the [UNIQUE] index with this id share its key. *)
 [@@deriving sexp_of ~portable]
 
 type t : value mod contended portable
 
 val create :
-  template:string -> Layout.t -> File.t -> (t, [> `Tablespace of error ]) result @@ portable
-(** [template] is the empty table's [.ibd]; the pages go to the file. *)
+  template:string ->
+  Layout.t ->
+  secondary:Layout.t list ->
+  File.t ->
+  scratch:File.t ->
+  threads:int ->
+  (t, [> `Tablespace of error ]) result
+  @@ portable
+(** [template] is the empty table's [.ibd], holding exactly the clustered and [secondary]
+    indexes; the pages go to the file, sorted secondary records to [scratch] until [finish],
+    which merges them on at most [threads] threads. *)
 
 type records : immutable_data
-(** A batch's rows as record images. *)
+(** A batch's rows as record images of every index. *)
 
 val encode :
   t ->
@@ -51,10 +62,11 @@ val run : t -> rank:int -> run @@ portable
 val add : run -> records -> (unit, [> `Tablespace of error | `File of File.error ]) result @@ portable
 (** After the run's earlier rows. *)
 
-type finished : immutable_data
-(** A run's pages, waiting for its neighbours. *)
+type finished : value mod contended portable
+(** A run's pages, waiting for its neighbours, and its secondary records sorting on a thread. *)
 
 val close : run -> (finished, [> `File of File.error ]) result @@ portable
+(** Writes its last leaf and starts writing its secondary records, sorted. *)
 
 val finish :
   t -> finished list -> (int, [> `Tablespace of error | `File of File.error ]) result @@ portable

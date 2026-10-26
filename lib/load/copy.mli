@@ -17,16 +17,24 @@ type need =
       (** [--binlog skip]: imported rows never reach the binlog, so replicas
           would miss them without a word. *)
   | Local_datadir of string  (** The data directory, here on this machine. *)
+  | Sort_directory of string  (** A directory here for sorted secondary records. *)
 [@@deriving sexp_of ~portable]
+
+(** How tables are built as tablespaces. *)
+type tablespaces = {
+  datadir : string option;
+      (** The server's data directory as this machine sees it, the server's own path when not given. *)
+  builder : Physical.builder;
+  sorting : string option;  (** Where sorted secondary records wait: beside each built file when not given. *)
+  threads : int option;  (** Threads merging a table's secondary indexes: half the fast cores when not given. *)
+}
 
 (** How the data reaches the target. *)
 type ingest =
   | Load_data  (** [LOAD DATA LOCAL], a transaction per chunk. *)
-  | Tablespaces of { datadir : string option }
+  | Tablespaces of tablespaces
       (** Each table this writer can build is built as a tablespace beside the
-          server and imported (§5.9); the others take [LOAD DATA]. [datadir]
-          is the server's data directory as this machine sees it, the server's
-          own path when not given. *)
+          server and imported (§5.9); the others take [LOAD DATA]. *)
 
 type error =
   | Unreachable of Load.cause  (** A loading session could not be set up. *)
@@ -64,11 +72,19 @@ val create :
 val shutdown : t -> unit
 (** Ends the loading sessions, after the dump succeeded or failed. *)
 
+type imported = {
+  preparing : Core.Time_ns.Span.t;
+      (** Creating its empty table and exporting the template, a free session included. *)
+  queued : Core.Time_ns.Span.t;  (** From its last part to a free session. *)
+  checking : Core.Time_ns.Span.t;  (** Building its upper levels and checking the whole file, here. *)
+  importing : Core.Time_ns.Span.t;  (** [DISCARD], [IMPORT] and [RENAME] on the server. *)
+  keys : Core.Time_ns.Span.t;  (** Adding its secondary keys. *)
+}
+(** Where a table built beside the server spent its time on the target. *)
+
 (** How a table with rows reached the target under [Tablespaces]. *)
 type way =
-  | Imported of { importing : Core.Time_ns.Span.t; keys : Core.Time_ns.Span.t }
-      (** Built beside the server: checking and importing its file after its
-          last part, then adding its secondary keys. *)
+  | Imported of imported
   | Loaded of Physical.unsuitable  (** [LOAD DATA], since the writer cannot build it. *)
 
 val ways : t -> (Quiver_core.Schema.Name.t * way) list
@@ -76,6 +92,17 @@ val ways : t -> (Quiver_core.Schema.Name.t * way) list
 
 val advice : t -> Quiver_core.Advice.t list
 (** What the target's durability settings cost the copy. *)
+
+(** How long [finish] took, part by part. *)
+type finishing =
+  | Unfinished
+  | Finished of {
+      built : Core.Time_ns.Span.t;  (** Waiting for imports and keys still running. *)
+      foreign_keys : Core.Time_ns.Span.t;
+      objects : Core.Time_ns.Span.t;
+    }
+
+val finishing : t -> finishing
 
 include
   Quiver_core.Sink_intf.S

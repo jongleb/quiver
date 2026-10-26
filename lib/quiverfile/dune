@@ -1,0 +1,8 @@
+(library
+ (name quiver_quiverfile)
+ (public_name quiver.quiverfile)
+ (libraries YAMLx base sexplib0)
+ (flags
+  (:standard -open Sexplib0.Sexp_conv))
+ (preprocess
+  (pps ppx_sexp_conv)))

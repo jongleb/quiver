@@ -12,6 +12,7 @@
   quiver.mysql
   quiver.load
   quiver.net
+  quiver.quiverfile
   file_path)
  (link_flags (:standard -ocamlrunparam d=512))
  (preprocess

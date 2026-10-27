@@ -109,6 +109,15 @@ let () =
           Core.Time_ns.Span.pp spent.reading Core.Time_ns.Span.pp spent.waiting
           Core.Time_ns.Span.pp spent.rendering written Core.Time_ns.Span.pp
           spent.writing Core.Time_ns.Span.pp spent.committing holding;
+        List.iter
+          (fun (name, ({ parts; spent; began; ended } : Quiver_core.Spent.table)) ->
+            let noun = match parts with 1 -> "part" | _ -> "parts" in
+            Format.printf
+              "read last: %a, %d %s from %a to %a since the start, reading %a, held back %a@."
+              Quiver_core.Schema.Name.pp name parts noun Core.Time_ns.Span.pp began
+              Core.Time_ns.Span.pp ended Core.Time_ns.Span.pp spent.reading Core.Time_ns.Span.pp
+              spent.waiting)
+          (Base.List.take (Quiver_core.Spent.of_tables manifest.chunks) 5);
         let { Quiver_core.Manifest.connected; planned; snapshot; first_part; read; committed } =
           manifest.phases
         in
@@ -744,6 +753,22 @@ let () =
                    0000-00-00 or 2020-02-30, which has no exact value; \
                    $(b,keep) writes every date as stored, and restoring it \
                    needs a server that accepts it.")
+    and keyless_read =
+      match side with
+      | `Target -> Term.const Quiver_mysql.Provider.Scan
+      | `Source ->
+          Arg.(
+            value
+            & opt
+                (choices Quiver_mysql.Provider.string_of_keyless_read
+                   Quiver_mysql.Provider.all_of_keyless_read)
+                Quiver_mysql.Provider.Scan
+            & described [ "keyless-read" ] ~docv:"WAY"
+                ~doc:
+                  "How a table without a primary key or a unique key over NOT NULL columns \
+                   is read: $(b,scan) in one pass over the whole table, cheap for the \
+                   server; $(b,ranges) by every reader at once, in ranges of another \
+                   index's first column, each row looked up through that index.")
     in
     let route =
       Term.(
@@ -792,7 +817,7 @@ let () =
         $ socket $ host $ port $ tls)
     in
     Term.(
-      const (fun route user password timeouts zero_dates ->
+      const (fun route user password timeouts zero_dates keyless_read ->
           Result.map
             (fun route ->
               {
@@ -802,9 +827,10 @@ let () =
                 timeouts;
                 zero_dates;
                 generated = Left_out;
+                keyless_read;
               })
             route)
-      $ route $ user $ password $ timeouts $ zero_dates)
+      $ route $ user $ password $ timeouts $ zero_dates $ keyless_read)
   in
   let server side =
     Cmdliner.Term.(term_result (const (Result.map warned) $ conn side))

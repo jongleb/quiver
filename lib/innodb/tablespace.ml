@@ -126,6 +126,10 @@ let create ~template (layout : Layout.t) ~secondary file ~scratch =
     extents = Portable.Atomic.make 1;
   }
 
+type order = Key_order | Any_order
+
+let order t = match t.keys with Stored -> Key_order | Numbered -> Any_order
+
 type records = { image : string; rows : int; secondary : string list  (** Each secondary index's, in its order. *) }
 
 let put_int bytes pos n v =

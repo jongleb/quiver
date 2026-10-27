@@ -7,6 +7,9 @@ type zero_dates = Reject | Keep
 
 type generated = Left_out | Read
 
+type keyless_read = Scan | Ranges
+[@@deriving to_string ~capitalize:"kebab-case" ~portable, enumerate]
+
 type conn_config = {
   route : Link.route;
   user : string;
@@ -14,6 +17,7 @@ type conn_config = {
   timeouts : Link.timeouts;
   zero_dates : zero_dates;
   generated : generated;
+  keyless_read : keyless_read;
 }
 
 (** How the group of sessions is opened. *)
@@ -156,6 +160,7 @@ let hang_up session = Quiver_core.Guarded.hold session (fun session -> close ses
 type connections = {
   zero_dates : zero_dates;
   generated : generated;
+  keyless_read : keyless_read;
   server : Server.t;
   control : session Await.Capsule.Await.With_mutex.t;
       (** Takes the lock while the sessions open their snapshots. *)
@@ -239,6 +244,7 @@ let connect config (wanted : Quiver_core.Provider_intf.sessions) =
               {
                 zero_dates = config.zero_dates;
                 generated = config.generated;
+                keyless_read = config.keyless_read;
                 server;
                 control;
                 sessions = Iarray.of_list sessions;
@@ -284,7 +290,7 @@ type index_column = {
   reach : [ `Forceable | `Unforceable ];
 }
 
-let key ~(fields : Quiver_core.Schema.Field.t list) ~keyable indexes =
+let key keyless_read ~(fields : Quiver_core.Schema.Field.t list) ~keyable indexes =
   let usable column = Base.List.mem keyable column ~equal:Quiver_core.Ident.equal in
   let groups =
     Base.List.group indexes ~break:(fun a b -> not (Quiver_core.Ident.equal a.index b.index))
@@ -301,6 +307,9 @@ let key ~(fields : Quiver_core.Schema.Field.t list) ~keyable indexes =
   in
   let indexed () =
     let ranked =
+      match keyless_read with
+      | Scan -> []
+      | Ranges ->
       List.filter_map
         (fun group ->
           match group with
@@ -586,7 +595,7 @@ let introspect connections (filter : Quiver_core.Filter.t) =
                  match kind with `Written -> First field | `Generated -> Second field)
            in
            let key =
-             key
+             key connections.keyless_read
                ~fields:(List.map (fun (field, _, _) -> field) columns)
                ~keyable:
                  (List.filter_map

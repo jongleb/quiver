@@ -51,9 +51,25 @@ type csv = {
   insert : Quiver_sink.Sql.Insert.lines;
 }
 
+(** A run of a spread part, started when a renderer first takes its slot, and the bytes of
+    records it took. *)
+type slot = { mutable run : Quiver_innodb.Tablespace.run option; mutable bytes : int }
+
+(** A part of a table whose runs number their own rows, so its batches need no order: each
+    renderer adds a batch to the lowest slot no other renderer holds, as it renders. *)
+type spread = {
+  space : Quiver_innodb.Tablespace.t;
+  rank : int;
+  slots : slot Await.Capsule.Await.With_mutex.t iarray;
+  held : int Portable.Atomic.t;  (** A bit for each slot a renderer holds. *)
+  closed : Quiver_innodb.Tablespace.finished list Portable.Atomic.t;
+      (** Runs that grew full and closed while the part was read, sorting already. *)
+}
+
 type renderer =
   | Csv of csv
   | Images of { space : Quiver_innodb.Tablespace.t; table : Quiver_core.Schema.Name.t }
+  | Spread_images of { spread : spread; table : Quiver_core.Schema.Name.t }
 
 (** Whether a built table reached the server. *)
 type imported = {
@@ -190,11 +206,16 @@ type loading = {
   mutable apart : (string * int) list;  (** [INSERT]s to run after the data, last first. *)
 }
 
+(** Where a building part's records go. *)
+type placing =
+  | In_order of Quiver_innodb.Tablespace.run  (** Its one run, batch after batch. *)
+  | Spread of spread
+
 type building = {
   owner : t;
   table : Quiver_core.Schema.Name.t;
   state : built;
-  run : Quiver_innodb.Tablespace.run;
+  placing : placing;
   file : File_path.Part.t;  (** The name the chunk's data file would have. *)
   hash : Quiver_sink.Xxh3.t;
   mutable rows : int;
@@ -670,22 +691,44 @@ let part t (table : Quiver_core.Schema.Table.t) ~index =
   match Portable_lockfree_htbl.find t.built table.name with
   | Null -> loading t table ~index
   | This state ->
-      Ok
-        (Building
-           {
-             owner = t;
-             table = table.name;
-             state;
-             run = Quiver_innodb.Tablespace.run (Physical.space state.physical) ~rank:index;
-             file = file_of table.name index;
-             hash = Quiver_sink.Xxh3.create ();
-             rows = 0;
-             bytes = 0;
-           })
+      let space = Physical.space state.physical in
+      let%map placing =
+        match Quiver_innodb.Tablespace.order space with
+        | Key_order -> Ok (In_order (Quiver_innodb.Tablespace.run space ~rank:index))
+        | Any_order ->
+            let slots = 16 in
+            let%map slots =
+              Result.map_error
+                (fun error -> `Sink error)
+                (Base.Result.all
+                   (List.init slots (fun _ ->
+                        Quiver_core.Guarded.create (fun () -> (Ok { run = None; bytes = 0 } : (slot, error) result)))))
+            in
+            Spread
+              {
+                space;
+                rank = index;
+                slots = Iarray.of_list slots;
+                held = Portable.Atomic.make 0;
+                closed = Portable.Atomic.make [];
+              }
+      in
+      Building
+        {
+          owner = t;
+          table = table.name;
+          state;
+          placing;
+          file = file_of table.name index;
+          hash = Quiver_sink.Xxh3.create ();
+          rows = 0;
+          bytes = 0;
+        }
 
 let renderer = function
   | Loading loading -> Csv loading.renderer
-  | Building building -> Images { space = Physical.space building.state.physical; table = building.table }
+  | Building { placing = In_order _; state; table; _ } -> Images { space = Physical.space state.physical; table }
+  | Building { placing = Spread spread; table; _ } -> Spread_images { spread; table }
 
 let render (renderer : renderer) (batch : Quiver_core.Batch.sealed @ local) =
   match renderer with
@@ -694,6 +737,52 @@ let render (renderer : renderer) (batch : Quiver_core.Batch.sealed @ local) =
       match Quiver_innodb.Tablespace.encode space (Quiver_core.Batch.sealed_columns batch) ~rows with
       | Ok records -> Ok (Records { records; rows })
       | Error (`Tablespace error) -> Error (`Sink (Built { table; cause = `Tablespace error })))
+  | Spread_images { spread; table } -> (
+      let rows = Quiver_core.Batch.sealed_rows batch in
+      let add slot records =
+        Quiver_core.Guarded.hold slot (fun slot ->
+            let run =
+              match slot.run with
+              | Some run -> run
+              | None ->
+                  let run = Quiver_innodb.Tablespace.run spread.space ~rank:spread.rank in
+                  slot.run <- Some run;
+                  run
+            in
+            let full = 32 lsl 20 in
+            (let%bind () = Quiver_innodb.Tablespace.add run records in
+             slot.bytes <- slot.bytes + String.length (Quiver_innodb.Tablespace.image records);
+             if slot.bytes < full then Ok ()
+             else
+               let%map finished = Quiver_innodb.Tablespace.close run in
+               slot.run <- None;
+               slot.bytes <- 0;
+               Portable.Atomic.update spread.closed ~pure_f:(fun closed -> finished :: closed)
+              : (unit, Physical.cause) result))
+      in
+      let rec claim () =
+        let held = Portable.Atomic.get spread.held in
+        match lnot held land ((1 lsl Iarray.length spread.slots) - 1) with
+        | 0 -> None
+        | free -> (
+            let bit = free land -free in
+            match Portable.Atomic.compare_and_set spread.held ~if_phys_equal_to:held ~replace_with:(held lor bit) with
+            | Set_here -> Some bit
+            | Compare_failed -> claim ())
+      in
+      let failed (#Physical.cause as cause) = Error (`Sink (Built { table; cause })) in
+      match Quiver_innodb.Tablespace.encode spread.space (Quiver_core.Batch.sealed_columns batch) ~rows with
+      | Error error -> failed error
+      | Ok records -> (
+          let added =
+            match claim () with
+            | None -> add (Iarray.get spread.slots 0) records
+            | Some bit ->
+                let added = add (Iarray.get spread.slots (Base.Int.ctz bit)) records in
+                Portable.Atomic.update spread.held ~pure_f:(fun held -> held land lnot bit);
+                added
+          in
+          match added with Error error -> failed error | Ok () -> Ok (Records { records; rows })))
   | Csv csv ->
       let out = Quiver_core.Buffer_pool.take csv.scratch in
       let unrepresentable (`Unrepresentable_date (table, column)) = `Sink (Unrepresentable_date { table; column }) in
@@ -749,7 +838,12 @@ let append part rendered =
       in
       append_loading loading text rows)
   | Building building, Records { records; rows } -> (
-      match Quiver_innodb.Tablespace.add building.run records with
+      let added =
+        match building.placing with
+        | In_order run -> Quiver_innodb.Tablespace.add run records
+        | Spread _ -> Ok ()
+      in
+      match added with
       | Error (#Physical.cause as cause) -> Error (`Sink (Built { table = building.table; cause }))
       | Ok () ->
           let image = Quiver_innodb.Tablespace.image records in
@@ -825,10 +919,28 @@ let close_building (part : building) answer =
       checksum = Xxh3_64 (Quiver_sink.Xxh3.value part.hash);
     }
   in
-  match Quiver_innodb.Tablespace.close part.run with
+  let closed =
+    match part.placing with
+    | In_order run -> Result.map (fun finished -> [ finished ]) (Quiver_innodb.Tablespace.close run)
+    | Spread spread -> (
+        let closed =
+          Iarray.to_list spread.slots
+          |> List.filter_map (fun slot ->
+                 Quiver_core.Guarded.hold slot (fun slot ->
+                     (Option.map Quiver_innodb.Tablespace.close slot.run
+                       : (Quiver_innodb.Tablespace.finished, Physical.cause) result option)))
+        in
+        match (closed, Portable.Atomic.get spread.closed) with
+        | [], [] ->
+            Result.map
+              (fun finished -> [ finished ])
+              (Quiver_innodb.Tablespace.close (Quiver_innodb.Tablespace.run spread.space ~rank:spread.rank))
+        | closed, earlier -> Result.map (fun closed -> closed @ earlier) (Base.Result.all closed))
+  in
+  match closed with
   | Error (#Physical.cause as cause) -> answer (Error (Built { table = part.table; cause }))
   | Ok finished -> (
-      Portable.Atomic.update state.finished ~pure_f:(fun all -> finished :: all);
+      Portable.Atomic.update state.finished ~pure_f:(fun all -> finished @ all);
       let (_ : int) = Portable.Atomic.fetch_and_add state.sent part.rows in
       let (_ : int) = Portable.Atomic.fetch_and_add state.bytes part.bytes in
       match Portable.Atomic.fetch_and_add state.remaining (-1) with

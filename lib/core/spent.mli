@@ -20,3 +20,14 @@ type stage =
 
 val of_states : Manifest.state list -> t
 val holding : t -> stage
+
+(** How one table's parts were read. *)
+type table = {
+  parts : int;
+  spent : t;
+  began : Core.Time_ns.Span.t;  (** Its first part's query, since the dump began. *)
+  ended : Core.Time_ns.Span.t;  (** Its last part's last row, since the dump began. *)
+}
+
+val of_tables : Manifest.entry list -> (Schema.Name.t * table) list
+(** The tables with a part read, the last to finish reading first. *)

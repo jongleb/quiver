@@ -12,6 +12,12 @@ type zero_dates = Reject | Keep
     {!Quiver_core.Schema.Table.generated}, for a writer that stores whole records. *)
 type generated = Left_out | Read
 
+(** How a table without a primary key or a usable unique one is read: [Scan] whole, in one
+    pass over its clustered index; [Ranges] in ranges of another index's leading column,
+    through that index, looking each row up in the clustered index. *)
+type keyless_read = Scan | Ranges
+[@@deriving to_string ~portable, enumerate ~portable]
+
 type conn_config = {
   route : Link.route;
   user : string;
@@ -19,6 +25,7 @@ type conn_config = {
   timeouts : Link.timeouts;
   zero_dates : zero_dates;
   generated : generated;
+  keyless_read : keyless_read;
 }
 (** Where and as whom to connect. *)
 
@@ -94,6 +101,7 @@ type index_column = {
 }
 
 val key :
+  keyless_read ->
   fields:Quiver_core.Schema.Field.t list ->
   keyable:Quiver_core.Ident.t list ->
   index_column list ->

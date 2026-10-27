@@ -21,6 +21,7 @@ let () =
         };
       zero_dates = Reject;
       generated = Left_out;
+      keyless_read = Scan;
     }
   in
   let fail pp error =

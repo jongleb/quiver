@@ -31,3 +31,37 @@ let holding { reading; waiting; rendering; writing; committing } =
   if seconds waiting < 0.25 *. (seconds reading +. seconds waiting) then Source
   else if seconds rendering >= seconds writing +. seconds committing then Rendering
   else Writing
+
+type table = {
+  parts : int;
+  spent : t;
+  began : Core.Time_ns.Span.t;
+  ended : Core.Time_ns.Span.t;
+}
+
+let of_tables entries =
+  let read =
+    List.filter_map
+      (fun ({ table; state; _ } : Manifest.entry) ->
+        match state with
+        | Pending -> None
+        | Done { reading; _ } -> Some (table, (state, reading)))
+      entries
+  in
+  Base.List.Assoc.sort_and_group read ~compare:Schema.Name.compare
+  |> List.map (fun (name, parts) ->
+         let spans f = List.map (fun (_, (reading : Manifest.reading)) -> f reading) parts in
+         ( name,
+           {
+             parts = List.length parts;
+             spent = of_states (List.map fst parts);
+             began =
+               Option.value ~default:Core.Time_ns.Span.zero
+                 (Base.List.min_elt (spans (fun r -> r.started)) ~compare:Core.Time_ns.Span.compare);
+             ended =
+               Option.value ~default:Core.Time_ns.Span.zero
+                 (Base.List.max_elt
+                    (spans (fun r -> Core.Time_ns.Span.(r.started + r.duration)))
+                    ~compare:Core.Time_ns.Span.compare);
+           } ))
+  |> List.stable_sort (fun (_, a) (_, b) -> Core.Time_ns.Span.compare b.ended a.ended)

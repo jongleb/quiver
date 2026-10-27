@@ -269,9 +269,10 @@ let chosen_key =
   QCheck2.Test.make ~count:500
     ~name:
       "a table with a primary key is chunked by it or read whole; without one, by the first \
-       usable unique index, else the best index to force, else whole"
-    ~print:(fun (fields, keyable, indexes) ->
-      Printf.sprintf "fields=%s keyable=%s indexes=%s"
+       usable unique index, else whole or, when asked, by the best index to force"
+    ~print:(fun (keyless_read, fields, keyable, indexes) ->
+      Printf.sprintf "%s fields=%s keyable=%s indexes=%s"
+        (Quiver_mysql.Provider.string_of_keyless_read keyless_read)
         (String.concat "," (List.map (fun (name, integer) -> name ^ if integer then ":int" else "") fields))
         (String.concat "," keyable)
         (String.concat ";"
@@ -299,13 +300,14 @@ let chosen_key =
       and+ keyable = map (List.filter_map Fun.id) (flatten_list (List.map (fun name -> option ~ratio:0.8 (return name)) names))
       and+ primary = option (index "PRIMARY")
       and+ others = flatten_list (List.map index [ "i"; "j"; "k" ]) >>= shuffle_list
-      and+ count = int_range 0 3 in
+      and+ count = int_range 0 3
+      and+ keyless_read = oneof_list Quiver_mysql.Provider.all_of_keyless_read in
       let others = List.filteri (fun i _ -> i < count) others in
-      (fields, keyable, Option.to_list primary @ others))
-    (fun (fields, keyable, indexes) ->
+      (keyless_read, fields, keyable, Option.to_list primary @ others))
+    (fun (keyless_read, fields, keyable, indexes) ->
       let id = Support.ident in
       let key =
-        Quiver_mysql.Provider.key
+        Quiver_mysql.Provider.key keyless_read
           ~fields:
             (List.map
                (fun (name, integer) ->
@@ -353,11 +355,11 @@ let chosen_key =
             Some (Primary (List.hd (names columns), List.tl (names columns)))
         | Some _ -> Some No_key
         | None -> (
-            match (unique, indexed) with
-            | Some (index, columns, _, _, _, _), _ ->
+            match (unique, indexed, keyless_read) with
+            | Some (index, columns, _, _, _, _), _, _ ->
                 Some (Unique { index = id index; fields = (List.hd (names columns), List.tl (names columns)) })
-            | None, [] -> Some No_key
-            | None, _ :: _ -> None)
+            | None, [], _ | None, _, Scan -> Some No_key
+            | None, _ :: _, Ranges -> None)
       in
       match (expected, key) with
       | Some expected, key ->

@@ -37,6 +37,12 @@ val create :
     indexes; the pages go to the file, sorted secondary records to [scratch] until [finish]
     merges them. *)
 
+(** How a run takes its rows: [Key_order], ascending by key; [Any_order], numbered by the
+    run as they come, for a table without a primary key. *)
+type order = Key_order | Any_order
+
+val order : t -> order @@ portable
+
 type records : immutable_data
 (** A batch's rows as record images of every index. *)
 

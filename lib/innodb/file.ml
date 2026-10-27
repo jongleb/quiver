@@ -13,7 +13,7 @@ let create path =
   let fd = open_ path in
   Result.map (fun () -> fd) (outcome "open" fd)
 
-let whole bytes = Bytes.length bytes = Page.size
+let whole bytes = Bytes.length bytes > 0 && Bytes.length bytes mod Page.size = 0
 
 let write t n bytes = if whole bytes then outcome "pwrite" (write_ t bytes n) else Error (`File { call = "pwrite"; code = 22 })
 let read t n bytes = if whole bytes then outcome "pread" (read_ t bytes n) else Error (`File { call = "pread"; code = 22 })

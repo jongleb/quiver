@@ -1055,8 +1055,11 @@ type pages : immutable_data = {
 (** A run's leaves, if it had rows. *)
 type leaves : immutable_data = Empty | Pages of pages
 
-(** A page of [scratch] and the key prefix of its first record. *)
-type block : immutable_data = { number : int; first : int * int }
+(** A page of [scratch], the key prefix of its first record and how many records it holds. *)
+type block : immutable_data = { number : int; first : int * int; records : int }
+
+(** Where a range of an index's merged records starts or ends: one of its records, at [at] in [image]. *)
+type bound : immutable_data = { prefix : int * int; image : string; at : int }
 
 (** For each secondary index, the pages of [scratch] its records went to, in order. *)
 type sorting : value mod contended portable =
@@ -1195,29 +1198,37 @@ let close run =
         ties j)
     in
     ties 0;
-    let block = Bytes.make Page.size '\000' in
-    let flush used acc =
-      if used = 2 then Ok acc
+    let size i = 16 + 6 + String.get_uint16_be image positions.(order.(i)) in
+    let rec blocks_for i blocks used =
+      if i = n then blocks
+      else if used + size i > Page.size then blocks_for (i + 1) (blocks + 1) (2 + size i)
+      else blocks_for (i + 1) blocks (used + size i)
+    in
+    let count = if n = 0 then 0 else blocks_for 0 1 2 in
+    let pages = Bytes.make (count * Page.size) '\000' in
+    let records = Array.make count 0 in
+    let rec fill i b used firsts =
+      if i = n then (
+        Bytes.set_uint16_be pages (b * Page.size) used;
+        firsts)
+      else if used + size i > Page.size then (
+        Bytes.set_uint16_be pages (b * Page.size) used;
+        fill i (b + 1) 2 firsts)
       else
-        let number = Portable.Atomic.fetch_and_add t.blocks 1 in
-        Bytes.set_uint16_be block 0 used;
-        let%map () = Result.map_error (fun (`File error) -> error) (File.write t.scratch number block) in
-        { number; first = (Int64.to_int (Bytes.get_int64_be block 2), Int64.to_int (Bytes.get_int64_be block 10)) } :: acc
+        let k = order.(i) in
+        let at = (b * Page.size) + used in
+        Bytes.set_int64_be pages at (Int64.of_int high.(k));
+        Bytes.set_int64_be pages (at + 8) (Int64.of_int low.(k));
+        Bytes.blit_string image positions.(k) pages (at + 16) (size i - 16);
+        records.(b) <- records.(b) + 1;
+        fill (i + 1) b (used + size i) (if used = 2 then (high.(k), low.(k)) :: firsts else firsts)
     in
-    let%bind used, acc =
-      Base.Array.fold_result order ~init:(2, []) ~f:(fun (used, acc) k ->
-          let pos = positions.(k) in
-          let size = 6 + String.get_uint16_be image pos in
-          let%map used, acc =
-            if used + 16 + size > Page.size then Result.map (fun acc -> (2, acc)) (flush used acc) else Ok (used, acc)
-          in
-          Bytes.set_int64_be block used (Int64.of_int high.(k));
-          Bytes.set_int64_be block (used + 8) (Int64.of_int low.(k));
-          Bytes.blit_string image pos block (used + 16) size;
-          (used + 16 + size, acc))
-    in
-    let%map blocks = flush used acc in
-    List.rev blocks
+    if count = 0 then Ok []
+    else
+      let firsts = List.rev (fill 0 0 2 []) in
+      let base = Portable.Atomic.fetch_and_add t.blocks count in
+      let%map () = Result.map_error (fun (`File error) -> error) (File.write t.scratch base pages) in
+      List.mapi (fun b first -> { number = base + b; first; records = records.(b) }) firsts
   in
   let%bind leaves = leaves_of run in
   let images = List.mapi (fun j tree -> (tree, Buffer.contents run.sorting.(j))) run.owner.secondary in
@@ -1244,6 +1255,7 @@ let stamp bytes =
 
 let finish t finished ~threads =
   let threads = Int.max 1 threads in
+  let prefix_order (h, l) (h', l') = if h <> h' then Int.compare h h' else Int.compare l l' in
   let%bind finished =
     Base.Result.all
       (List.map
@@ -1392,59 +1404,78 @@ let finish t finished ~threads =
     in
   let merged j (tree : tree) ~from ~until : (pages list, [ `Tablespace of error | `File of File.error ]) result =
     let fields = Iarray.length tree.fields in
-    let before (h, l) high low = h < high || (h = high && l < low) in
-    let below bound high low = Option.fold bound ~none:false ~some:(fun bound -> before (high, low) (fst bound) (snd bound)) in
-    let reached bound high low = Option.fold bound ~none:false ~some:(fun bound -> not (before (high, low) (fst bound) (snd bound))) in
+    let before ((h : int), (l : int)) (high : int) (low : int) = h < high || (h = high && l < low) in
     let lists =
       List.filter_map
         (fun finished ->
           let blocks = List.nth (snd finished) j in
           let rec skip = function
-            | _ :: (next :: _ as rest) when below from (fst next.first) (snd next.first) -> skip rest
+            | _ :: (next :: _ as rest)
+              when Option.fold from ~none:false ~some:(fun (bound : bound) ->
+                       prefix_order next.first bound.prefix < 0) ->
+                skip rest
             | blocks -> blocks
           in
           match skip blocks with [] -> None | blocks -> Some blocks)
         finished
     in
     let k = List.length lists in
-    let blocks = Array.make k "" and pos = Array.make k 2 and rest = Array.of_list (List.map List.tl lists) in
+    let span = Int.max 1 (Int.min 32 (4096 / Int.max 1 (k * threads))) in
+    let chunks = Array.make k "" and block = Array.make k 0 and pos = Array.make k 2 and rest = Array.of_list lists in
     let high = Array.make k 0 and low = Array.make k 0 in
-    let load c (block : block) =
-      let%map bytes = read t.scratch block.number in
-      blocks.(c) <- Bytes.to_string bytes;
-      pos.(c) <- 2
+    let towards (bound : bound) c =
+      let order = prefix_order (high.(c), low.(c)) bound.prefix in
+      if order <> 0 then order else compare_images tree chunks.(c) (pos.(c) + 16) bound.image bound.at ~fields
     in
+    let below bound c = Option.fold bound ~none:false ~some:(fun bound -> towards bound c < 0) in
+    let reached bound c = Option.fold bound ~none:false ~some:(fun bound -> towards bound c >= 0) in
     let current c =
-      high.(c) <- Int64.to_int (String.get_int64_be blocks.(c) pos.(c));
-      low.(c) <- Int64.to_int (String.get_int64_be blocks.(c) (pos.(c) + 8))
+      high.(c) <- Int64.to_int (String.get_int64_be chunks.(c) pos.(c));
+      low.(c) <- Int64.to_int (String.get_int64_be chunks.(c) (pos.(c) + 8))
+    in
+    let load c =
+      match rest.(c) with
+      | [] -> Ok `Spent
+      | first :: _ ->
+          let rec along (blocks : block list) count =
+            match blocks with
+            | next :: others when count < span && next.number = first.number + count -> along others (count + 1)
+            | _ -> (count, blocks)
+          in
+          let count, others = along rest.(c) 0 in
+          let bytes = Bytes.create (count * Page.size) in
+          let%map () = File.read t.scratch first.number bytes in
+          chunks.(c) <- Bytes.unsafe_to_string bytes;
+          block.(c) <- 0;
+          pos.(c) <- 2;
+          rest.(c) <- others;
+          current c;
+          `Live
     in
     let advance c =
-      let image = blocks.(c) in
+      let image = chunks.(c) in
       let after = pos.(c) + 16 + 6 + String.get_uint16_be image (pos.(c) + 16) in
-      if after < String.get_uint16_be image 0 then (
+      if after < block.(c) + String.get_uint16_be image block.(c) then (
         pos.(c) <- after;
         current c;
         Ok `Live)
-      else
-        match rest.(c) with
-        | block :: others ->
-            let%map () = load c block in
-            rest.(c) <- others;
-            current c;
-            `Live
-        | [] -> Ok `Spent
+      else if block.(c) + Page.size < String.length image then (
+        block.(c) <- block.(c) + Page.size;
+        pos.(c) <- block.(c) + 2;
+        current c;
+        Ok `Live)
+      else load c
     in
     let rec start c =
-      if below from high.(c) low.(c) then
+      if below from c then
         let%bind state = advance c in
         match state with `Live -> start c | `Spent -> Ok `Spent
-      else Ok (if reached until high.(c) low.(c) then `Spent else `Live)
+      else Ok (if reached until c then `Spent else `Live)
     in
     let%bind live =
-      Base.List.fold_result (List.mapi (fun c blocks -> (c, List.hd blocks)) lists) ~init:[] ~f:(fun live (c, block) ->
-          let%bind () = load c block in
-          current c;
-          let%map state = start c in
+      Base.List.fold_result (List.init k Fun.id) ~init:[] ~f:(fun live c ->
+          let%bind loaded = load c in
+          let%map state = match loaded with `Live -> start c | `Spent -> Ok `Spent in
           match state with `Live -> c :: live | `Spent -> live)
     in
     let heap = Array.of_list (List.rev live) in
@@ -1452,7 +1483,7 @@ let finish t finished ~threads =
     let less x y =
       if high.(x) <> high.(y) then high.(x) < high.(y)
       else if low.(x) <> low.(y) then low.(x) < low.(y)
-      else compare_images tree blocks.(x) (pos.(x) + 16) blocks.(y) (pos.(y) + 16) ~fields < 0
+      else compare_images tree chunks.(x) (pos.(x) + 16) chunks.(y) (pos.(y) + 16) ~fields < 0
     in
     let rec down i =
       let l = (2 * i) + 1 in
@@ -1477,7 +1508,7 @@ let finish t finished ~threads =
       if !size = 0 then Ok ()
       else
         let c = heap.(0) in
-        let image = blocks.(c) and at = pos.(c) + 16 and h = high.(c) and l = low.(c) in
+        let image = chunks.(c) and at = pos.(c) + 16 and h = high.(c) and l = low.(c) in
         let%bind () =
           match previous with
           | None -> Ok ()
@@ -1497,7 +1528,7 @@ let finish t finished ~threads =
         let%bind state = advance c in
         let () =
           match state with
-          | `Live when not (reached until high.(c) low.(c)) -> ()
+          | `Live when not (reached until c) -> ()
           | `Live | `Spent ->
               size := !size - 1;
               heap.(0) <- heap.(!size)
@@ -1524,26 +1555,51 @@ let finish t finished ~threads =
   in
   let%bind clustered = build t.clustered runs in
   let%bind merges =
-    let ranges =
-      List.concat
-        (List.mapi
+    let%bind ranges =
+      let%map ranges =
+        Base.Result.all
+          (List.mapi
            (fun j _ ->
-             let firsts =
-               List.sort compare
-                 (List.concat_map
-                    (fun (_, sorted) -> List.map (fun (block : block) -> block.first) (List.nth sorted j))
-                    finished)
+             let blocks =
+               Array.of_list
+                 (List.sort
+                    (fun (a : block) (b : block) -> prefix_order a.first b.first)
+                    (List.concat_map (fun (_, sorted) -> List.nth sorted j) finished))
              in
-             let count = List.length firsts in
+             let count = Array.length blocks in
+             let before =
+               Base.Array.folding_map blocks ~init:0 ~f:(fun seen (block : block) -> (seen + block.records, seen))
+             in
+             let total = Base.Array.sum (module Base.Int) blocks ~f:(fun (block : block) -> block.records) in
              let share = (threads + List.length t.secondary - 1) / Int.max 1 (List.length t.secondary) in
              let parts = Int.max 1 (Int.min share (count / 8)) in
-             let splitters = List.sort_uniq compare (List.init (parts - 1) (fun p -> List.nth firsts ((p + 1) * count / parts))) in
+             let splitters =
+               List.sort_uniq Int.compare
+                 (List.filter_map
+                    (fun p ->
+                      match
+                        Base.Array.binary_search before ~compare:Int.compare `First_greater_than_or_equal_to
+                          ((p + 1) * total / parts)
+                      with
+                      | Some b -> Some b
+                      | None -> None)
+                    (List.init (parts - 1) Fun.id))
+             in
+             let%map bounds =
+               Base.Result.all
+                 (List.map
+                    (fun b ->
+                      let%map bytes = read t.scratch blocks.(b).number in
+                      { prefix = blocks.(b).first; image = Bytes.unsafe_to_string bytes; at = 18 })
+                    splitters)
+             in
              List.map2
                (fun from until -> (j, from, until))
-               (None :: List.map Option.some splitters)
-               (List.map Option.some splitters @ [ None ]))
+               (None :: List.map Option.some bounds)
+               (List.map Option.some bounds @ [ None ]))
            t.secondary)
-      |> Iarray.of_list
+      in
+      Iarray.of_list (List.concat ranges)
     in
     let%map pieces =
       Result.map_error

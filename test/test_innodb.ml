@@ -1348,6 +1348,50 @@ let keyed_rows { rows; seed; twin; _ } =
     (("s", String), List.map (fun _ -> `Text (String.make (Random.State.int random 5) 'x')) ids);
   ]
 
+let secondary_hold keyed =
+  let typed = keyed_rows keyed in
+  let bins = List.filter (fun bin -> bin <> `Null) (List.assoc ("bin", Quiver_core.Ltype.Bytes) typed) in
+  let repeated = List.length (List.sort_uniq compare bins) < List.length bins in
+  match (secondary_built typed ~cuts:keyed.cuts ~batch:keyed.batch ~threads:keyed.threads, repeated) with
+  | Error (`Tablespace (Quiver_innodb.Tablespace.Duplicate _)), true -> true
+  | Error _, _ -> QCheck2.Test.fail_reportf "the build failed"
+  | Ok (layout, others, bytes), _ -> (
+      match
+        ( Quiver_innodb.Check.tablespace layout ~secondary:others
+            ~pages:(Bytes.length bytes / Quiver_innodb.Page.size) ~threads:keyed.threads ~read:(read bytes),
+          repeated )
+      with
+      | Error (`Check (Quiver_innodb.Check.Duplicate _)), true -> true
+      | Error _, _ -> QCheck2.Test.fail_reportf "check: %s" (check_error (Quiver_innodb.Check.tablespace layout ~secondary:others ~pages:(Bytes.length bytes / Quiver_innodb.Page.size) ~threads:keyed.threads ~read:(read bytes)))
+      | Ok _, true -> QCheck2.Test.fail_reportf "a repeated unique key passed"
+      | Ok { rows; _ }, false ->
+          let clustered = stored layout bytes in
+          rows = keyed.rows
+          && List.for_all
+               (fun (index : Quiver_innodb.Layout.t) ->
+                 let projected =
+                   List.map
+                     (fun record ->
+                       List.map
+                         (fun (field : Quiver_innodb.Layout.field) ->
+                           let raw =
+                             List.find_map
+                               (fun ((stored : Quiver_innodb.Layout.field), raw) ->
+                                 if stored.source = field.source then Some raw else None)
+                               record
+                           in
+                           match (Option.join raw, field.part) with
+                           | Some raw, Prefix n -> Some (String.sub raw 0 (Int.min n (String.length raw)))
+                           | Some raw, Characters n -> Some (characters n raw)
+                           | raw, (Prefix _ | Characters _ | Whole) -> raw)
+                         index.fields)
+                     clustered
+                 in
+                 let model = List.sort compare projected in
+                 let ours = List.map (List.map snd) (stored index bytes) in
+                 ours = model || QCheck2.Test.fail_reportf "index %d differs from the sorted rows" index.index)
+               others)
+
 let tests =
   tests
   @ [
@@ -1363,49 +1407,19 @@ let tests =
              and+ twin = map (fun k -> k = 0) (int_range 0 4)
              and+ threads = int_range 1 9 in
              { rows; seed; cuts; batch; twin; threads })
-           (fun keyed ->
-             let typed = keyed_rows keyed in
-             let bins = List.filter (fun bin -> bin <> `Null) (List.assoc ("bin", Quiver_core.Ltype.Bytes) typed) in
-             let repeated = List.length (List.sort_uniq compare bins) < List.length bins in
-             match (secondary_built typed ~cuts:keyed.cuts ~batch:keyed.batch ~threads:keyed.threads, repeated) with
-             | Error (`Tablespace (Quiver_innodb.Tablespace.Duplicate _)), true -> true
-             | Error _, _ -> QCheck2.Test.fail_reportf "the build failed"
-             | Ok (layout, others, bytes), _ -> (
-                 match
-                   ( Quiver_innodb.Check.tablespace layout ~secondary:others
-                       ~pages:(Bytes.length bytes / Quiver_innodb.Page.size) ~threads:keyed.threads ~read:(read bytes),
-                     repeated )
-                 with
-                 | Error (`Check (Quiver_innodb.Check.Duplicate _)), true -> true
-                 | Error _, _ -> QCheck2.Test.fail_reportf "check: %s" (check_error (Quiver_innodb.Check.tablespace layout ~secondary:others ~pages:(Bytes.length bytes / Quiver_innodb.Page.size) ~threads:keyed.threads ~read:(read bytes)))
-                 | Ok _, true -> QCheck2.Test.fail_reportf "a repeated unique key passed"
-                 | Ok { rows; _ }, false ->
-                     let clustered = stored layout bytes in
-                     rows = keyed.rows
-                     && List.for_all
-                          (fun (index : Quiver_innodb.Layout.t) ->
-                            let projected =
-                              List.map
-                                (fun record ->
-                                  List.map
-                                    (fun (field : Quiver_innodb.Layout.field) ->
-                                      let raw =
-                                        List.find_map
-                                          (fun ((stored : Quiver_innodb.Layout.field), raw) ->
-                                            if stored.source = field.source then Some raw else None)
-                                          record
-                                      in
-                                      match (Option.join raw, field.part) with
-                                      | Some raw, Prefix n -> Some (String.sub raw 0 (Int.min n (String.length raw)))
-                                      | Some raw, Characters n -> Some (characters n raw)
-                                      | raw, (Prefix _ | Characters _ | Whole) -> raw)
-                                    index.fields)
-                                clustered
-                            in
-                            let model = List.sort compare projected in
-                            let ours = List.map (List.map snd) (stored index bytes) in
-                            ours = model || QCheck2.Test.fail_reportf "index %d differs from the sorted rows" index.index)
-                          others)));
+           secondary_hold);
+      QCheck_alcotest.to_alcotest
+        (QCheck2.Test.make ~count:4
+           ~name:"secondary indexes merged in ranges cut inside runs of one key hold every row's key in order"
+           ~print:(fun keyed -> Sexplib0.Sexp.to_string (sexp_of_keyed keyed))
+           QCheck2.Gen.(
+             let* rows = int_range 20_000 40_000 in
+             let+ seed = int
+             and+ cuts = list_size (int_range 2 6) (int_range 0 rows)
+             and+ batch = int_range 500 3000
+             and+ threads = int_range 14 28 in
+             { rows; seed; cuts; batch; twin = false; threads })
+           secondary_hold);
     ]
 
 let origins file n =

@@ -82,3 +82,20 @@ include
      and type error := error
      and type position := position
      and type snapshot_mode := snapshot_mode
+
+(** One column of an index, as [information_schema.STATISTICS] lists it. *)
+type index_column = {
+  index : Quiver_core.Ident.t;
+  column : Quiver_core.Ident.t option;  (** [None] for an expression. *)
+  uniqueness : [ `Unique | `Repeating ];
+  part : [ `Whole | `Prefix ];
+  cardinality : int;
+  reach : [ `Forceable | `Unforceable ];  (** A visible BTREE index that [FORCE INDEX] can name. *)
+}
+
+val key :
+  fields:Quiver_core.Schema.Field.t list ->
+  keyable:Quiver_core.Ident.t list ->
+  index_column list ->
+  Quiver_core.Ident.t Quiver_core.Schema.Table.key
+(** The key to chunk by; a table with a primary key is read in its order, by it or whole. *)

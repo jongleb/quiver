@@ -8,10 +8,10 @@ val create : string -> (t, [> `File of error ]) result @@ portable
 (** Created anew, or emptied. *)
 
 val write : t -> int -> Bytes.t -> (unit, [> `File of error ]) result @@ portable
-(** Page [n], a whole page of bytes. *)
+(** Pages from [n], a whole number of pages of bytes. *)
 
 val read : t -> int -> Bytes.t -> (unit, [> `File of error ]) result @@ portable
-(** Page [n] into a page of bytes: zeros where the file has none. *)
+(** Pages from [n] into a whole number of pages of bytes: zeros where the file has none. *)
 
 val resize : t -> pages:int -> (unit, [> `File of error ]) result @@ portable
 val close : t -> unit @@ portable

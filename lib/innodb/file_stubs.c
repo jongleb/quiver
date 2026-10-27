@@ -9,7 +9,7 @@
 #include <unistd.h>
 
 /* A tablespace file written and read by whole pages from any thread: each call
-   copies the page outside the OCaml heap before releasing the runtime, so the
+   copies the pages outside the OCaml heap before releasing the runtime, so the
    bytes cannot move under the system call. Results are 0 or -errno. */
 
 #define PAGE 16384
@@ -20,19 +20,20 @@ value quiver_innodb_open(value path)
   return Val_long(fd < 0 ? -errno : fd);
 }
 
-value quiver_innodb_write(value fd, value page, value number)
+value quiver_innodb_write(value fd, value pages, value number)
 {
-  CAMLparam3(fd, page, number);
-  char *copy = malloc(PAGE);
+  CAMLparam3(fd, pages, number);
+  size_t length = caml_string_length(pages);
+  char *copy = malloc(length);
   if (copy == NULL) CAMLreturn(Val_long(-ENOMEM));
-  memcpy(copy, Bytes_val(page), PAGE);
+  memcpy(copy, Bytes_val(pages), length);
   int f = Int_val(fd);
   off_t at = (off_t)Long_val(number) * PAGE;
   long result = 0;
   caml_enter_blocking_section();
   size_t done = 0;
-  while (done < PAGE) {
-    ssize_t n = pwrite(f, copy + done, PAGE - done, at + (off_t)done);
+  while (done < length) {
+    ssize_t n = pwrite(f, copy + done, length - done, at + (off_t)done);
     if (n < 0) {
       if (errno == EINTR) continue;
       result = -errno;
@@ -45,18 +46,19 @@ value quiver_innodb_write(value fd, value page, value number)
   CAMLreturn(Val_long(result));
 }
 
-value quiver_innodb_read(value fd, value page, value number)
+value quiver_innodb_read(value fd, value pages, value number)
 {
-  CAMLparam3(fd, page, number);
-  char *copy = calloc(1, PAGE);
+  CAMLparam3(fd, pages, number);
+  size_t length = caml_string_length(pages);
+  char *copy = calloc(1, length);
   if (copy == NULL) CAMLreturn(Val_long(-ENOMEM));
   int f = Int_val(fd);
   off_t at = (off_t)Long_val(number) * PAGE;
   long result = 0;
   caml_enter_blocking_section();
   size_t done = 0;
-  while (done < PAGE) {
-    ssize_t n = pread(f, copy + done, PAGE - done, at + (off_t)done);
+  while (done < length) {
+    ssize_t n = pread(f, copy + done, length - done, at + (off_t)done);
     if (n < 0) {
       if (errno == EINTR) continue;
       result = -errno;
@@ -66,7 +68,7 @@ value quiver_innodb_read(value fd, value page, value number)
     done += (size_t)n;
   }
   caml_leave_blocking_section();
-  if (result == 0) memcpy(Bytes_val(page), copy, PAGE);
+  if (result == 0) memcpy(Bytes_val(pages), copy, length);
   free(copy);
   CAMLreturn(Val_long(result));
 }

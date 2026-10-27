@@ -275,6 +275,71 @@ let supports : type lvl.
       Error (`Consistency (Unsupported (Any Best_effort)))
   | Trx_only, Snapshot -> Error (`Consistency (Unsupported (Any Snapshot)))
 
+type index_column = {
+  index : Quiver_core.Ident.t;
+  column : Quiver_core.Ident.t option;
+  uniqueness : [ `Unique | `Repeating ];
+  part : [ `Whole | `Prefix ];
+  cardinality : int;
+  reach : [ `Forceable | `Unforceable ];
+}
+
+let key ~(fields : Quiver_core.Schema.Field.t list) ~keyable indexes =
+  let usable column = Base.List.mem keyable column ~equal:Quiver_core.Ident.equal in
+  let groups =
+    Base.List.group indexes ~break:(fun a b -> not (Quiver_core.Ident.equal a.index b.index))
+  in
+  let whole group =
+    match group with
+    | { index; uniqueness = `Unique; _ } :: _ -> (
+        let columns = List.map (fun { column; _ } -> column) group in
+        match columns with
+        | Some first :: rest when List.for_all (Base.Option.exists ~f:usable) columns ->
+            Some (index, (first, Base.List.filter_opt rest))
+        | _ -> None)
+    | { uniqueness = `Repeating; _ } :: _ | [] -> None
+  in
+  let indexed () =
+    let ranked =
+      List.filter_map
+        (fun group ->
+          match group with
+          | { index; column = Some column; part = `Whole; cardinality; reach = `Forceable; _ } :: _
+            when usable column ->
+              let rank =
+                Option.fold ~none:1
+                  ~some:(fun ({ ltype; _ } : Quiver_core.Schema.Field.t) ->
+                    match ltype with
+                    | Int8 | Int16 | Int32 | Int64 | Uint8 | Uint16 | Uint32 | Uint64 -> 0
+                    | _ -> 1)
+                  (List.find_opt
+                     (fun ({ name; _ } : Quiver_core.Schema.Field.t) ->
+                       Quiver_core.Ident.equal name column)
+                     fields)
+              in
+              Some ((rank, -cardinality), index, column)
+          | _ -> None)
+        groups
+    in
+    Option.fold ~none:Quiver_core.Schema.Table.No_key
+      ~some:(fun (_, index, field) -> Quiver_core.Schema.Table.Indexed { index; field })
+      (Base.List.min_elt ranked ~compare:(fun (a, _, _) (b, _, _) -> [%compare: int * int] a b))
+  in
+  Option.fold
+    ~none:
+      (Option.fold ~none:(indexed ())
+         ~some:(fun (index, fields) -> Quiver_core.Schema.Table.Unique { index; fields })
+         (List.find_map whole groups))
+    ~some:(fun group ->
+      Option.fold ~none:Quiver_core.Schema.Table.No_key
+        ~some:(fun (_, fields) -> Quiver_core.Schema.Table.Primary fields)
+        (whole group))
+    (List.find_opt
+       (function
+         | { index; _ } :: _ -> String.equal (index :> string) "PRIMARY"
+         | [] -> false)
+       groups)
+
 let introspect connections (filter : Quiver_core.Filter.t) =
   let tables, (columns, indexes) =
     Quiver_core.Concurrent.both
@@ -448,7 +513,9 @@ let introspect connections (filter : Quiver_core.Filter.t) =
                let uniqueness = if String.equal non_unique "0" then `Unique else `Repeating in
                let part = Option.fold ~none:`Whole ~some:(fun _ -> `Prefix) sub_part in
                let reach = if String.equal reachable "1" then `Forceable else `Unforceable in
-               Ok (table, (index, column, uniqueness, part, number (Some cardinality), reach))
+               Ok
+                 ( table,
+                   { index; column; uniqueness; part; cardinality = number (Some cardinality); reach } )
            | _ -> unexpected (Indexes connections.server))
          indexes)
   in
@@ -518,86 +585,19 @@ let introspect connections (filter : Quiver_core.Filter.t) =
              Base.List.partition_map columns ~f:(fun (field, _, kind) ->
                  match kind with `Written -> First field | `Generated -> Second field)
            in
-           let keyable =
-             Idents.of_list
-               (List.filter_map
-                  (fun ( ({ name; nullability; ltype } :
-                           Quiver_core.Schema.Field.t),
-                         literals, _ ) ->
-                    match (nullability, literals, key_parser ltype) with
-                    | Not_null, `Splittable, Some _ -> Some name
-                    | Nullable, _, _ | _, `Unsplittable, _ | _, _, None ->
-                        None)
-                  columns)
-           in
-           let usable columns =
-             List.for_all
-               (Base.Option.exists ~f:(fun column -> Idents.mem column keyable))
-               columns
-           in
-           let groups =
-             Base.List.group
-               (Base.Hashtbl.find_multi indexes_by_table name)
-               ~break:(fun (a, _, _, _, _, _) (b, _, _, _, _, _) ->
-                 not (Quiver_core.Ident.equal a b))
-           in
-           let candidates =
-             List.filter_map
-               (fun group ->
-                 match group with
-                 | (index, _, `Unique, _, _, _) :: _ -> (
-                     let columns = List.map (fun (_, column, _, _, _, _) -> column) group in
-                     match columns with
-                     | Some first :: rest when usable columns ->
-                         Some (index, (first, Base.List.filter_opt rest))
-                     | _ -> None)
-                 | (_, _, `Repeating, _, _, _) :: _ | [] -> None)
-               groups
-           in
-           let indexed =
-             let ranked =
-               List.filter_map
-                 (fun group ->
-                   match group with
-                   | (index, Some column, _, `Whole, cardinality, `Forceable) :: _
-                     when Idents.mem column keyable ->
-                       let rank =
-                         Option.fold ~none:1
-                           ~some:(fun ({ Quiver_core.Schema.Field.ltype; _ }, _, _) ->
-                             match ltype with
-                             | Int8 | Int16 | Int32 | Int64 | Uint8 | Uint16 | Uint32 | Uint64 -> 0
-                             | _ -> 1)
-                           (List.find_opt
-                              (fun ({ Quiver_core.Schema.Field.name; _ }, _, _) ->
-                                Quiver_core.Ident.equal name column)
-                              columns)
-                       in
-                       Some ((rank, -cardinality), index, column)
-                   | _ -> None)
-                 groups
-             in
-             Option.map
-               (fun (_, index, field) -> Quiver_core.Schema.Table.Indexed { index; field })
-               (Base.List.min_elt ranked ~compare:(fun (a, _, _) (b, _, _) -> [%compare: int * int] a b))
-           in
            let key =
-             Option.value
-               ~default:
-                 (Option.fold
-                    ~none:(Option.value indexed ~default:Quiver_core.Schema.Table.No_key)
-                    ~some:(fun (index, fields) ->
-                      Quiver_core.Schema.Table.Unique { index; fields })
-                    (Base.List.hd candidates))
-               (let open Base.Option.Let_syntax in
-                let%map fields =
-                  List.find_map
-                    (fun ((index : Quiver_core.Ident.t), fields) ->
-                      match (index :> string) with
-                      | "PRIMARY" -> Some fields
-                      | _ -> None)
-                    candidates
-                in
-                Quiver_core.Schema.Table.Primary fields)
+             key
+               ~fields:(List.map (fun (field, _, _) -> field) columns)
+               ~keyable:
+                 (List.filter_map
+                    (fun ( ({ name; nullability; ltype } : Quiver_core.Schema.Field.t),
+                           literals,
+                           _ ) ->
+                      match (nullability, literals, key_parser ltype) with
+                      | Not_null, `Splittable, Some _ -> Some name
+                      | Nullable, _, _ | _, `Unsplittable, _ | _, _, None -> None)
+                    columns)
+               (Base.Hashtbl.find_multi indexes_by_table name)
            in
            Quiver_core.Schema.Table.make ~name ~fields ~generated ~key
              ~estimate:{ rows; bytes })

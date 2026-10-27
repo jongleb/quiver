@@ -1,0 +1,5 @@
+(executable
+ (name main)
+ (flags
+  (:standard -open Stdlib_stable))
+ (libraries stdlib_stable core quiver.core quiver.innodb unix))

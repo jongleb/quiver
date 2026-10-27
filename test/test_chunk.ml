@@ -265,6 +265,114 @@ let indexed_cover =
       && List.for_all through (Chunk.whole table :: Option.to_list closed @ chunks)
       && Option.is_some (Chunk.integer_key (Chunk.whole table)))
 
+let chosen_key =
+  QCheck2.Test.make ~count:500
+    ~name:
+      "a table with a primary key is chunked by it or read whole; without one, by the first \
+       usable unique index, else the best index to force, else whole"
+    ~print:(fun (fields, keyable, indexes) ->
+      Printf.sprintf "fields=%s keyable=%s indexes=%s"
+        (String.concat "," (List.map (fun (name, integer) -> name ^ if integer then ":int" else "") fields))
+        (String.concat "," keyable)
+        (String.concat ";"
+           (List.map
+              (fun (index, columns, unique, whole, cardinality, forceable) ->
+                Printf.sprintf "%s(%s)%s%s%s#%d" index
+                  (String.concat "," (List.map (Option.value ~default:"<expr>") columns))
+                  (if unique then " unique" else "")
+                  (if whole then "" else " prefix")
+                  (if forceable then "" else " unforceable")
+                  cardinality)
+              indexes)))
+    QCheck2.Gen.(
+      let names = [ "a"; "b"; "c"; "d" ] in
+      let column = oneof_weighted [ (6, map Option.some (oneof_list names)); (1, return None) ] in
+      let index name =
+        let+ columns = list_size (int_range 1 2) column
+        and+ unique = oneof_weighted [ (1, return true); (3, return false) ]
+        and+ whole = oneof_weighted [ (4, return true); (1, return false) ]
+        and+ cardinality = int_range 0 3
+        and+ forceable = oneof_weighted [ (4, return true); (1, return false) ] in
+        (name, columns, unique || String.equal name "PRIMARY", whole, cardinality, forceable)
+      in
+      let+ fields = flatten_list (List.map (fun name -> map (fun integer -> (name, integer)) bool) names)
+      and+ keyable = map (List.filter_map Fun.id) (flatten_list (List.map (fun name -> option ~ratio:0.8 (return name)) names))
+      and+ primary = option (index "PRIMARY")
+      and+ others = flatten_list (List.map index [ "i"; "j"; "k" ]) >>= shuffle_list
+      and+ count = int_range 0 3 in
+      let others = List.filteri (fun i _ -> i < count) others in
+      (fields, keyable, Option.to_list primary @ others))
+    (fun (fields, keyable, indexes) ->
+      let id = Support.ident in
+      let key =
+        Quiver_mysql.Provider.key
+          ~fields:
+            (List.map
+               (fun (name, integer) ->
+                 {
+                   Schema.Field.name = id name;
+                   ltype = (if integer then Ltype.Int32 else Ltype.String);
+                   nullability = Not_null;
+                 })
+               fields)
+          ~keyable:(List.map id keyable)
+          (List.concat_map
+             (fun (index, columns, unique, whole, cardinality, forceable) ->
+               List.map
+                 (fun column ->
+                   {
+                     Quiver_mysql.Provider.index = id index;
+                     column = Option.map id column;
+                     uniqueness = (if unique then `Unique else `Repeating);
+                     part = (if whole then `Whole else `Prefix);
+                     cardinality;
+                     reach = (if forceable then `Forceable else `Unforceable);
+                   })
+                 columns)
+             indexes)
+      in
+      let usable = function Some column -> List.mem column keyable | None -> false in
+      let names columns = List.map (fun column -> id (Option.get column)) columns in
+      let rank (index, columns, _, _, cardinality, _) =
+        let integer = List.assoc (Option.get (List.hd columns)) fields in
+        ((if integer then 0 else 1), -cardinality, index)
+      in
+      let indexed =
+        List.filter
+          (fun (_, columns, _, whole, _, forceable) -> whole && forceable && usable (List.hd columns))
+          indexes
+      in
+      let unique =
+        List.find_opt
+          (fun (_, columns, unique, _, _, _) -> unique && List.for_all usable columns)
+          indexes
+      in
+      let expected : Ident.t Schema.Table.key option =
+        match List.find_opt (fun (index, _, _, _, _, _) -> String.equal index "PRIMARY") indexes with
+        | Some (_, columns, _, _, _, _) when List.for_all usable columns ->
+            Some (Primary (List.hd (names columns), List.tl (names columns)))
+        | Some _ -> Some No_key
+        | None -> (
+            match (unique, indexed) with
+            | Some (index, columns, _, _, _, _), _ ->
+                Some (Unique { index = id index; fields = (List.hd (names columns), List.tl (names columns)) })
+            | None, [] -> Some No_key
+            | None, _ :: _ -> None)
+      in
+      match (expected, key) with
+      | Some expected, key ->
+          let sexp = Schema.Table.sexp_of_key Ident.sexp_of_t in
+          Sexplib0.Sexp.equal (sexp expected) (sexp key)
+      | None, Indexed { index; field } ->
+          let best = List.fold_left (fun best entry -> min best (rank entry)) (rank (List.hd indexed)) indexed in
+          List.exists
+            (fun ((name, columns, _, _, _, _) as entry) ->
+              String.equal name (index :> string)
+              && Ident.equal (id (Option.get (List.hd columns))) field
+              && (let r, c, _ = rank entry and r', c', _ = best in r = r' && c = c'))
+            indexed
+      | None, (Primary _ | Unique _ | No_key) -> false)
+
 let tests =
   [
     Alcotest.test_case "chunks print as table and key range" `Quick (fun () ->
@@ -290,6 +398,7 @@ let tests =
          });
     QCheck_alcotest.to_alcotest tuple_cover;
     QCheck_alcotest.to_alcotest indexed_cover;
+    QCheck_alcotest.to_alcotest chosen_key;
     QCheck_alcotest.to_alcotest
       (exact_cover
          {

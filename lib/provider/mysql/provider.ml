@@ -282,7 +282,7 @@ let introspect connections (filter : Quiver_core.Filter.t) =
       (fun () ->
         Quiver_core.Concurrent.both
           (fun () -> fetch connections Columns)
-          (fun () -> fetch connections Unique_indexes))
+          (fun () -> fetch connections (Indexes connections.server)))
   in
   let%bind tables = provider tables
   and columns = provider columns
@@ -434,7 +434,8 @@ let introspect connections (filter : Quiver_core.Filter.t) =
     Base.Result.all
       (List.map
          (function
-           | [ Some database; Some table; Some index; column ] ->
+           | [ Some database; Some table; Some index; column; Some non_unique; sub_part;
+               Some cardinality; Some reachable ] ->
                let%bind table = name database table in
                let%bind index = Quiver_core.Ident.of_string index in
                let%bind column =
@@ -444,17 +445,18 @@ let introspect connections (filter : Quiver_core.Filter.t) =
                        (Quiver_core.Ident.of_string column))
                    column
                in
-               Ok (table, index, column)
-           | _ -> unexpected Unique_indexes)
+               let uniqueness = if String.equal non_unique "0" then `Unique else `Repeating in
+               let part = Option.fold ~none:`Whole ~some:(fun _ -> `Prefix) sub_part in
+               let reach = if String.equal reachable "1" then `Forceable else `Unforceable in
+               Ok (table, (index, column, uniqueness, part, number (Some cardinality), reach))
+           | _ -> unexpected (Indexes connections.server))
          indexes)
   in
   let indexes_by_table =
     Base.Hashtbl.create (module Quiver_core.Schema.Name)
   in
   List.iter
-    (fun (table, index, column) ->
-      Base.Hashtbl.add_multi indexes_by_table ~key:table
-        ~data:(index, column))
+    (fun (table, entry) -> Base.Hashtbl.add_multi indexes_by_table ~key:table ~data:entry)
     (List.rev indexes);
   let module Idents = Set.Make (Quiver_core.Ident) in
   let module Names = Set.Make (Quiver_core.Schema.Name) in
@@ -533,26 +535,56 @@ let introspect connections (filter : Quiver_core.Filter.t) =
                (Base.Option.exists ~f:(fun column -> Idents.mem column keyable))
                columns
            in
+           let groups =
+             Base.List.group
+               (Base.Hashtbl.find_multi indexes_by_table name)
+               ~break:(fun (a, _, _, _, _, _) (b, _, _, _, _, _) ->
+                 not (Quiver_core.Ident.equal a b))
+           in
            let candidates =
              List.filter_map
                (fun group ->
                  match group with
-                 | (index, _) :: _ -> (
-                     let columns = List.map snd group in
+                 | (index, _, `Unique, _, _, _) :: _ -> (
+                     let columns = List.map (fun (_, column, _, _, _, _) -> column) group in
                      match columns with
                      | Some first :: rest when usable columns ->
                          Some (index, (first, Base.List.filter_opt rest))
                      | _ -> None)
-                 | [] -> None)
-               (Base.List.group
-                  (Base.Hashtbl.find_multi indexes_by_table name)
-                  ~break:(fun (a, _) (b, _) ->
-                    not (Quiver_core.Ident.equal a b)))
+                 | (_, _, `Repeating, _, _, _) :: _ | [] -> None)
+               groups
+           in
+           let indexed =
+             let ranked =
+               List.filter_map
+                 (fun group ->
+                   match group with
+                   | (index, Some column, _, `Whole, cardinality, `Forceable) :: _
+                     when Idents.mem column keyable ->
+                       let rank =
+                         Option.fold ~none:1
+                           ~some:(fun ({ Quiver_core.Schema.Field.ltype; _ }, _, _) ->
+                             match ltype with
+                             | Int8 | Int16 | Int32 | Int64 | Uint8 | Uint16 | Uint32 | Uint64 -> 0
+                             | _ -> 1)
+                           (List.find_opt
+                              (fun ({ Quiver_core.Schema.Field.name; _ }, _, _) ->
+                                Quiver_core.Ident.equal name column)
+                              columns)
+                       in
+                       Some ((rank, -cardinality), index, column)
+                   | _ -> None)
+                 groups
+             in
+             Option.map
+               (fun (_, index, field) -> Quiver_core.Schema.Table.Indexed { index; field })
+               (Base.List.min_elt ranked ~compare:(fun (a, _, _) (b, _, _) -> [%compare: int * int] a b))
            in
            let key =
              Option.value
                ~default:
-                 (Option.fold ~none:Quiver_core.Schema.Table.No_key
+                 (Option.fold
+                    ~none:(Option.value indexed ~default:Quiver_core.Schema.Table.No_key)
                     ~some:(fun (index, fields) ->
                       Quiver_core.Schema.Table.Unique { index; fields })
                     (Base.List.hd candidates))
@@ -641,11 +673,16 @@ let plan connections (schema : Quiver_core.Schema.t)
                               ~some:(value field) cell)
                           pairs)
                in
-               match table.key with
-               | No_key -> whole
-               | _ when count <= 1 -> whole
-               | Primary ((first, rest) as key)
-               | Unique { fields = (first, rest) as key; _ } -> (
+               let splittable : (Quiver_core.Schema.Field.t * Quiver_core.Schema.Field.t list) option =
+                 match table.key with
+                 | No_key -> None
+                 | Primary key | Unique { fields = key; _ } -> Some key
+                 | Indexed { field; _ } -> Some (field, [])
+               in
+               match splittable with
+               | None -> whole
+               | Some _ when count <= 1 -> whole
+               | Some ((first, rest) as key) -> (
                    match
                      Base.Option.all
                        (List.map

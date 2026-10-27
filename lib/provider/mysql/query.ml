@@ -7,7 +7,7 @@ type collation = {
 type t =
   | Tables
   | Columns
-  | Unique_indexes
+  | Indexes of Server.t
   | Key_bounds of {
       table : Quiver_core.Schema.Name.t;
       key : Quiver_core.Ident.t;
@@ -126,12 +126,17 @@ let sql = function
          IS_NULLABLE, NUMERIC_PRECISION, NUMERIC_SCALE, DATETIME_PRECISION, \
          EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA NOT IN \
          %{system} ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION"]
-  | Unique_indexes ->
+  | Indexes server ->
+      let usable =
+        match server with
+        | Mysql_8_0 _ | Mysql_8_4 _ -> "IS_VISIBLE = 'YES'"
+        | Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _ -> "IGNORED = 'NO'"
+      in
       [%string
-        "SELECT TABLE_SCHEMA, TABLE_NAME, INDEX_NAME, COLUMN_NAME FROM \
-         information_schema.STATISTICS WHERE NON_UNIQUE = 0 AND TABLE_SCHEMA \
-         NOT IN %{system} ORDER BY TABLE_SCHEMA, TABLE_NAME, INDEX_NAME, \
-         SEQ_IN_INDEX"]
+        "SELECT TABLE_SCHEMA, TABLE_NAME, INDEX_NAME, COLUMN_NAME, NON_UNIQUE, \
+         SUB_PART, IFNULL(CARDINALITY, 0), INDEX_TYPE = 'BTREE' AND %{usable} \
+         FROM information_schema.STATISTICS WHERE TABLE_SCHEMA NOT IN %{system} \
+         ORDER BY TABLE_SCHEMA, TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX"]
   | Key_bounds { table; key } ->
       [%string "SELECT MIN(%{Quiver_core.Ident.backquoted key}), MAX(%{Quiver_core.Ident.backquoted key}) FROM %{qualified table}"]
   | Read_threads server -> (
@@ -189,10 +194,16 @@ let sql = function
       let order =
         match table.key with
         | Primary (key, keys) -> " ORDER BY " ^ columns (key :: keys)
-        | Unique _ | No_key -> ""
+        | Unique _ | Indexed _ | No_key -> ""
+      in
+      let through =
+        match (chunk, table.key) with
+        | Range _, Indexed { index; _ } ->
+            [%string " FORCE INDEX (%{Quiver_core.Ident.backquoted index})"]
+        | (Whole _ | Range _), (Primary _ | Unique _ | Indexed _ | No_key) -> ""
       in
       [%string
-        "SELECT %{columns (Quiver_core.Schema.Table.columns table)} FROM %{qualified table.name}%{where chunk}%{order}"]
+        "SELECT %{columns (Quiver_core.Schema.Table.columns table)} FROM %{qualified table.name}%{through}%{where chunk}%{order}"]
   | Key_span { chunk; key } ->
       let key = Quiver_core.Ident.backquoted key in
       [%string

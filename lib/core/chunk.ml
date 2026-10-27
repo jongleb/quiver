@@ -63,7 +63,11 @@ let integer_key chunk =
   in
   match chunk with
   | Range { key = field, []; _ }
-  | Whole { key = Primary (field, []) | Unique { fields = field, []; _ }; _ } ->
+  | Whole
+      {
+        key = Primary (field, []) | Unique { fields = field, []; _ } | Indexed { field; _ };
+        _;
+      } ->
       integer field
   | Range _ | Whole _ -> None
 
@@ -117,9 +121,15 @@ let divide chunk at =
   | (Whole _ | Range _), _ -> None
 
 let of_bounds (table : Schema.Table.t) values =
-  match table.key with
-  | No_key -> Error (`Chunk (Unsplittable_key table.name))
-  | Primary key | Unique { fields = key; _ } -> (
+  let key : (Schema.Field.t * Schema.Field.t list) option =
+    match table.key with
+    | No_key -> None
+    | Primary key | Unique { fields = key; _ } -> Some key
+    | Indexed { field; _ } -> Some (field, [])
+  in
+  match key with
+  | None -> Error (`Chunk (Unsplittable_key table.name))
+  | Some key -> (
       let%map bounds = Base.Result.all (List.map (Key.make key) values) in
       let range range = Range { table; key; range } in
       let rec between = function

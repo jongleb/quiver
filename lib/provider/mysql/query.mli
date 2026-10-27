@@ -10,7 +10,7 @@ type collation = {
 type t =
   | Tables  (** Base tables outside the system schemas, with estimates. *)
   | Columns
-  | Unique_indexes
+  | Indexes of Server.t
   | Key_bounds of {
       table : Quiver_core.Schema.Name.t;
       key : Quiver_core.Ident.t;

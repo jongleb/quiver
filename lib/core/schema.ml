@@ -35,6 +35,7 @@ module Table = struct
   type 'f key =
     | Primary of ('f * 'f list)
     | Unique of { index : Ident.t; fields : 'f * 'f list }
+    | Indexed of { index : Ident.t; field : 'f }
     | No_key
   [@@deriving sexp ~portable, yojson]
 
@@ -88,6 +89,9 @@ module Table = struct
              | Unique { index; fields } ->
                  let%map fields = resolve fields in
                  Unique { index; fields }
+             | Indexed { index; field } ->
+                 let%map field, _ = resolve (field, []) in
+                 Indexed { index; field }
            in
            { name; fields = (first, rest); generated; key; estimate })
 
@@ -100,6 +104,7 @@ module Table = struct
       | No_key -> No_key
       | Primary fields -> Primary (names fields)
       | Unique { index; fields } -> Unique { index; fields = names fields }
+      | Indexed { index; field } -> Indexed { index; field = field.Field.name }
     in
     make ~name ~fields:(first :: rest) ~generated ~key ~estimate
 

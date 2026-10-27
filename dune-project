@@ -3,7 +3,7 @@
 
 (name quiver)
 
-(version 1.3.5)
+(version 1.3.6)
 
 (generate_opam_files true)
 

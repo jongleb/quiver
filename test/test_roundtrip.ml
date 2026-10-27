@@ -367,7 +367,7 @@ let table =
     in
     let* ltypes = list_size (int_range 1 6) ltype in
     let* written = int_range 1 (List.length ltypes) in
-    let+ key = int_range 0 3 in
+    let+ key = int_range 0 4 in
     let last = List.length ltypes - 1 in
     let fields =
       List.mapi
@@ -384,6 +384,7 @@ let table =
         | 0 -> Primary ("c0", [])
         | 1 -> Unique { index = Support.ident "u"; fields = ("c0", []) }
         | 2 -> Primary ("c" ^ string_of_int last, [])
+        | 3 -> Indexed { index = Support.ident "i"; field = "c0" }
         | _ -> No_key)
       fields)
 

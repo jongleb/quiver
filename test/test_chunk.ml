@@ -203,6 +203,68 @@ let expect_error name expected result =
             (Support.testable Chunk.sexp_of_error Chunk.equal_error)
             "error" expected error)
 
+let indexed_cover =
+  QCheck2.Test.make ~count:300
+    ~name:
+      "a table read through an index: every row, however many share its value, falls in \
+       exactly one chunk, and ranges are read through the index"
+    ~print:(fun (bounds, rows) ->
+      Printf.sprintf "bounds=%s rows=%s"
+        (String.concat "," (List.map string_of_int bounds))
+        (String.concat "," (List.map string_of_int rows)))
+    QCheck2.Gen.(
+      let+ bounds = list_size (int_range 0 8) (int_range (-20) 20)
+      and+ rows = list_size (int_range 1 60) (int_range (-25) 25) in
+      (List.sort_uniq compare bounds, rows))
+    (fun (bounds, rows) ->
+      let table =
+        Support.table
+          ~key:(Indexed { index = Support.ident "i"; field = "k" })
+          [ ("v", Ltype.Int64, Schema.Field.Nullable); ("k", Ltype.Int64, Schema.Field.Not_null) ]
+      in
+      let rec holds k (predicate : Predicate.t) =
+        match predicate with
+        | Always -> true
+        | Compare { field = { name; _ }; value = Signed v; comparison }
+          when String.equal (name :> string) "k" -> (
+            let k = Int64.of_int k in
+            match comparison with
+            | Less -> Int64.compare k v < 0
+            | Equal -> Int64.equal k v
+            | Greater -> Int64.compare k v > 0
+            | At_least -> Int64.compare k v >= 0)
+        | Compare _ -> false
+        | All (first, rest) -> List.for_all (holds k) (first :: rest)
+        | Any (first, rest) -> List.exists (holds k) (first :: rest)
+      in
+      let chunks =
+        Support.get_ok
+          (Chunk.of_bounds table (List.map (fun v -> [ Key.Signed (Int64.of_int v) ]) bounds))
+      in
+      let lowest = List.fold_left min max_int rows and highest = List.fold_left max min_int rows in
+      let closed =
+        Chunk.closed (Chunk.whole table) (Key.Signed (Int64.of_int lowest))
+          (Key.Signed (Int64.of_int highest))
+      in
+      let sql chunk = Quiver_mysql.Query.sql (Chunk chunk) in
+      let through chunk =
+        let text = sql chunk in
+        match chunk with
+        | Range _ ->
+            Base.String.is_substring text ~substring:"FORCE INDEX (`i`)"
+            && not (Base.String.is_substring text ~substring:"ORDER BY")
+        | Whole _ -> not (Base.String.is_substring text ~substring:"FORCE INDEX")
+      in
+      List.for_all
+        (fun k ->
+          List.length (List.filter (fun chunk -> holds k (Predicate.of_chunk chunk)) chunks) = 1
+          && Option.fold ~none:false
+               ~some:(fun chunk -> holds k (Predicate.of_chunk chunk))
+               closed)
+        rows
+      && List.for_all through (Chunk.whole table :: Option.to_list closed @ chunks)
+      && Option.is_some (Chunk.integer_key (Chunk.whole table)))
+
 let tests =
   [
     Alcotest.test_case "chunks print as table and key range" `Quick (fun () ->
@@ -227,6 +289,7 @@ let tests =
            highest = Int64.max_int;
          });
     QCheck_alcotest.to_alcotest tuple_cover;
+    QCheck_alcotest.to_alcotest indexed_cover;
     QCheck_alcotest.to_alcotest
       (exact_cover
          {
@@ -235,6 +298,21 @@ let tests =
            lowest = 0L;
            highest = -1L;
          });
+    Alcotest.test_case "an index's field that may be NULL is no key" `Quick (fun () ->
+        let field (name, ltype, nullability) =
+          { Schema.Field.name = Support.ident name; ltype; nullability }
+        in
+        match
+          Schema.Table.make ~name:Support.name
+            ~fields:[ field ("k", Ltype.Int64, Schema.Field.Nullable) ]
+            ~generated:[]
+            ~key:(Indexed { index = Support.ident "i"; field = Support.ident "k" })
+            ~estimate:{ rows = 0; bytes = 0 }
+        with
+        | Error (`Schema (Schema.Nullable_key_field _)) -> ()
+        | Error (`Schema error) ->
+            Alcotest.failf "%a" Sexplib0.Sexp.pp_hum (Schema.sexp_of_error error)
+        | Ok _ -> Alcotest.fail "a nullable field became the key");
     expect_error "no key" (Chunk.Unsplittable_key Support.name)
       (Chunk.of_bounds
          (Support.table ~key:No_key [ ("id", Int64, Nullable) ])

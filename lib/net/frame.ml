@@ -23,7 +23,7 @@ type header = {
 
 let header_bytes = 32
 let max_payload = 1 lsl 30
-let version = 7
+let version = 8
 let checked_bytes = 28
 
 let xxh3 bytes ~first ~length =

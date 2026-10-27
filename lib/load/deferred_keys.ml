@@ -156,9 +156,48 @@ let split deferral table statement =
                        | (Plain_key | Spatial_key | Full_text_key | Foreign_key), _ -> [])
                      definitions)
               in
+              let deferred = List.filter_map (function Deferred key -> Some key | Fixed _ -> None) lines in
               let keys =
-                Option.fold primary ~none:[] ~some:(fun _ ->
-                    List.filter_map (function Deferred key -> Some key | Fixed _ -> None) lines)
+                match primary with
+                | Some _ -> deferred
+                | None ->
+                    let nullable =
+                      List.filter_map
+                        (fun line ->
+                          if Base.String.is_prefix line ~prefix:"  `" && not (Base.String.is_substring line ~substring:" NOT NULL")
+                          then identifier line 2
+                          else None)
+                        body
+                    in
+                    let columns definition =
+                      let length = String.length definition in
+                      let rec parts i depth acc =
+                        if i >= length then None
+                        else
+                          match definition.[i] with
+                          | '`' when depth = 1 ->
+                              Option.bind (identifier definition i) (fun column ->
+                                  parts (i + String.length column + 2) depth (column :: acc))
+                          | '(' -> parts (i + 1) (depth + 1) acc
+                          | ')' when depth = 1 -> Some (List.rev acc)
+                          | ')' -> parts (i + 1) (depth - 1) acc
+                          | ',' | ' ' when depth = 1 -> parts (i + 1) depth acc
+                          | _ when depth = 1 -> None
+                          | _ -> parts (i + 1) depth acc
+                      in
+                      Option.bind (Base.String.substr_index definition ~pattern:"` (") (fun at -> parts (at + 2) 0 [])
+                    in
+                    let never_clustered (key : key) =
+                      match key.group with
+                      | Plain -> true
+                      | Unique ->
+                          Option.fold (columns key.definition) ~none:false
+                            ~some:(List.exists (fun column -> List.mem column nullable))
+                    in
+                    Base.List.take_while deferred ~f:never_clustered
+                    @ List.filter
+                        (fun (key : key) -> key.group = Plain)
+                        (Base.List.drop_while deferred ~f:never_clustered)
               in
               {
                 create =

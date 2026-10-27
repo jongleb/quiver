@@ -154,16 +154,19 @@ let sessions config binlog uniqueness ~count ~control ~close =
       Error error
 
 let retried ~cause run =
-  let rec attempt left =
+  let attempts = 8 in
+  let rec attempt k random =
     match run () with
     | Ok _ as done_ -> done_
     | Error error as failed -> (
-        match (cause error, left) with
-        | Some (`Link (Quiver_mysql.Link.Refused { code = 1213 | 1205; _ })), left when left > 1 ->
-            attempt (left - 1)
+        match cause error with
+        | Some (`Link (Quiver_mysql.Link.Refused { code = 1213 | 1205; _ })) when k + 1 < attempts ->
+            let random = Option.value random ~default:(Random.State.make_self_init ()) in
+            Unix.sleepf (Random.State.float random (Float.min 1. (0.01 *. Float.of_int (1 lsl k))));
+            attempt (k + 1) (Some random)
         | _ -> failed)
   in
-  attempt 5
+  attempt 0 None
 
 let renamed target database =
   match target with Same_names -> database | Into renamed -> renamed

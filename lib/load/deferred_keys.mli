@@ -29,9 +29,9 @@ type t = {
           it goes after [later]. *)
   keys : key list;
       (** The deferred [KEY] and [UNIQUE KEY] definitions, in order; a plain key after a spatial
-          one is not among them, so adding the spatial key later keeps the order; none without a
-          primary key, where InnoDB would make the first [UNIQUE] key of [NOT NULL] columns the
-          clustered index. *)
+          one is not among them, so adding the spatial key later keeps the order. Without a
+          primary key InnoDB makes the first [UNIQUE] key of [NOT NULL] columns the clustered
+          index: such a key and the [UNIQUE] ones after it are not among them either. *)
   special : string list;  (** [later] without [keys]: spatial keys and the plain ones after, full-text keys. *)
   outline : outline;
 }

@@ -86,6 +86,7 @@ type built = {
   remaining : int Portable.Atomic.t;  (** Parts not closed yet. *)
   finished : Quiver_innodb.Tablespace.finished list Portable.Atomic.t;
   sent : int Portable.Atomic.t;  (** Rows of its closed parts. *)
+  bytes : int Portable.Atomic.t;  (** Of its closed parts' records: the more, the sooner what follows its last part runs. *)
   progress : progress Portable.Atomic.t;
   preparing : Core.Time_ns.Span.t;  (** Creating its empty table and exporting the template. *)
 }
@@ -99,7 +100,6 @@ type mode =
       collations : (int * Quiver_innodb.Layout.charset) list;
       builder : Physical.builder;
       sorting : string option;
-      threads : int;
     }
       (** The data directory as this machine sees it, and the server's collations of the character sets stored. *)
 
@@ -107,6 +107,7 @@ type deferred = {
   into : Quiver_core.Schema.Name.t;
   later : string * string list;
   remaining : int Portable.Atomic.t;  (** Parts not committed yet. *)
+  bytes : int Portable.Atomic.t;  (** Of its committed parts. *)
 }
 (** Keys of a table added once its last part commits. *)
 
@@ -167,8 +168,10 @@ type t = {
   declaring : (unit, error) result Await.Await.Ivar.t list Portable.Atomic.t;
   broken : error option Portable.Atomic.t;  (** The first table that could not be declared. *)
   preparing : declaration Quiver_core.Pool.t;
-      (** A few threads creating and preparing tables for the whole copy. *)
-  ending : ending Quiver_core.Pool.t;  (** A thread per loader for what follows tables' last parts. *)
+      (** A few threads creating and preparing tables for the whole copy, the largest first. *)
+  spare : Quiver_core.Lease.t;  (** Threads finishing and checking built files, between all tables. *)
+  ending : ending Quiver_core.Pool.t;
+      (** A thread per loader for what follows tables' last parts, the largest tables first. *)
 }
 
 
@@ -270,17 +273,23 @@ let declare t { table = { name; _ } as table; ddl; parts; declared } =
     | first :: rest when parts > 0 ->
         ignore
           (Portable_lockfree_htbl.set t.deferred ~key:name
-             ~data:{ into; later = (first, rest); remaining = Portable.Atomic.make parts })
+             ~data:
+               {
+                 into;
+                 later = (first, rest);
+                 remaining = Portable.Atomic.make parts;
+                 bytes = Portable.Atomic.make 0;
+               })
     | [] | _ :: _ -> ()
   in
-  let physical datadir collations builder sorting threads =
+  let physical datadir collations builder sorting =
     let definition = Deferred_keys.split All_keys name.table ddl in
     let started = Quiver_core.Stopwatch.start () in
     let%bind prepared =
       on_idle_loader t (fun link ->
           Result.map_error
             (fun (#Physical.cause as cause) -> Built { table = name; cause })
-            (Physical.prepare link ~datadir ~collations ~into table ~definition ~builder ~sorting ~threads))
+            (Physical.prepare link ~datadir ~collations ~into table ~definition ~builder ~sorting))
     in
     match prepared with
     | Unsuitable reason ->
@@ -296,6 +305,7 @@ let declare t { table = { name; _ } as table; ddl; parts; declared } =
             remaining = Portable.Atomic.make parts;
             finished = Portable.Atomic.make [];
             sent = Portable.Atomic.make 0;
+            bytes = Portable.Atomic.make 0;
             progress = Portable.Atomic.make Pending;
             preparing = Quiver_core.Stopwatch.elapsed started;
           }
@@ -307,8 +317,8 @@ let declare t { table = { name; _ } as table; ddl; parts; declared } =
   in
   let created =
     match t.mode with
-    | Physical_at { datadir; collations; builder; sorting; threads } when parts > 0 ->
-        physical datadir collations builder sorting threads
+    | Physical_at { datadir; collations; builder; sorting } when parts > 0 ->
+        physical datadir collations builder sorting
     | Physical_at _ | Plain -> plain ()
   in
   Result.iter_error
@@ -325,9 +335,13 @@ let ended t = function
         (on_idle_loader t (fun link ->
              let queued = Quiver_core.Stopwatch.elapsed closed and started = Quiver_core.Stopwatch.start () in
              let%bind checked =
-               Result.map_error
-                 (fun (#Physical.cause as cause) -> Built { table; cause })
-                 (Physical.check link state.physical (Portable.Atomic.get state.finished))
+               let wanted = Int.max 1 (Portable.Atomic.get state.bytes / (4 * 1024 * 1024)) in
+               let lent = Quiver_core.Lease.take t.spare ~wanted in
+               let checked =
+                 Physical.check link state.physical (Portable.Atomic.get state.finished) ~threads:(Int.max 1 lent)
+               in
+               Quiver_core.Lease.give t.spare lent;
+               Result.map_error (fun (#Physical.cause as cause) -> Built { table; cause }) checked
              in
              let checking = Quiver_core.Stopwatch.elapsed started and imports = Quiver_core.Stopwatch.start () in
              let%bind built =
@@ -364,8 +378,7 @@ let create config target ~keys ~binlog ~ingest ~sessions =
        let%map mode =
          match ingest with
          | Load_data -> Ok Plain
-         | Tablespaces { datadir; builder; sorting; threads } ->
-             let threads = Option.value threads ~default:(Quiver_core.Cores.budget Same_machine) in
+         | Tablespaces { datadir; builder; sorting; threads = _ } ->
              Quiver_core.Guarded.hold control (fun link ->
                  let%bind () =
                    match Quiver_mysql.Link.server link with
@@ -406,7 +419,6 @@ let create config target ~keys ~binlog ~ingest ~sessions =
                      datadir;
                      builder;
                      sorting;
-                     threads;
                      collations =
                        List.filter_map
                          (function
@@ -462,6 +474,11 @@ let create config target ~keys ~binlog ~ingest ~sessions =
              preparing =
                Quiver_core.Pool.start ~workers:(Int.min 4 (List.length loaders)) (fun declaration ->
                    Option.iter (fun t -> declare t declaration) (Portable.Atomic.get copy));
+             spare =
+               Quiver_core.Lease.create
+                 (match ingest with
+                 | Load_data -> 0
+                 | Tablespaces { threads; _ } -> Option.value threads ~default:(Quiver_core.Cores.budget Same_machine));
              ending =
                Quiver_core.Pool.start ~workers:(List.length loaders) (fun job ->
                    Option.iter (fun t -> ended t job) (Portable.Atomic.get copy));
@@ -524,7 +541,7 @@ let table t ({ name; _ } as table : Quiver_core.Schema.Table.t) ~ddl ~parts =
   ignore (Portable_lockfree_htbl.set t.declared ~key:name ~data:declared);
   Portable.Atomic.update t.declaring ~pure_f:(fun declaring -> declared :: declaring);
   let declaration = { table; ddl; parts; declared } in
-  match Quiver_core.Pool.submit t.preparing declaration with
+  match Quiver_core.Pool.submit t.preparing ~priority:table.estimate.bytes declaration with
   | Queued -> Ok ()
   | Unqueued ->
       declare t declaration;
@@ -769,7 +786,8 @@ let close_loading (part : loading) answer =
       let built =
         match Portable_lockfree_htbl.find t.deferred part.job.table with
         | Null -> Ok ()
-        | This { into; later; remaining } -> (
+        | This { into; later; remaining; bytes } -> (
+            let (_ : int) = Portable.Atomic.fetch_and_add bytes part.bytes in
             match Portable.Atomic.fetch_and_add remaining (-1) with
             | 1 ->
                 let added = Await.Await.Ivar.create () in
@@ -777,7 +795,9 @@ let close_loading (part : loading) answer =
                     added :: building);
                 let job = Keys_of { into; later; added } in
                 let () =
-                  match Quiver_core.Pool.submit t.ending job with Queued -> () | Unqueued -> ended t job
+                  match Quiver_core.Pool.submit t.ending ~priority:(Portable.Atomic.get bytes) job with
+                  | Queued -> ()
+                  | Unqueued -> ended t job
                 in
                 Ok ()
             | _ -> Ok ())
@@ -810,13 +830,18 @@ let close_building (part : building) answer =
   | Ok finished -> (
       Portable.Atomic.update state.finished ~pure_f:(fun all -> finished :: all);
       let (_ : int) = Portable.Atomic.fetch_and_add state.sent part.rows in
+      let (_ : int) = Portable.Atomic.fetch_and_add state.bytes part.bytes in
       match Portable.Atomic.fetch_and_add state.remaining (-1) with
       | 1 ->
           let imported = Await.Await.Ivar.create () and table = part.table
           and closed = Quiver_core.Stopwatch.start () in
           Portable.Atomic.update t.building ~pure_f:(fun building -> imported :: building);
           let job = Import_of { state; table; closed; imported } in
-          let () = match Quiver_core.Pool.submit t.ending job with Queued -> () | Unqueued -> ended t job in
+          let () =
+            match Quiver_core.Pool.submit t.ending ~priority:(Portable.Atomic.get state.bytes) job with
+            | Queued -> ()
+            | Unqueued -> ended t job
+          in
           answer (Ok (manifest ()))
       | _ -> answer (Ok (manifest ())))
 

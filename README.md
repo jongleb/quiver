@@ -327,7 +327,7 @@ itself.
 - **What it saves.** Writing rows and building byte-ordered keys moves to the client's cores; the
   import then has more pages to take. Tables that fall back load as before.
 - **Settings.** `--tablespace-keys server|quiver`, `--sort-dir` (where sorted secondary records
-  wait; beside the file by default), `--build-threads` (threads merging a table's indexes).
+  wait; beside the file by default), `--build-threads` (threads finishing and checking built files, shared by all tables).
   `--read-order largest-tables` reads the largest tables first, so their check, import and keys
   run while the rest is read, and `--declare-tables all-at-once` prepares every table before
   the rows; both default to how 1.3.2 worked (`largest-chunks`, `before-rows`).

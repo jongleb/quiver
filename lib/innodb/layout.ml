@@ -20,6 +20,7 @@ type number = Plain | Year | Days | Member of string list | Members of string li
 type clock = Microseconds | Fields [@@deriving sexp_of ~portable]
 
 type charset = Utf8mb4 | Utf8mb3 | Latin1 [@@deriving sexp_of ~portable]
+type sorted = Collated | Padded | Bytewise [@@deriving sexp_of ~portable]
 
 type storage =
   | Integer of { bytes : int; sign : sign; number : number }
@@ -31,7 +32,7 @@ type storage =
   | Time of int
   | Binary of int
   | Char of { least : int; big : bool; charset : charset }
-  | Text of { big : bool; charset : charset }
+  | Text of { big : bool; charset : charset; sorted : sorted }
   | Variable of { big : bool }
   | Json
   | Row_id
@@ -42,7 +43,7 @@ type storage =
 type length = Fixed of int | Varying of { big : bool } [@@deriving sexp_of ~portable]
 
 type nullability = Not_null | Null_bit of int [@@deriving sexp_of ~portable]
-type part = Whole | Prefix of int [@@deriving sexp_of ~portable]
+type part = Whole | Prefix of int | Characters of int [@@deriving sexp_of ~portable]
 
 type field = { source : int; storage : storage; nullability : nullability; part : part }
 [@@deriving sexp_of ~portable]
@@ -60,6 +61,8 @@ type t = {
   root : int;
 }
 [@@deriving sexp_of ~portable]
+
+let widest = function Utf8mb4 -> 4 | Utf8mb3 -> 3 | Latin1 -> 1
 
 let decimal_bytes ~precision ~scale =
   let digits n = ((n / 9) * 4) + Int.min 4 (((n mod 9) + 1) / 2) in
@@ -143,11 +146,11 @@ let of_cfg (cfg : Cfg.t) ~collations dumped =
             Ok (i, Time (fsp :> int), nullable)
         | 9, Float32, _ -> Ok (i, Float, nullable)
         | 10, Float64, _ -> Ok (i, Double, nullable)
-        | (1 | 12 | 5), String, _ -> text (fun charset -> Text { big = column.len > 255 || mtype = 5; charset })
+        | (1 | 12 | 5), String, _ ->
+            let sorted = match collation with 46 | 47 | 83 -> Padded | 309 -> Bytewise | _ -> Collated in
+            text (fun charset -> Text { big = column.len > 255 || mtype = 5; charset; sorted })
         | (2 | 13), String, _ ->
-            text (fun charset ->
-                let widest = match charset with Utf8mb4 -> 4 | Utf8mb3 -> 3 | Latin1 -> 1 in
-                Char { least = column.len / widest; big = column.len > 255; charset })
+            text (fun charset -> Char { least = column.len / widest charset; big = column.len > 255; charset })
         | (4 | 5), Bytes, _ when collation = 63 -> Ok (i, Variable { big = column.len > 255 || mtype = 5 }, nullable)
         | 14, Geometry, _ -> Ok (i, Variable { big = true }, nullable)
         | 5, Json, _ when mysql = 245 -> Ok (i, Json, nullable)
@@ -195,13 +198,15 @@ let secondary clustered (cfg : Cfg.t) (index : Cfg.Index.t) =
              match (field.prefix, column.storage) with
              | 0, _ -> Ok Whole
              | prefix, Variable _ -> Ok (Prefix prefix)
+             | prefix, Text { charset; _ } -> Ok (Characters (prefix / widest charset))
              | _, _ -> Error (`Layout (Prefix_key field.column))
            in
            match (field.order, column.storage) with
            | Descending, _ -> Error (`Layout (Descending_key field.column))
-           | Ascending, (Integer _ | Decimal _ | Datetime _ | Timestamp _ | Time _ | Binary _ | Variable _) ->
+           | Ascending, (Integer _ | Decimal _ | Datetime _ | Timestamp _ | Time _ | Binary _ | Variable _ | Row_id)
+           | Ascending, Text { sorted = Padded | Bytewise; _ } ->
                Ok (column, part)
-           | Ascending, (Float | Double | Char _ | Text _ | Json | Row_id | Trx_id | Roll_ptr) ->
+           | Ascending, (Float | Double | Char _ | Text { sorted = Collated; _ } | Json | Trx_id | Roll_ptr) ->
                Error (`Layout (Key_type field.column)))
          index.fields)
   in

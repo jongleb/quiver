@@ -173,8 +173,7 @@ let tests =
                  original
              in
              let sorted = List.sort compare in
-             (List.exists (fun line -> Base.String.is_prefix line ~prefix:"PRIMARY KEY ") original || t.keys = [])
-             && lines (Quiver_load.Deferred_keys.with_keys t chosen) = expected
+             lines (Quiver_load.Deferred_keys.with_keys t chosen) = expected
              && sorted (keys @ added t.special) = sorted deferred_keys
              && List.for_all
                   (fun (key : Quiver_load.Deferred_keys.key) ->
@@ -243,11 +242,57 @@ let tests =
   tests
   @ [
       QCheck_alcotest.to_alcotest
-        (QCheck2.Test.make ~count:1000 ~name:"keys put back never change which index clusters the table"
+        (QCheck2.Test.make ~count:1000 ~name:"keys put back never change which index clusters the table, and only unique keys stay out"
            ~print:(String.concat "\n")
            keyed_table
            (fun definitions ->
              let text = "CREATE TABLE `t` (\n" ^ String.concat ",\n" definitions ^ "\n) ENGINE=InnoDB" in
              let t = Quiver_load.Deferred_keys.split All_keys table text in
-             clustered (Quiver_load.Deferred_keys.with_keys t t.keys) = clustered t.create));
+             let staying = lines t.create in
+             let named prefix =
+               List.filter_map
+                 (fun line ->
+                   if Base.String.is_prefix line ~prefix && not (List.mem line staying) then
+                     List.nth_opt (String.split_on_char '`' line) 1
+                   else None)
+                 (List.map String.trim definitions)
+             in
+             let kept group =
+               List.filter_map
+                 (fun (key : Quiver_load.Deferred_keys.key) -> if key.group = group then Some key.name else None)
+                 t.keys
+             in
+             let unique = named "UNIQUE KEY " in
+             clustered (Quiver_load.Deferred_keys.with_keys t t.keys) = clustered t.create
+             && kept Plain = named "KEY "
+             && Base.List.take unique (List.length (kept Unique)) = kept Unique));
+    ]
+
+let tests =
+  tests
+  @ [
+      Alcotest.test_case "a statement deadlocked fewer than 8 times in a row goes through, other errors at once" `Quick
+        (fun () ->
+          let refused code = `Link (Quiver_mysql.Link.Refused { code; sqlstate = "40001"; message = "" }) in
+          List.iter
+            (fun (failures, code, expected, runs) ->
+              let count = ref 0 and started = Unix.gettimeofday () in
+              let outcome =
+                Quiver_load.Load.retried ~cause:Option.some (fun () ->
+                    incr count;
+                    if !count <= failures then Error (refused code) else Ok ())
+              in
+              let shown = match outcome with Ok () -> "ok" | Error _ -> "error" in
+              if runs = 8 && Unix.gettimeofday () -. started < 0.05 then Alcotest.failf "%d failures without pauses" failures;
+              Alcotest.(check (pair string int))
+                (Printf.sprintf "%d failures with %d" failures code)
+                (expected, runs) (shown, !count))
+            [
+              (0, 1213, "ok", 1);
+              (3, 1213, "ok", 4);
+              (7, 1205, "ok", 8);
+              (8, 1213, "error", 8);
+              (20, 1205, "error", 8);
+              (1, 1062, "error", 1);
+            ]);
     ]

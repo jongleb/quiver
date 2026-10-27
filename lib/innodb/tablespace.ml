@@ -51,14 +51,13 @@ type t = {
   file : File.t;
   scratch : File.t;  (** Each run's secondary records, sorted, until [finish] merges them. *)
   blocks : int Portable.Atomic.t;  (** Pages of [scratch] taken. *)
-  threads : int;  (** Most threads merging secondary indexes at once. *)
   template : string;
   space : int;
   template_size : int;
   extents : int Portable.Atomic.t;
 }
 
-let create ~template (layout : Layout.t) ~secondary file ~scratch ~threads =
+let create ~template (layout : Layout.t) ~secondary file ~scratch =
   let u16 at = String.get_uint16_be template at in
   let u32 at = Int32.to_int (String.get_int32_be template at) land 0xFFFF_FFFF in
   let template_size = u32 46 in
@@ -99,16 +98,28 @@ let create ~template (layout : Layout.t) ~secondary file ~scratch ~threads =
     }
   in
   let%bind clustered = tree layout in
-  let%map secondary = Base.Result.all (List.map tree secondary) in
+  let%bind secondary = Base.Result.all (List.map tree secondary) in
+  let keys = match layout.fields with { storage = Row_id; _ } :: _ -> Numbered | _ -> Stored in
+  let%map () =
+    match keys with
+    | Stored -> Ok ()
+    | Numbered ->
+        if
+          List.for_all
+            (fun (tree : tree) ->
+              match Base.List.last tree.layout.fields with Some { storage = Row_id; _ } -> true | Some _ | None -> false)
+            secondary
+        then Ok ()
+        else Error (`Tablespace (Template "a secondary index of a table without a primary key ends not with the row id"))
+  in
   {
     clustered;
     secondary;
-    keys = (match layout.fields with { storage = Row_id; _ } :: _ -> Numbered | _ -> Stored);
+    keys;
     runs = Portable.Atomic.make 0;
     file;
     scratch;
     blocks = Portable.Atomic.make 0;
-    threads = Int.max 1 threads;
     template;
     space = u32 34;
     template_size;
@@ -214,7 +225,18 @@ let text_length (field : Layout.field) (columns @ local) i =
   match Quiver_core.Column.repr column with
   | Text -> (
       let length = Quiver_core.Column.text_length column i in
-      match field.part with Whole -> length | Prefix prefix -> Int.min length prefix)
+      match field.part with
+      | Whole -> length
+      | Prefix prefix -> Int.min length prefix
+      | Characters n ->
+          let source = Quiver_core.Column.text_bytes column and at = Quiver_core.Column.text_offset column i in
+          let rec past k left =
+            if left = 0 || k >= at + length then Int.min length (k - at)
+            else
+              let lead = Bytes.get_uint8 source k in
+              past (k + if lead < 0x80 then 1 else if lead < 0xE0 then 2 else if lead < 0xF0 then 3 else 4) (left - 1)
+          in
+          past at n [@nontail])
   | Bool | Int | Int64 | Float -> 0
 
 let put_fraction bytes pos fsp fraction =
@@ -493,7 +515,7 @@ let encode t (columns @ local) ~rows =
           | Variable { big } ->
               let length = text_length field columns i in
               varying big length [@nontail]
-          | Text { big; charset } -> (
+          | Text { big; charset; _ } -> (
               match text charset with Error error -> Error error | Ok length -> varying big length [@nontail])
           | Json -> (
               let source = text_bytes field columns and at = text_offset field columns i and length = text_length field columns i in
@@ -870,7 +892,18 @@ let compare_images (tree : tree) a pa b pb ~fields =
               let c = bytes (oa + da) (ob + db) (Int.min na nb) 0 in
               if c <> 0 then c
               else
-                let c = Int.compare na nb in
+                let c =
+                  match field.storage with
+                  | Text { sorted = Padded; _ } ->
+                      let rec spaces s at stop sign =
+                        if at = stop then 0
+                        else
+                          let byte = String.get_uint8 s at in
+                          if byte = 0x20 then spaces s (at + 1) stop sign else sign * Int.compare byte 0x20
+                      in
+                      if na > nb then spaces a (oa + da + nb) (oa + da + na) 1 else spaces b (ob + db + na) (ob + db + nb) (-1)
+                  | _ -> Int.compare na nb
+                in
                 if c <> 0 then c else go (j + 1) (la - used_a) (lb - used_b) (da + na) (db + nb))
       | 0, _ -> 1
       | _, 0 -> -1
@@ -983,6 +1016,7 @@ let put run image pos =
   next
 
 let add run { image; rows; secondary } =
+  let first = run.base + run.numbered in
   let rec record pos i =
     if i = rows then Ok ()
     else
@@ -990,7 +1024,23 @@ let add run { image; rows; secondary } =
       record next (i + 1)
   in
   let%map () = record 0 0 in
-  List.iteri (fun j other -> Buffer.add_string run.sorting.(j) other) secondary
+  List.iteri
+    (fun j other ->
+      let sorting = run.sorting.(j) in
+      match run.owner.keys with
+      | Stored -> Buffer.add_string sorting other
+      | Numbered ->
+          let rec numbered pos i =
+            if pos < String.length other then (
+              let size = String.get_uint16_be other pos in
+              let id = first + i in
+              Buffer.add_substring sorting other pos size;
+              Buffer.add_uint16_be sorting (id lsr 32);
+              Buffer.add_int32_be sorting (Int32.of_int (id land 0xFFFF_FFFF));
+              numbered (pos + 6 + size) (i + 1))
+          in
+          numbered 0 0)
+    secondary
 
 type pages : immutable_data = {
   first : int;
@@ -1078,7 +1128,17 @@ let close run =
                 if big && first land 0x80 <> 0 then ((first land 0x3F) lsl 8) lor String.get_uint8 image (lengths - 1)
                 else first
               in
-              bytes high low k (origin + data) (origin + data + length) (fun high low k -> finish high low k)
+              bytes high low k (origin + data) (origin + data + length) (fun high low k ->
+                  match field.storage with
+                  | Text { sorted = Padded; _ } ->
+                      let rec spaces high low k =
+                        if k >= 14 then (high, low)
+                        else
+                          let high, low = push high low k 0x20 in
+                          spaces high low (k + 1)
+                      in
+                      spaces high low k
+                  | _ -> finish high low k)
     in
     walk 0 0 0 0 (origin - 6 - null_bytes) 0
     in
@@ -1182,7 +1242,8 @@ let stamp bytes =
   Bytes.set_int32_be bytes 0 sum;
   Bytes.set_int32_be bytes (Page.size - 8) sum
 
-let finish t finished =
+let finish t finished ~threads =
+  let threads = Int.max 1 threads in
   let%bind finished =
     Base.Result.all
       (List.map
@@ -1474,7 +1535,7 @@ let finish t finished =
                     finished)
              in
              let count = List.length firsts in
-             let share = (t.threads + List.length t.secondary - 1) / Int.max 1 (List.length t.secondary) in
+             let share = (threads + List.length t.secondary - 1) / Int.max 1 (List.length t.secondary) in
              let parts = Int.max 1 (Int.min share (count / 8)) in
              let splitters = List.sort_uniq compare (List.init (parts - 1) (fun p -> List.nth firsts ((p + 1) * count / parts))) in
              List.map2
@@ -1488,7 +1549,7 @@ let finish t finished =
       Result.map_error
         (function `Tablespace error -> `Tablespace error | `File error -> `File error)
         (Base.Result.all
-           (Quiver_core.Concurrent.spread ~workers:t.threads ranges (fun (j, from, until) ->
+           (Quiver_core.Concurrent.spread ~workers:threads ranges (fun (j, from, until) ->
                 merged j (List.nth t.secondary j) ~from ~until)))
     in
     let pieces = List.combine (Iarray.to_list ranges) pieces in

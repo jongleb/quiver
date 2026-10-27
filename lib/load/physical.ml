@@ -46,7 +46,7 @@ let plain name =
 let execute link statement = Quiver_mysql.Link.run_statement link statement
 
 let prepare link ~datadir ~collations ~(into : Quiver_core.Schema.Name.t) (table : Quiver_core.Schema.Table.t)
-    ~(definition : Deferred_keys.t) ~builder ~sorting ~threads =
+    ~(definition : Deferred_keys.t) ~builder ~sorting =
   let database = (into.database :> string) in
   if not (plain database && plain (table.name.table :> string)) then Ok (Unsuitable Name)
   else
@@ -112,7 +112,7 @@ let prepare link ~datadir ~collations ~(into : Quiver_core.Schema.Name.t) (table
                           let secondary = List.filter_map (fun (_, laid) -> Result.to_option laid) laid in
                           let%bind file = Quiver_innodb.File.create building in
                           let%bind scratch = Quiver_innodb.File.create sorting in
-                          match Quiver_innodb.Tablespace.create ~template layout ~secondary file ~scratch ~threads with
+                          match Quiver_innodb.Tablespace.create ~template layout ~secondary file ~scratch with
                           | Error (`Tablespace error) ->
                               Quiver_innodb.File.close file;
                               Quiver_innodb.File.close scratch;
@@ -175,15 +175,15 @@ let abandon link t =
 
 type checked = { table : table; rows : int }
 
-let check link t finished =
+let check link t finished ~threads =
   let checked =
-    let%bind pages = Quiver_innodb.Tablespace.finish t.space finished in
+    let%bind pages = Quiver_innodb.Tablespace.finish t.space finished ~threads in
     let read n =
       let page = Bytes.make Quiver_innodb.Page.size '\000' in
       let (_ : (unit, _) result) = Quiver_innodb.File.read t.file n page in
       page
     in
-    let%map checked = Quiver_innodb.Check.tablespace t.layout ~secondary:t.secondary ~pages ~read in
+    let%map checked = Quiver_innodb.Check.tablespace t.layout ~secondary:t.secondary ~pages ~threads ~read in
     { table = t; rows = checked.rows }
   in
   Result.iter_error (fun _ -> abandon link t) checked;

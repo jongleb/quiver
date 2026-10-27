@@ -45,13 +45,12 @@ val prepare :
   definition:Deferred_keys.t ->
   builder:builder ->
   sorting:string option ->
-  threads:int ->
   (prepared, [> cause ]) result
   @@ portable
 (** [definition] is the table's [CREATE TABLE] split from its deferred keys: with
     [Quiver] the empty table gets every [KEY] and [UNIQUE KEY], then loses those the writer
     cannot build; sorted secondary records wait in [sorting], beside the built file when
-    [None]; [threads] merge them. *)
+    [None]. *)
 
 val left : table -> Deferred_keys.key list @@ portable
 (** The keys the server adds after the import. *)
@@ -65,10 +64,11 @@ val check :
   Quiver_mysql.Link.t ->
   table ->
   Quiver_innodb.Tablespace.finished list ->
+  threads:int ->
   (checked, [> cause ]) result
   @@ portable
-(** Builds the upper levels over the runs and checks the whole file. Whatever
-    fails leaves no table and no file behind. *)
+(** Builds the upper levels over the runs and checks the whole file, each on at most
+    [threads] threads. Whatever fails leaves no table and no file behind. *)
 
 val import : Quiver_mysql.Link.t -> checked -> (int, [> cause ]) result @@ portable
 (** Imports the checked file and names the table: the rows it holds. Whatever

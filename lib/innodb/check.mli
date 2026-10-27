@@ -29,8 +29,10 @@ val tablespace :
   Layout.t ->
   secondary:Layout.t list ->
   pages:int ->
+  threads:int ->
   read:(int -> Bytes.t) @ portable ->
   (t, [> `Check of error ]) result
   @@ portable
-(** The clustered index and the [secondary] ones, each with a record per row. *)
+(** The clustered index and the [secondary] ones, each with a record per row; the leaves of
+    each split between at most [threads] threads. *)
 (** [read n] is page [n] of the file, zeros if never written. *)

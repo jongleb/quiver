@@ -30,7 +30,11 @@ type list_kind = Free | Free_frag | Full_frag | Segment_free | Not_full | Full
     fields, then its bytes. *)
 type key = { nulls : string; lengths : string; data : string }
 
-let tablespace (clustered : Layout.t) ~(secondary : Layout.t list) ~pages ~read =
+(** Pages walked on one level, in order: the pointers they hold, their rows, and the pages of the
+    columns stored off their records. *)
+type slice = { children : (int * key) list; rows : int; walked : int list; claimed : int list }
+
+let tablespace (clustered : Layout.t) ~(secondary : Layout.t list) ~pages ~threads ~read =
   let fail error = Error error in
   let u8 bytes at = Bytes.get_uint8 bytes at in
   let u16 bytes at = Bytes.get_uint16_be bytes at in
@@ -62,15 +66,7 @@ let tablespace (clustered : Layout.t) ~(secondary : Layout.t list) ~pages ~read 
   |> ignore;
   let%bind clustered_root = page clustered.root in
   let space = u32 clustered_root 34 in
-  let lobs = Hashtbl.create 64 in
-  let claim n =
-    if Hashtbl.mem used n then fail (Lob n)
-    else (
-      Hashtbl.replace used n ();
-      Hashtbl.replace lobs n ();
-      Ok ())
-  in
-  let lob bytes at n =
+  let lob ~claim bytes at n =
     let first_no = u32 bytes (at + 4) and length = u32 bytes (at + 16) in
     let%bind () =
       if u32 bytes at = space && u32 bytes (at + 8) = 1 && u32 bytes (at + 12) = 0 && length > 0 then Ok ()
@@ -133,8 +129,7 @@ let tablespace (clustered : Layout.t) ~(secondary : Layout.t list) ~pages ~read 
     let%bind (_ : int) = walk 80 0 ~entry:(fun _ _ _ total -> Ok total) in
     if total = length && Hashtbl.length seen = 10 + (272 * List.length index) then Ok () else fail (Lob first_no)
   in
-  let index (layout : Layout.t) ~lob =
-    let tree = Hashtbl.create 1024 in
+  let slice (layout : Layout.t) ~lob ~height ~numbers ~expected ~from ~until =
     let fields = Array.of_list layout.fields in
     let mask = Bytes.make layout.null_bytes '\000' in
     Array.iteri
@@ -239,7 +234,18 @@ let tablespace (clustered : Layout.t) ~(secondary : Layout.t list) ~pages ~read 
                   let c = bytes (oa + da) (ob + db) (Int.min na nb) 0 in
                   if c <> 0 then c
                   else
-                    let c = Int.compare na nb in
+                    let c =
+                      match field.storage with
+                      | Text { sorted = Padded; _ } ->
+                          let rec spaces s at stop sign =
+                            if at = stop then 0
+                            else
+                              let byte = u8 s at in
+                              if byte = 0x20 then spaces s (at + 1) stop sign else sign * Int.compare byte 0x20
+                          in
+                          if na > nb then spaces a (oa + da + nb) (oa + da + na) 1 else spaces b (ob + db + na) (ob + db + nb) (-1)
+                      | _ -> Int.compare na nb
+                    in
                     if c <> 0 then c else go (j + 1) (la - used_a) (lb - used_b) (da + na) (db + nb))
       in
       go 0 (oa - 6 - layout.null_bytes) (ob - 6 - layout.null_bytes) 0 0
@@ -331,98 +337,146 @@ let tablespace (clustered : Layout.t) ~(secondary : Layout.t list) ~pages ~read 
       in
       go 0 (origin - 6 - layout.null_bytes) 0 []
     in
-    let%bind root = page layout.root in
-    let rec level height numbers expected last rows =
-      let numbers = Array.of_list numbers in
-      let%bind children, _, rows =
-        Base.List.fold_result (List.init (Array.length numbers) Fun.id) ~init:([], last, rows)
-          ~f:(fun (children, last, rows) j ->
-            let n = numbers.(j) in
-            let%bind bytes = if n = layout.root then Ok root else page n in
-            let%bind () =
-              if Hashtbl.mem tree n then fail (Links n)
-              else (
-                Hashtbl.replace tree n height;
-                Ok ())
-            in
-            let%bind () =
-              if u16 bytes 24 = 17855 && Int64.to_int (Bytes.get_int64_be bytes 66) = layout.index then Ok ()
-              else fail (Not_index n)
-            in
-            let%bind () = if u16 bytes 64 = height then Ok () else fail (Level n) in
-            let prev = if j > 0 then numbers.(j - 1) else Page.null in
-            let next = if j + 1 < Array.length numbers then numbers.(j + 1) else Page.null in
-            let%bind () = if u32 bytes 8 = prev && u32 bytes 12 = next then Ok () else fail (Links n) in
-            let%bind origins = records bytes n ~level:height ~leftmost:(j = 0) in
-            let%bind () = directory bytes n origins in
-            let%bind () =
-              match (origins, height, Array.length numbers) with
-              | [], 0, 1 when n = layout.root -> Ok ()
-              | [], _, _ -> fail (Empty n)
-              | _ -> Ok ()
-            in
-            let%bind keys =
-              if height > 0 then Base.Result.all (List.map (fun origin -> key_at bytes n origin) origins)
-              else Base.Result.all (List.map (fun origin -> key_at bytes n origin) (Base.List.take origins 1))
-            in
-            let%bind () =
-              match (expected, keys) with
-              | Some expected, first :: _
-                when not
-                       (String.equal expected.(j).nulls first.nulls
-                       && String.equal expected.(j).lengths first.lengths
-                       && String.equal expected.(j).data first.data) ->
-                  fail (Pointer n)
-              | _ -> Ok ()
-            in
-            let%bind last =
-              Base.List.fold_result origins ~init:last ~f:(fun last origin ->
-                  let%map () = in_order n last (bytes, origin) in
-                  Some (bytes, origin))
-            in
-            let children =
-              if height = 0 then children
-              else
-                List.rev_append
-                  (List.map2 (fun origin key -> (u32 bytes (origin + String.length key.data), key)) origins keys)
-                  children
-            in
-            let rows = if height = 0 then rows + List.length origins else rows in
-            let%bind () =
-              if height > 0 then Ok ()
-              else
-                Base.List.fold_result origins ~init:() ~f:(fun () origin ->
-                    Base.List.fold_result (references bytes origin) ~init:() ~f:(fun () at -> lob bytes at n))
-            in
-            Ok (children, last, rows))
-      in
-      if height = 0 then Ok rows
+    let claims = Hashtbl.create 16 in
+    let claim n =
+      if Hashtbl.mem claims n then fail (Lob n)
+      else (
+        Hashtbl.replace claims n ();
+        Ok ())
+    in
+    let%bind last =
+      if from = 0 then Ok None
       else
-        let children = List.rev children in
-        let expected = Array.of_list (List.map snd children) in
+        let n = Iarray.get numbers (from - 1) in
+        let%bind bytes = page n in
+        let%map origins = records bytes n ~level:height ~leftmost:(from = 1) in
+        Option.map (fun origin -> (bytes, origin)) (Base.List.last origins)
+    in
+    let%map children, _, rows, walked =
+      Base.List.fold_result (List.init (until - from) (fun k -> from + k)) ~init:([], last, 0, [])
+        ~f:(fun (children, last, rows, walked) j ->
+          let n = Iarray.get numbers j in
+          let%bind bytes = page n in
+          let%bind () =
+            if u16 bytes 24 = 17855 && Int64.to_int (Bytes.get_int64_be bytes 66) = layout.index then Ok ()
+            else fail (Not_index n)
+          in
+          let%bind () = if u16 bytes 64 = height then Ok () else fail (Level n) in
+          let prev = if j > 0 then Iarray.get numbers (j - 1) else Page.null in
+          let next = if j + 1 < Iarray.length numbers then Iarray.get numbers (j + 1) else Page.null in
+          let%bind () = if u32 bytes 8 = prev && u32 bytes 12 = next then Ok () else fail (Links n) in
+          let%bind origins = records bytes n ~level:height ~leftmost:(j = 0) in
+          let%bind () = directory bytes n origins in
+          let%bind () =
+            match (origins, height, Iarray.length numbers) with
+            | [], 0, 1 when n = layout.root -> Ok ()
+            | [], _, _ -> fail (Empty n)
+            | _ -> Ok ()
+          in
+          let%bind keys =
+            if height > 0 then Base.Result.all (List.map (fun origin -> key_at bytes n origin) origins)
+            else Base.Result.all (List.map (fun origin -> key_at bytes n origin) (Base.List.take origins 1))
+          in
+          let%bind () =
+            match (expected, keys) with
+            | Some expected, first :: _
+              when let pointed = Iarray.get expected j in
+                   not
+                     (String.equal pointed.nulls first.nulls
+                     && String.equal pointed.lengths first.lengths
+                     && String.equal pointed.data first.data) ->
+                fail (Pointer n)
+            | _ -> Ok ()
+          in
+          let%bind last =
+            Base.List.fold_result origins ~init:last ~f:(fun last origin ->
+                let%map () = in_order n last (bytes, origin) in
+                Some (bytes, origin))
+          in
+          let children =
+            if height = 0 then children
+            else
+              List.rev_append
+                (List.map2 (fun origin key -> (u32 bytes (origin + String.length key.data), key)) origins keys)
+                children
+          in
+          let rows = if height = 0 then rows + List.length origins else rows in
+          let%bind () =
+            if height > 0 then Ok ()
+            else
+              Base.List.fold_result origins ~init:() ~f:(fun () origin ->
+                  Base.List.fold_result (references bytes origin) ~init:() ~f:(fun () at -> lob ~claim bytes at n))
+          in
+          Ok (children, last, rows, n :: walked))
+    in
+    { children = List.rev children; rows; walked; claimed = List.of_seq (Hashtbl.to_seq_keys claims) }
+  in
+  let index (layout : Layout.t) ~lob ~threads =
+    let%bind root = page layout.root in
+    let tree = Hashtbl.create 1024 in
+    let rec level height numbers expected rows claimed =
+      let count = Iarray.length numbers in
+      let slices = Int.max 1 (Int.min threads (count / 16)) in
+      let run (from, until) = slice layout ~lob ~height ~numbers ~expected ~from ~until in
+      let%bind parts =
+        if slices = 1 then Result.map (fun part -> [ part ]) (run (0, count))
+        else
+          Base.Result.all
+            (Quiver_core.Concurrent.spread ~workers:slices
+               (Iarray.init slices (fun s -> (s * count / slices, (s + 1) * count / slices)))
+               run)
+      in
+      let%bind () =
+        Base.List.fold_result parts ~init:() ~f:(fun () part ->
+            Base.List.fold_result part.walked ~init:() ~f:(fun () n ->
+                if Hashtbl.mem tree n then fail (Links n)
+                else (
+                  Hashtbl.replace tree n height;
+                  Ok ())))
+      in
+      let rows = rows + Base.List.sum (module Base.Int) parts ~f:(fun part -> part.rows) in
+      let claimed = List.concat_map (fun part -> part.claimed) parts @ claimed in
+      if height = 0 then Ok (rows, claimed)
+      else
+        let children = List.concat_map (fun part -> part.children) parts in
         let%bind () =
           Base.List.fold_result children ~init:() ~f:(fun () (child, _) ->
               if child < pages then Ok () else fail (Pointer child))
         in
-        level (height - 1) (List.map fst children) (Some expected) None rows
+        level (height - 1)
+          (Iarray.of_list (List.map fst children))
+          (Some (Iarray.of_list (List.map snd children)))
+          rows claimed
     in
-    let%bind rows = level (u16 root 64) [ layout.root ] None None 0 in
+    let%bind rows, claimed = level (u16 root 64) (Iarray.of_list [ layout.root ]) None 0 [] in
     let inode_of offset =
       if u32 root (offset + 4) = 2 then Ok (u16 root (offset + 8))
       else fail (Space "a segment's inode is not on page 2")
     in
     let%bind leaf_inode = inode_of 74 in
     let%map top_inode = inode_of 84 in
-    (layout, rows, leaf_inode, top_inode, List.of_seq (Hashtbl.to_seq tree))
+    (layout, rows, leaf_inode, top_inode, List.of_seq (Hashtbl.to_seq tree), claimed)
   in
-  let%bind first = index clustered ~lob in
+  let%bind ((_, _, _, _, _, claimed) as first) = index clustered ~lob ~threads in
   let%bind others =
-    Base.Result.all (Quiver_core.Concurrent.each (List.length secondary) (fun j -> index (List.nth secondary j) ~lob:(fun _ _ n -> fail (Lob n))))
+    let threads = Int.max 1 (threads / Int.max 1 (List.length secondary)) in
+    Base.Result.all
+      (Quiver_core.Concurrent.each (List.length secondary) (fun j ->
+           index (List.nth secondary j) ~lob:(fun ~claim:_ _ _ n -> fail (Lob n)) ~threads))
+  in
+  let lobs = Hashtbl.create 64 in
+  let%bind () =
+    Base.List.fold_result claimed ~init:() ~f:(fun () n ->
+        if Hashtbl.mem used n then fail (Lob n)
+        else (
+          Hashtbl.replace used n ();
+          Hashtbl.replace lobs n ();
+          Ok ()))
   in
   let indexes = first :: others in
   let tree = Hashtbl.create 1024 in
   let%bind () =
-    Base.List.fold_result indexes ~init:() ~f:(fun () (layout, _, _, _, walked) ->
+    Base.List.fold_result indexes ~init:() ~f:(fun () (layout, _, _, _, walked, _) ->
         Base.List.fold_result walked ~init:() ~f:(fun () (n, height) ->
             if Hashtbl.mem used n then fail (Links n)
             else (
@@ -430,7 +484,7 @@ let tablespace (clustered : Layout.t) ~(secondary : Layout.t list) ~pages ~read 
               Hashtbl.replace tree n (layout, height);
               Ok ())))
   in
-  let indexes = List.map (fun (layout, rows, leaf_inode, top_inode, _) -> (layout, rows, leaf_inode, top_inode)) indexes in
+  let indexes = List.map (fun (layout, rows, leaf_inode, top_inode, _, _) -> (layout, rows, leaf_inode, top_inode)) indexes in
   let%bind rows, leaf_inode =
     match indexes with
     | (_, rows, leaf_inode, _) :: others ->
@@ -549,5 +603,5 @@ let tablespace (clustered : Layout.t) ~(secondary : Layout.t list) ~pages ~read 
   let%bind () = if u32 header 58 = frag_used then Ok () else fail (Space "the space's count of fragment pages") in
   Ok { pages; rows }
 
-let tablespace clustered ~secondary ~pages ~read =
-  Result.map_error (fun error -> `Check error) (tablespace clustered ~secondary ~pages ~read)
+let tablespace clustered ~secondary ~pages ~threads ~read =
+  Result.map_error (fun error -> `Check error) (tablespace clustered ~secondary ~pages ~threads ~read)

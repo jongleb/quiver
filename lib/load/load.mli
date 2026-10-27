@@ -95,8 +95,9 @@ val advice : Quiver_mysql.Link.t -> binlog -> Quiver_core.Advice.t list @@ porta
 
 val retried :
   cause:('e -> cause option) -> (unit -> ('a, 'e) result) -> ('a, 'e) result @@ portable
-(** Runs again, up to 5 times in all, while the server reports a deadlock or a
-    lock wait timeout. *)
+(** Runs again, up to 8 times in all, while the server reports a deadlock or a
+    lock wait timeout, each time after a random pause of up to 10 ms, doubled per
+    attempt, at most 1 s: sessions that collided at once do not collide again. *)
 
 val renamed : target -> Quiver_core.Ident.t -> Quiver_core.Ident.t @@ portable
 

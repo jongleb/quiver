@@ -31,12 +31,11 @@ val create :
   secondary:Layout.t list ->
   File.t ->
   scratch:File.t ->
-  threads:int ->
   (t, [> `Tablespace of error ]) result
   @@ portable
 (** [template] is the empty table's [.ibd], holding exactly the clustered and [secondary]
-    indexes; the pages go to the file, sorted secondary records to [scratch] until [finish],
-    which merges them on at most [threads] threads. *)
+    indexes; the pages go to the file, sorted secondary records to [scratch] until [finish]
+    merges them. *)
 
 type records : immutable_data
 (** A batch's rows as record images of every index. *)
@@ -69,5 +68,10 @@ val close : run -> (finished, [> `File of File.error ]) result @@ portable
 (** Writes its last leaf and starts writing its secondary records, sorted. *)
 
 val finish :
-  t -> finished list -> (int, [> `Tablespace of error | `File of File.error ]) result @@ portable
-(** The runs in any order: the file's length in pages. *)
+  t ->
+  finished list ->
+  threads:int ->
+  (int, [> `Tablespace of error | `File of File.error ]) result
+  @@ portable
+(** The runs in any order, the secondary records merged on at most [threads] threads: the
+    file's length in pages. *)

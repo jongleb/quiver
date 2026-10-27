@@ -14,7 +14,9 @@ type submitted =
 val start : ('a : value mod contended portable). workers:int -> ('a -> unit) @ portable -> 'a t
 (** Up to [workers] threads, fewer when the system gives fewer. *)
 
-val submit : ('a : value mod contended portable). 'a t -> 'a -> submitted
+val submit : ('a : value mod contended portable). 'a t -> priority:int -> 'a -> submitted
+(** A free thread takes the waiting item of the highest [priority], the earliest of equal
+    ones. *)
 
 val stop : ('a : value mod contended portable). 'a t -> unit
 (** Once every item submitted before is done, ends the threads. *)

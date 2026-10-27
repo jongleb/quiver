@@ -387,7 +387,7 @@ let fixed_pool =
       let rec submit item =
         if item < items then (
           let () =
-            match Quiver_core.Pool.submit pool item with
+            match Quiver_core.Pool.submit pool ~priority:0 item with
             | Queued -> ()
             | Unqueued -> Portable.Atomic.incr (Iarray.get done_ item)
           in
@@ -399,6 +399,68 @@ let fixed_pool =
       && Portable.Atomic.get most <= Int.max 1 workers
       && Portable.Atomic.get running = 0)
 
+let pool_priorities =
+  QCheck2.Test.make ~count:200
+    ~name:"a free thread of a pool takes the waiting item of the highest priority, the earliest of equal ones"
+    ~print:QCheck2.Print.(list int)
+    QCheck2.Gen.(list_size (int_range 0 60) (int_range 0 5))
+    (fun priorities ->
+      let opened = Portable.Atomic.make false and taken = Portable.Atomic.make [] in
+      let pool =
+        Quiver_core.Pool.start ~workers:1 (fun item ->
+            if item < 0 then
+              let rec wait () = if not (Portable.Atomic.get opened) then (Thread.yield (); wait ()) in
+              wait ()
+            else Portable.Atomic.update taken ~pure_f:(fun taken -> item :: taken))
+      in
+      let (_ : Quiver_core.Pool.submitted) = Quiver_core.Pool.submit pool ~priority:Int.max_int (-1) in
+      List.iteri
+        (fun item priority ->
+          let (_ : Quiver_core.Pool.submitted) = Quiver_core.Pool.submit pool ~priority item in
+          ())
+        priorities;
+      Portable.Atomic.set opened true;
+      Quiver_core.Pool.stop pool;
+      let expected =
+        List.map snd
+          (List.stable_sort
+             (fun (p, _) (q, _) -> Int.compare q p)
+             (List.mapi (fun item priority -> (priority, item)) priorities))
+      in
+      List.equal Int.equal (List.rev (Portable.Atomic.get taken)) expected)
+
+let lease =
+  QCheck2.Test.make ~count:100
+    ~name:"threads lent at once never pass the budget, all come back, and a free budget lends what is wanted"
+    ~print:(fun (budget, wants) -> Printf.sprintf "budget %d, wants %s" budget (String.concat "," (List.map string_of_int wants)))
+    QCheck2.Gen.(pair (int_range 0 16) (list_size (int_range 1 8) (int_range 0 20)))
+    (fun (budget, wants) ->
+      let lease = Quiver_core.Lease.create budget in
+      let lent = Portable.Atomic.make 0 and most = Portable.Atomic.make 0 in
+      let wants = Iarray.of_list wants in
+      let (_ : unit list) =
+        Quiver_core.Concurrent.each (Iarray.length wants) (fun j ->
+            let wanted = Iarray.get wants j in
+            Base.Fn.apply_n_times ~n:2000
+              (fun () ->
+                let got = Quiver_core.Lease.take lease ~wanted in
+                let now = Portable.Atomic.fetch_and_add lent got + got in
+                let rec raise_most () =
+                  let seen = Portable.Atomic.get most in
+                  if now > seen then
+                    match Portable.Atomic.compare_and_set most ~if_phys_equal_to:seen ~replace_with:now with
+                    | Set_here -> ()
+                    | Compare_failed -> raise_most ()
+                in
+                raise_most ();
+                if got > wanted then Portable.Atomic.set most Int.max_int;
+                Portable.Atomic.update lent ~pure_f:(fun lent -> lent - got);
+                Quiver_core.Lease.give lease got)
+              ())
+      in
+      Portable.Atomic.get most <= budget
+      && Quiver_core.Lease.take lease ~wanted:(budget + 1) = budget)
+
 let tests =
   List.map QCheck_alcotest.to_alcotest
-    [ mailbox_model; mailbox_threads; registry; buffers; pool_waits; each; spread; fixed_pool ]
+    [ mailbox_model; mailbox_threads; registry; buffers; pool_waits; each; spread; fixed_pool; pool_priorities; lease ]

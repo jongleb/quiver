@@ -46,6 +46,13 @@ type charset : immutable_data =
   | Latin1  (** One byte a character, MySQL's [cp1252]: [CHAR] has a fixed length. *)
 [@@deriving sexp_of ~portable]
 
+(** How the server orders a text field's values. *)
+type sorted : immutable_data =
+  | Collated  (** By a collation this writer does not reproduce. *)
+  | Padded  (** By bytes, the shorter as if padded with spaces: a [_bin] collation of [PAD SPACE]. *)
+  | Bytewise  (** By bytes, a value before a longer one it begins: [utf8mb4_0900_bin]. *)
+[@@deriving sexp_of ~portable]
+
 (** How one field is stored. *)
 type storage : immutable_data =
   | Integer of { bytes : int; sign : sign; number : number }  (** Big-endian. *)
@@ -59,7 +66,7 @@ type storage : immutable_data =
   | Binary of int  (** [BINARY]: raw bytes padded with zeros. *)
   | Char of { least : int; big : bool; charset : charset }
       (** [CHAR]: text padded with spaces to [least] bytes. *)
-  | Text of { big : bool; charset : charset }
+  | Text of { big : bool; charset : charset; sorted : sorted }
       (** [VARCHAR] or [TEXT]; a length of 128 or more takes two bytes when [big]. *)
   | Variable of { big : bool }
       (** Raw bytes; a length of 128 or more takes two bytes when [big]. *)
@@ -81,6 +88,7 @@ type nullability : immutable_data = Not_null | Null_bit of int [@@deriving sexp_
 type part : immutable_data =
   | Whole
   | Prefix of int  (** Its first bytes. *)
+  | Characters of int  (** Its first characters, of text. *)
 [@@deriving sexp_of ~portable]
 
 type field : immutable_data = {

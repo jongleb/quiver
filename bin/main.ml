@@ -1112,8 +1112,8 @@ let () =
           & opt (some int) None
           & described [ "build-threads" ] ~docv:"N"
               ~doc:
-                "Threads merging a table's secondary indexes when its file is finished; half the \
-                 fast cores when not given."))
+                "Threads finishing and checking built files, between all tables at once: the \
+                 larger a table, the more it borrows; half the fast cores when not given."))
   in
   let binlog =
     let open Cmdliner in

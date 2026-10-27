@@ -91,7 +91,7 @@ let built ~cfg ~template ~dumped rows ~cuts ~order ~batch =
   let path = Filename.temp_file "quiver" ".ibd" in
   let file = ok (Quiver_innodb.File.create path) in
   let scratch = ok (Quiver_innodb.File.create (path ^ ".sort")) in
-  let space = ok (Quiver_innodb.Tablespace.create ~template:(fixture template) layout ~secondary:[] file ~scratch ~threads:4) in
+  let space = ok (Quiver_innodb.Tablespace.create ~template:(fixture template) layout ~secondary:[] file ~scratch) in
   let rows = Array.of_list rows in
   let bounds = List.sort_uniq compare ((0 :: cuts) @ [ Array.length rows ]) in
   let slices =
@@ -121,7 +121,7 @@ let built ~cfg ~template ~dumped rows ~cuts ~order ~batch =
         ok (Quiver_innodb.Tablespace.close run))
       fill_order
   in
-  let (_ : int) = ok (Quiver_innodb.Tablespace.finish space finished) in
+  let (_ : int) = ok (Quiver_innodb.Tablespace.finish space finished ~threads:4) in
   Quiver_innodb.File.close file;
   Quiver_innodb.File.close scratch;
   let bytes = Bytes.of_string (In_channel.with_open_bin path In_channel.input_all) in
@@ -133,8 +133,9 @@ let read file =
   let text = Bytes.to_string file in
   fun n -> Bytes.of_string (String.sub text (n * Quiver_innodb.Page.size) Quiver_innodb.Page.size)
 
-let checked layout file =
-  Quiver_innodb.Check.tablespace layout ~secondary:[] ~pages:(Bytes.length file / Quiver_innodb.Page.size) ~read:(read file)
+let checked ?(threads = 8) layout file =
+  Quiver_innodb.Check.tablespace layout ~secondary:[] ~pages:(Bytes.length file / Quiver_innodb.Page.size) ~threads
+    ~read:(read file)
 
 (** The leaf records read back on their own: down the leftmost pointers, along
     the leaves, each field's bytes cut by the layout, [None] when NULL. *)
@@ -409,7 +410,7 @@ let tests =
           let path = Filename.temp_file "quiver" ".ibd" in
           let file = ok (Quiver_innodb.File.create path) in
           let scratch = ok (Quiver_innodb.File.create (path ^ ".sort")) in
-          let space = ok (Quiver_innodb.Tablespace.create ~template:(fixture "narrow.ibd") layout ~secondary:[] file ~scratch ~threads:4) in
+          let space = ok (Quiver_innodb.Tablespace.create ~template:(fixture "narrow.ibd") layout ~secondary:[] file ~scratch) in
           let run = Quiver_innodb.Tablespace.run space ~rank:0 in
           let columns = Iarray.of_list [ column Int64 [ `Int 5; `Int 3 ]; column Int32 [ `Int 0; `Int 0 ] ] in
           let records = ok (Quiver_innodb.Tablespace.encode space columns ~rows:2) in
@@ -515,7 +516,7 @@ let tests =
               let path = Filename.temp_file "quiver" ".ibd" in
               let file = ok (Quiver_innodb.File.create path) in
               let scratch = ok (Quiver_innodb.File.create (path ^ ".sort")) in
-              let space = ok (Quiver_innodb.Tablespace.create ~template:(fixture template) layout ~secondary:[] file ~scratch ~threads:4) in
+              let space = ok (Quiver_innodb.Tablespace.create ~template:(fixture template) layout ~secondary:[] file ~scratch) in
               let rows = rows_of scenario in
               let runs = 8 in
               let per = (List.length rows + runs - 1) / runs in
@@ -556,7 +557,7 @@ let tests =
                     built)
               in
               let finished = List.map (function Ok finished -> finished | Error message -> Alcotest.fail message) finished in
-              let (_ : int) = ok (Quiver_innodb.Tablespace.finish space finished) in
+              let (_ : int) = ok (Quiver_innodb.Tablespace.finish space finished ~threads:4) in
               Quiver_innodb.File.close file;
               Quiver_innodb.File.close scratch;
               let bytes = Bytes.of_string (In_channel.with_open_bin path In_channel.input_all) in
@@ -667,7 +668,7 @@ let typed_build ?(table = "typed") ?(runs = 1) typed =
   let path = Filename.temp_file "quiver" ".ibd" in
   let file = ok (Quiver_innodb.File.create path) in
   let scratch = ok (Quiver_innodb.File.create (path ^ ".sort")) in
-  let space = ok (Quiver_innodb.Tablespace.create ~template:(fixture (table ^ ".ibd")) layout ~secondary:[] file ~scratch ~threads:4) in
+  let space = ok (Quiver_innodb.Tablespace.create ~template:(fixture (table ^ ".ibd")) layout ~secondary:[] file ~scratch) in
   let rows = List.length (snd (List.hd typed)) in
   let cuts = List.init runs (fun r -> (r * rows / runs, ((r + 1) * rows / runs) - (r * rows / runs))) in
   let started = List.mapi (fun rank cut -> (cut, Quiver_innodb.Tablespace.run space ~rank)) cuts in
@@ -685,7 +686,7 @@ let typed_build ?(table = "typed") ?(runs = 1) typed =
              Quiver_innodb.Tablespace.close run)
            started)
     in
-    Quiver_innodb.Tablespace.finish space finished
+    Quiver_innodb.Tablespace.finish space finished ~threads:4
   in
   Quiver_innodb.File.close file;
   Quiver_innodb.File.close scratch;
@@ -970,7 +971,7 @@ let outside_build rows ~cuts =
   let path = Filename.temp_file "quiver" ".ibd" in
   let file = ok (Quiver_innodb.File.create path) in
   let scratch = ok (Quiver_innodb.File.create (path ^ ".sort")) in
-  let space = ok (Quiver_innodb.Tablespace.create ~template:(fixture "outside.ibd") layout ~secondary:[] file ~scratch ~threads:4) in
+  let space = ok (Quiver_innodb.Tablespace.create ~template:(fixture "outside.ibd") layout ~secondary:[] file ~scratch) in
   let rows = Array.of_list rows in
   let bounds = List.sort_uniq compare ((0 :: cuts) @ [ Array.length rows ]) in
   let slices = List.filteri (fun k _ -> k + 1 < List.length bounds) bounds in
@@ -989,7 +990,7 @@ let outside_build rows ~cuts =
         ok (Quiver_innodb.Tablespace.close run))
       slices
   in
-  let (_ : int) = ok (Quiver_innodb.Tablespace.finish space (List.rev finished)) in
+  let (_ : int) = ok (Quiver_innodb.Tablespace.finish space (List.rev finished) ~threads:4) in
   Quiver_innodb.File.close file;
   Quiver_innodb.File.close scratch;
   let bytes = Bytes.of_string (In_channel.with_open_bin path In_channel.input_all) in
@@ -1111,7 +1112,7 @@ let tests =
           let path = Filename.temp_file "quiver" ".ibd" in
           let file = ok (Quiver_innodb.File.create path) in
           let scratch = ok (Quiver_innodb.File.create (path ^ ".sort")) in
-          let space = ok (Quiver_innodb.Tablespace.create ~template:(fixture "json.ibd") layout ~secondary:[] file ~scratch ~threads:4) in
+          let space = ok (Quiver_innodb.Tablespace.create ~template:(fixture "json.ibd") layout ~secondary:[] file ~scratch) in
           let run = Quiver_innodb.Tablespace.run space ~rank:0 in
           let batch =
             Iarray.of_list
@@ -1119,7 +1120,7 @@ let tests =
                 typed_column (Quiver_core.Ltype.Json, List.map (fun text -> `Text text) texts) ]
           in
           ok (Quiver_innodb.Tablespace.add run (ok (Quiver_innodb.Tablespace.encode space batch ~rows:(List.length texts))));
-          let (_ : int) = ok (Quiver_innodb.Tablespace.finish space [ ok (Quiver_innodb.Tablespace.close run) ]) in
+          let (_ : int) = ok (Quiver_innodb.Tablespace.finish space [ ok (Quiver_innodb.Tablespace.close run) ] ~threads:4) in
           Quiver_innodb.File.close file;
           Quiver_innodb.File.close scratch;
           let built = Bytes.of_string (In_channel.with_open_bin path In_channel.input_all) in
@@ -1214,16 +1215,25 @@ let secondary_layouts cfg =
   let layout = ok (Quiver_innodb.Layout.of_cfg cfg ~collations (List.map fst secondary_rows)) in
   (layout, List.map (fun index -> ok (Quiver_innodb.Layout.secondary layout cfg index)) cfg.secondary)
 
-let secondary_built typed ~cuts ~batch ~threads =
+let characters n text =
+  let rec past k left =
+    if left = 0 || k >= String.length text then Int.min k (String.length text)
+    else
+      let lead = Char.code text.[k] in
+      past (k + if lead < 0x80 then 1 else if lead < 0xE0 then 2 else if lead < 0xF0 then 3 else 4) (left - 1)
+  in
+  String.sub text 0 (past 0 n)
+
+let secondary_built ?(table = "secondary") typed ~cuts ~batch ~threads =
   let dumped = List.map fst typed in
-  let cfg = ok (Quiver_innodb.Cfg.parse (fixture "secondary.cfg")) in
+  let cfg = ok (Quiver_innodb.Cfg.parse (fixture (table ^ ".cfg"))) in
   let layout = ok (Quiver_innodb.Layout.of_cfg cfg ~collations dumped) in
   let others = List.map (fun index -> ok (Quiver_innodb.Layout.secondary layout cfg index)) cfg.secondary in
   let path = Filename.temp_file "quiver" ".ibd" in
   let file = ok (Quiver_innodb.File.create path) in
   let scratch = ok (Quiver_innodb.File.create (path ^ ".sort")) in
   let space =
-    ok (Quiver_innodb.Tablespace.create ~template:(fixture "secondary.ibd") layout ~secondary:others file ~scratch ~threads)
+    ok (Quiver_innodb.Tablespace.create ~template:(fixture (table ^ ".ibd")) layout ~secondary:others file ~scratch)
   in
   let rows = List.length (snd (List.hd typed)) in
   let bounds = List.sort_uniq compare ((0 :: List.map (fun cut -> cut mod (rows + 1)) cuts) @ [ rows ]) in
@@ -1250,7 +1260,7 @@ let secondary_built typed ~cuts ~batch ~threads =
              Quiver_innodb.Tablespace.close run)
            ranges)
     in
-    Quiver_innodb.Tablespace.finish space finished
+    Quiver_innodb.Tablespace.finish space finished ~threads
   in
   Quiver_innodb.File.close file;
   Quiver_innodb.File.close scratch;
@@ -1277,7 +1287,7 @@ let tests =
               let () =
                 match
                   Quiver_innodb.Check.tablespace layout ~secondary:others ~pages:(Bytes.length bytes / Quiver_innodb.Page.size)
-                    ~read:(read bytes)
+                    ~threads:8 ~read:(read bytes)
                 with
                 | Ok { rows; _ } -> Alcotest.(check int) "rows" 20000 rows
                 | Error _ as failed -> Alcotest.fail (Printf.sprintf "%d runs: %s" runs (check_error failed))
@@ -1363,11 +1373,11 @@ let tests =
              | Ok (layout, others, bytes), _ -> (
                  match
                    ( Quiver_innodb.Check.tablespace layout ~secondary:others
-                       ~pages:(Bytes.length bytes / Quiver_innodb.Page.size) ~read:(read bytes),
+                       ~pages:(Bytes.length bytes / Quiver_innodb.Page.size) ~threads:keyed.threads ~read:(read bytes),
                      repeated )
                  with
                  | Error (`Check (Quiver_innodb.Check.Duplicate _)), true -> true
-                 | Error _, _ -> QCheck2.Test.fail_reportf "check: %s" (check_error (Quiver_innodb.Check.tablespace layout ~secondary:others ~pages:(Bytes.length bytes / Quiver_innodb.Page.size) ~read:(read bytes)))
+                 | Error _, _ -> QCheck2.Test.fail_reportf "check: %s" (check_error (Quiver_innodb.Check.tablespace layout ~secondary:others ~pages:(Bytes.length bytes / Quiver_innodb.Page.size) ~threads:keyed.threads ~read:(read bytes)))
                  | Ok _, true -> QCheck2.Test.fail_reportf "a repeated unique key passed"
                  | Ok { rows; _ }, false ->
                      let clustered = stored layout bytes in
@@ -1387,7 +1397,8 @@ let tests =
                                       in
                                       match (Option.join raw, field.part) with
                                       | Some raw, Prefix n -> Some (String.sub raw 0 (Int.min n (String.length raw)))
-                                      | raw, (Prefix _ | Whole) -> raw)
+                                      | Some raw, Characters n -> Some (characters n raw)
+                                      | raw, (Prefix _ | Characters _ | Whole) -> raw)
                                     index.fields)
                                 clustered
                             in
@@ -1430,7 +1441,7 @@ let tests =
             change file (n * Quiver_innodb.Page.size) (origins file n);
             reseal file n;
             Quiver_innodb.Check.tablespace layout ~secondary:others ~pages:(Bytes.length file / Quiver_innodb.Page.size)
-              ~read:(read file)
+              ~threads:8 ~read:(read file)
           in
           let () =
             match
@@ -1466,4 +1477,109 @@ let tests =
           | Error (`Layout (Quiver_innodb.Layout.Clustered_by "uc")) -> ()
           | Error (`Layout error) -> Alcotest.fail (Sexplib0.Sexp.to_string (Quiver_innodb.Layout.sexp_of_error error))
           | Ok _ -> Alcotest.fail "built");
+    ]
+
+let tests =
+  tests
+  @ [
+      Alcotest.test_case "keys out of order between two leaves fail the check however the leaves are split" `Quick (fun () ->
+          let _, layout, file =
+            build_scenario { shape = Narrow; rows = 60_000; seed = 5; cuts = [ 20_000 ]; order = [ 1; 0 ]; batch = 1000 }
+          in
+          let size = Quiver_innodb.Page.size in
+          let u16 file at = Bytes.get_uint16_be file at
+          and u32 file at = Int32.to_int (Bytes.get_int32_be file at) land 0xFFFF_FFFF in
+          let first page = (99 + u16 file ((page * size) + 97)) land 0xFFFF in
+          let rec leftmost page = if u16 file ((page * size) + 64) = 0 then page else leftmost (u32 file ((page * size) + first page + 8)) in
+          let rec leaves page acc = if page = Quiver_innodb.Page.null then List.rev acc else leaves (u32 file ((page * size) + 12)) (page :: acc) in
+          let leaves = leaves (leftmost layout.root) [] in
+          if List.length leaves < 64 then Alcotest.failf "only %d leaves" (List.length leaves);
+          List.iter
+            (fun threads -> Alcotest.(check string) (Printf.sprintf "%d threads, unbroken" threads) "passed" (check_error (checked ~threads layout file)))
+            [ 1; 2; 3; 8 ];
+          List.iter
+            (fun page ->
+              let copy = Bytes.copy file in
+              let rec last origin =
+                let next = (origin + u16 copy ((page * size) + origin - 2)) land 0xFFFF in
+                if next = 112 then origin else last next
+              in
+              Bytes.fill copy ((page * size) + last (first page)) 8 '\xFF';
+              reseal copy page;
+              List.iter
+                (fun threads ->
+                  match checked ~threads layout copy with
+                  | Error (`Check (Quiver_innodb.Check.Order _)) -> ()
+                  | outcome -> Alcotest.failf "leaf %d, %d threads: %s" page threads (check_error outcome))
+                [ 1; 8 ])
+            (Base.List.drop_last_exn leaves));
+    ]
+
+(** [nopk.txt]: 4000 rows of a table without a primary key, as [nopk-rows.ibd] holds them: text
+    in [utf8mb3_bin] keyed by its first 10 characters, [utf8mb4_bin] by 5 with an integer after,
+    [utf8mb4_0900_bin] whole, an integer key, a [UNIQUE] key with a nullable column; values with
+    trailing spaces, bytes below the space, characters of 2–4 bytes, values equal once padded. *)
+let nopk_rows =
+  let rows =
+    List.map (String.split_on_char '\t') (List.filter (fun line -> line <> "") (String.split_on_char '\n' (fixture "nopk.txt")))
+  in
+  let field k f = List.map (fun row -> match List.nth row k with "NULL" -> `Null | v -> f v) rows in
+  [
+    (("t", Quiver_core.Ltype.String), field 0 (fun v -> `Text (hex v)));
+    (("v", String), field 1 (fun v -> `Text (hex v)));
+    (("w", String), field 2 (fun v -> `Text (hex v)));
+    (("a", Uint32), field 3 (fun v -> `Int (int_of_string v)));
+    (("b", Uint32), field 4 (fun v -> `Int (int_of_string v)));
+    (("c", Uint64), field 5 (fun v -> `Int64 (Int64.of_string v)));
+    (("d", Int8), field 6 (fun v -> `Int (int_of_string v)));
+  ]
+
+let ranked (layout : Quiver_innodb.Layout.t) others file =
+  let ranks = List.mapi (fun rank record -> (snd (List.hd record), rank)) (stored layout file) in
+  List.map
+    (fun index ->
+      List.map
+        (fun record ->
+          match List.rev (List.map snd record) with
+          | id :: rest -> List.rev (Some (string_of_int (List.assoc id ranks)) :: rest)
+          | [] -> [])
+        (stored index file))
+    others
+
+let tests =
+  tests
+  @ [
+      Alcotest.test_case "a table without a primary key gets its secondary indexes as the server builds them, text keys of _bin collations too" `Quick
+        (fun () ->
+          let cfg = ok (Quiver_innodb.Cfg.parse (fixture "nopk-rows.cfg")) in
+          let server_layout = ok (Quiver_innodb.Layout.of_cfg cfg ~collations (List.map fst nopk_rows)) in
+          let server_others = List.map (fun index -> ok (Quiver_innodb.Layout.secondary server_layout cfg index)) cfg.secondary in
+          let theirs = ranked server_layout server_others (Bytes.of_string (fixture "nopk-rows.ibd")) in
+          let rows = List.length (snd (List.hd nopk_rows)) in
+          List.iter
+            (fun runs ->
+              let layout, others, bytes =
+                ok (secondary_built ~table:"nopk" nopk_rows ~cuts:(List.init runs (fun r -> r * rows / runs)) ~batch:333 ~threads:4)
+              in
+              let () =
+                match
+                  Quiver_innodb.Check.tablespace layout ~secondary:others ~pages:(Bytes.length bytes / Quiver_innodb.Page.size)
+                    ~threads:4 ~read:(read bytes)
+                with
+                | Ok { rows = checked; _ } -> Alcotest.(check int) "rows" rows checked
+                | Error _ as failed -> Alcotest.failf "%d runs: %s" runs (check_error failed)
+              in
+              let ours = ranked layout others bytes in
+              Alcotest.(check int) "indexes" 5 (List.length ours);
+              List.iteri
+                (fun k (ours, theirs) ->
+                  Alcotest.(check int) (Printf.sprintf "%d runs, index %d records" runs k) (List.length theirs) (List.length ours);
+                  List.iteri
+                    (fun r (ours, theirs) ->
+                      if ours <> theirs then
+                        Alcotest.failf "%d runs, index %d, record %d: ours %s, the server's %s" runs k r
+                          (String.concat "," (List.map shown_raw ours)) (String.concat "," (List.map shown_raw theirs)))
+                    (List.combine ours theirs))
+                (List.combine ours theirs))
+            [ 1; 6 ]);
     ]

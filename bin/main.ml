@@ -1119,13 +1119,13 @@ let () =
                  tablespace); the server's own when not given.")
       $ Arg.(
           value
-          & opt (enum [ ("quiver", Quiver_load.Physical.Quiver); ("server", Server) ]) Quiver_load.Physical.Server
+          & opt (enum [ ("quiver", Quiver_load.Physical.Quiver); ("server", Server) ]) Quiver_load.Physical.Quiver
           & described [ "tablespace-keys" ] ~docv:"WHO"
               ~doc:
                 "Who builds the secondary keys of a table built as a tablespace: $(b,quiver) builds \
                  those ordered by bytes (integers, dates and times, decimals, binary strings) into \
-                 the file, the server adds the others after the import; $(b,server) adds them all \
-                 after the import.")
+                 the file, the server adds the others after the import (the default); \
+                 $(b,server) adds them all after the import.")
       $ Arg.(
           value
           & opt (some dir) None

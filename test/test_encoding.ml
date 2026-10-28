@@ -106,7 +106,8 @@ let tests =
       QCheck2.Test.make ~count:1000
         ~name:
           "most of the last half minute goes to rungs within a fifth of the \
-           fastest"
+           fastest, or whose next rung toward the bottleneck gains less than \
+           the noise hides"
         ~print scenario (fun (path, at, noises) ->
           let best =
             Array.fold_left Int.max 0
@@ -115,8 +116,21 @@ let tests =
           let late =
             List.filteri (fun index _ -> index >= 50) (run path ~at noises)
           in
+          let settled rung =
+            let rendered = path.renderers * path.speeds.(rung)
+            and carried = path.network * 1000 / path.ratios.(rung) in
+            let next =
+              if carried < Int.min path.source rendered && rung + 1 < Array.length path.speeds then
+                Some (rung + 1)
+              else if rendered < Int.min path.source carried && rung > 0 then Some (rung - 1)
+              else None
+            in
+            Option.fold ~none:true
+              ~some:(fun next -> rate path next * 100 < rate path rung * 115)
+              next
+          in
           let good =
-            Base.List.count late ~f:(fun rung -> rate path rung * 5 >= best * 4)
+            Base.List.count late ~f:(fun rung -> rate path rung * 5 >= best * 4 || settled rung)
           in
           good * 10 >= List.length late * 8);
     ]

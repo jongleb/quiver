@@ -141,6 +141,9 @@ SQL literals.
 - **Even chunks.** Key ranges are bisected by the server's `EXPLAIN` estimates and small
   neighbours are merged, so skewed tables split evenly. Data flows from the first second and the
   DDL of small tables is taken along the way.
+- **Tables without a key.** A table with neither a primary key nor a unique one over `NOT NULL`
+  columns is read in one pass, cheap for the server. `--keyless-read ranges` has every reader
+  take a range of another index's first column instead, at the cost of a lookup per row.
 - **Separate stages.** Readers, renderers (SQL, CSV, zstd) and writers run on their own cores,
   joined by bounded queues. Doubles are printed by zmij, about 13× faster than Grisu3.
 
@@ -313,12 +316,12 @@ itself.
   stored in the order the source sorted them, and the target checks that order in its own
   collation when it imports the table: a table out of order is refused, not stored. A table without a primary key works too; its
   hidden row ids are numbered by quiver.
-- **Secondary keys.** quiver builds keys over integers, dates and times, decimals and binary
-  strings (prefixes too) into the file, and checks `UNIQUE` keys itself, since `IMPORT` does
-  not. Keys over text in a collation, floats or `DESC` columns, keys of a table without a primary
-  key, `SPATIAL` and `FULLTEXT` keys are added by the server after the import, in their places,
-  so `SHOW CREATE TABLE` matches the source. This is `--tablespace-keys quiver`; by default
-  (`server`) the server adds them all after the import.
+- **Secondary keys.** quiver builds keys over integers, dates and times, decimals, binary
+  strings (prefixes too) and text in a `_bin` collation into the file, also for a table without a
+  primary key, and checks `UNIQUE` keys itself, since `IMPORT` does not. Keys over text in another
+  collation, floats or `DESC` columns, `SPATIAL` and `FULLTEXT` keys are added by the server after
+  the import, in their places, so `SHOW CREATE TABLE` matches the source. This is the default;
+  `--tablespace-keys server` has the server add them all after the import.
 - **Checks.** Each stored field and every secondary index record is compared byte for byte with
   records the server wrote itself.
 - **Fallback.** A table the writer cannot build goes through `LOAD DATA`, and quiver says why.
@@ -326,7 +329,7 @@ itself.
   by way and by reason, and times each table's import and secondary keys.
 - **What it saves.** Writing rows and building byte-ordered keys moves to the client's cores; the
   import then has more pages to take. Tables that fall back load as before.
-- **Settings.** `--tablespace-keys server|quiver`, `--sort-dir` (where sorted secondary records
+- **Settings.** `--tablespace-keys quiver|server`, `--sort-dir` (where sorted secondary records
   wait; beside the file by default), `--build-threads` (threads finishing and checking built files, shared by all tables).
   `--read-order largest-tables` reads the largest tables first, so their check, import and keys
   run while the rest is read, and `--declare-tables all-at-once` prepares every table before

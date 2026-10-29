@@ -28,6 +28,9 @@ val open_ :
   result @@ portable
 
 val width : t -> int @@ portable
+
+val warnings : t -> int @@ portable
+(** The warnings the server counted for the result, once its last row is read. *)
 val kind : t -> int -> kind @@ portable
 
 val next :

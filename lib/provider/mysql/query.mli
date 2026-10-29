@@ -30,8 +30,9 @@ type t =
       name : Quiver_core.Ident.t;
       kind : Quiver_core.Definition.kind;
     }
-  | Chunk of Quiver_core.Chunk.t
-      (** The chunk's rows, in primary key order when the table has one. *)
+  | Chunk of { chunk : Quiver_core.Chunk.t; sources : (Quiver_core.Ident.t * string) list }
+      (** The chunk's rows, in primary key order when the table has one; each field in
+          [sources] is its expression, cast to the field's type. *)
   | Key_span of { chunk : Quiver_core.Chunk.t; key : Quiver_core.Ident.t }
       (** The smallest and the largest [key] of the chunk's rows. *)
   | Collation of {

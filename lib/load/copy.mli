@@ -54,18 +54,21 @@ type error =
   | Lost_rows of { table : Quiver_core.Schema.Name.t; sent : int; built : int }
       (** The imported tablespace holds another number of rows than were read. *)
   | Mismatched_render  (** A batch rendered for the other kind of part. *)
+  | After_load of After_load.error
 [@@deriving sexp_of ~portable]
 
 val create :
   Quiver_mysql.Provider.conn_config ->
   Load.target ->
   keys:Load.keys ->
+  after:After_load.rule list ->
   binlog:Load.binlog ->
   ingest:ingest ->
   sessions:int ->
   (t, [> `Sink of error ]) result
 (** Opens [sessions] loading sessions, each taken by one part at a time from
-    [part] to [close]: as many as parts open at once. *)
+    [part] to [close]: as many as parts open at once. [after] runs once every table's
+    rows and keys are in, before foreign keys and objects. *)
 
 val shutdown : t -> unit
 (** Ends the loading sessions, after the dump succeeded or failed. *)
@@ -96,6 +99,7 @@ type finishing =
   | Unfinished
   | Finished of {
       built : Core.Time_ns.Span.t;  (** Waiting for imports and keys still running. *)
+      after_load : Core.Time_ns.Span.t;  (** The statements of [after]. *)
       foreign_keys : Core.Time_ns.Span.t;
       objects : Core.Time_ns.Span.t;
     }

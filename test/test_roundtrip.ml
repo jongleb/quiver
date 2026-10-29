@@ -501,7 +501,7 @@ let localized =
               committed = Core.Time_ns.Span.zero;
             }
           ~schema:(Support.get_ok (Quiver_core.Schema.make tables))
-          interleaved
+          ~masked:[] interleaved
       in
       match
         Quiver_core.Manifest.localize

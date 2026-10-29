@@ -32,6 +32,16 @@ copy:
   sort-dir: /fast/scratch
   build-threads: 8
   data-table: [shop.orders, shop.items]
+  mask:                       # masked as read: null, text:VALUE, shape, email, hash, keep, sql:…, expr:…
+    shop.users:               # a map gives the option once per leaf: shop.users.name=shape …
+      name: shape
+      passport: hash
+    "*.*.email": email        # quote keys that start with *
+  mask-script: [policy.scm]   # your own masking policy in S-expressions: quiver mask --help
+  mask-strict: [shop.users]   # every column of these tables masked or kept, or nothing is read
+  mask-secret: change-me      # the same secret masks the same value the same way every run
+  after-load:                 # run on the target once the rows and keys are in, {table} its name
+    shop.orders: "UPDATE {table} SET comment = NULL"
 
 load:
   directory: /backups/today

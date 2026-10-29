@@ -64,7 +64,7 @@ module Make (S : Quiver_core.Sink_intf.S) : sig
     session ->
     S.t ->
     columns:Message.columns ->
-    (unit, [> `Collector of error | `Sink of S.error ]) result
+    (unit, [> `Collector of error | `Sink of S.error | `Mask of Quiver_core.Mask.error ]) result
   (** Answers the hello, accepts the data connections and writes everything sent
       until the agent finishes, passing it on to [forward] too; the agent reads
       [columns] of each table, or [Stored_too] when [forward] takes them; the first

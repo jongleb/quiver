@@ -25,7 +25,7 @@ type t =
       name : Quiver_core.Ident.t;
       kind : Quiver_core.Definition.kind;
     }
-  | Chunk of Quiver_core.Chunk.t
+  | Chunk of { chunk : Quiver_core.Chunk.t; sources : (Quiver_core.Ident.t * string) list }
   | Key_span of { chunk : Quiver_core.Chunk.t; key : Quiver_core.Ident.t }
   | Collation of {
       table : Quiver_core.Schema.Name.t;
@@ -189,12 +189,40 @@ let sql = function
         | Event -> "EVENT"
       in
       [%string "SHOW CREATE %{kind} %{Quiver_core.Ident.backquoted database}.%{Quiver_core.Ident.backquoted name}"]
-  | Chunk chunk ->
+  | Chunk { chunk; sources } ->
       let table = Quiver_core.Chunk.table chunk in
+      let selected (field : Quiver_core.Schema.Field.t) =
+        let name = Quiver_core.Ident.backquoted field.name in
+        Option.fold
+          (List.assoc_opt field.name sources)
+          ~none:name
+          ~some:(fun expression ->
+            let fsp (fsp : Quiver_core.Ltype.Fsp.t) = Int.to_string (fsp :> int) in
+            let cast =
+              match field.ltype with
+              | Int8 | Int16 | Int32 | Int64 | Year -> Some "SIGNED"
+              | Uint8 | Uint16 | Uint32 | Uint64 -> Some "UNSIGNED"
+              | Float32 | Float64 -> Some "DOUBLE"
+              | Decimal { precision; scale } -> Some [%string "DECIMAL(%{precision#Int}, %{scale#Int})"]
+              | String | Json -> Some "CHAR CHARACTER SET utf8mb4"
+              | Bytes -> Some "BINARY"
+              | Date | Unchecked_date -> Some "DATE"
+              | Datetime precision | Timestamp precision | Unchecked_datetime precision ->
+                  Some [%string "DATETIME(%{fsp precision})"]
+              | Time precision -> Some [%string "TIME(%{fsp precision})"]
+              | Bool | Enum _ | Set _ | Geometry -> None
+            in
+            Option.fold cast
+              ~none:[%string "(%{expression}) AS %{name}"]
+              ~some:(fun cast -> [%string "CAST((%{expression}) AS %{cast}) AS %{name}"]))
+      in
       let order =
         match table.key with
         | Primary (key, keys) -> " ORDER BY " ^ columns (key :: keys)
         | Unique _ | Indexed _ | No_key -> ""
+      in
+      let selected_columns =
+        String.concat ", " (List.map selected (Quiver_core.Schema.Table.columns table))
       in
       let through =
         match (chunk, table.key) with
@@ -203,7 +231,7 @@ let sql = function
         | (Whole _ | Range _), (Primary _ | Unique _ | Indexed _ | No_key) -> ""
       in
       [%string
-        "SELECT %{columns (Quiver_core.Schema.Table.columns table)} FROM %{qualified table.name}%{through}%{where chunk}%{order}"]
+        "SELECT %{selected_columns} FROM %{qualified table.name}%{through}%{where chunk}%{order}"]
   | Key_span { chunk; key } ->
       let key = Quiver_core.Ident.backquoted key in
       [%string

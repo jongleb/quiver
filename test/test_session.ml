@@ -682,6 +682,7 @@ let property
               committed = Core.Time_ns.Span.zero;
             }
          ~schema:(Support.get_ok (Schema.make schema))
+         ~masked:[]
          (Base.List.concat_mapi tables ~f:(fun n parts ->
               Base.List.filter_mapi parts ~f:(fun index _ ->
                   match

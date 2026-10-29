@@ -16,6 +16,7 @@ type error =
   | Built of { table : Quiver_core.Schema.Name.t @@ aliased; cause : Physical.cause @@ aliased }
   | Lost_rows of { table : Quiver_core.Schema.Name.t; sent : int; built : int }
   | Mismatched_render
+  | After_load of After_load.error
 [@@deriving sexp_of ~portable]
 
 type tablespaces = {
@@ -90,6 +91,7 @@ type finishing =
   | Unfinished
   | Finished of {
       built : Core.Time_ns.Span.t;
+      after_load : Core.Time_ns.Span.t;
       foreign_keys : Core.Time_ns.Span.t;
       objects : Core.Time_ns.Span.t;
     }
@@ -152,6 +154,7 @@ type declaration = {
 type t = {
   target : Load.target;
   keys : Load.keys;
+  after : After_load.rule list;
   control : Quiver_mysql.Link.t Await.Capsule.Await.With_mutex.t;
   loaders : Quiver_mysql.Link.t Await.Capsule.Await.With_mutex.t iarray;
   idle : int Await.Await.Mpmc_queue.t;  (** Loaders no part holds. *)
@@ -241,7 +244,7 @@ let retried link statement =
     (fun () -> run link statement)
     ~cause:(function Rejected { cause; _ } -> Some cause | _ -> None)
 
-let add_keys link (into : Quiver_core.Schema.Name.t) (first, rest) =
+let run_in link (into : Quiver_core.Schema.Name.t) (first, rest) =
   let%bind () = execute link (Use into.database) in
   Base.List.fold_result (first :: rest) ~init:() ~f:(fun () statement ->
       retried link statement)
@@ -274,7 +277,7 @@ let declare t { table = { name; _ } as table; ddl; parts; declared } =
           let%bind () = retried link create in
           match (later, parts) with
           | first :: rest, 0 ->
-              let%map () = add_keys link into (first, rest) in
+              let%map () = run_in link into (first, rest) in
               Load.Together
           | _, 0 -> Ok Load.Together
           | _, _ ->
@@ -350,7 +353,7 @@ let declare t { table = { name; _ } as table; ddl; parts; declared } =
 
 let ended t = function
   | Keys_of { into; later; added } ->
-      Await.Await.Ivar.fill_if_empty added (on_idle_loader t (fun link -> add_keys link into later))
+      Await.Await.Ivar.fill_if_empty added (on_idle_loader t (fun link -> run_in link into later))
   | Import_of { state; table; closed; imported } ->
       Await.Await.Ivar.fill_if_empty imported
         (on_idle_loader t (fun link ->
@@ -372,12 +375,12 @@ let ended t = function
              let%bind () = if built = sent then Ok () else Error (Lost_rows { table; sent; built }) in
              let importing = Quiver_core.Stopwatch.elapsed imports in
              let keying = Quiver_core.Stopwatch.start () in
-             let%map () = match state.later with [] -> Ok () | first :: rest -> add_keys link state.into (first, rest) in
+             let%map () = match state.later with [] -> Ok () | first :: rest -> run_in link state.into (first, rest) in
              Portable.Atomic.set state.progress
                (Imported
                   { preparing = state.preparing; queued; checking; importing; keys = Quiver_core.Stopwatch.elapsed keying })))
 
-let create config target ~keys ~binlog ~ingest ~sessions =
+let create config target ~keys ~after ~binlog ~ingest ~sessions =
   Result.map_error
     (fun error -> `Sink error)
     (let%bind control, loaders =
@@ -467,6 +470,7 @@ let create config target ~keys ~binlog ~ingest ~sessions =
            {
              target;
              keys;
+             after;
              control;
              loaders = Iarray.of_list loaders;
              idle;
@@ -973,7 +977,7 @@ let discard_loading (part : loading) =
 
 let discard = function Loading loading -> discard_loading loading | Building _ -> ()
 
-let finish t ~source:_ ~tables:_ ~manifest:_ =
+let finish t ~source:_ ~tables ~manifest:_ =
   Result.map_error
     (fun error -> `Sink error)
     (let began = Quiver_core.Stopwatch.start () in
@@ -990,16 +994,29 @@ let finish t ~source:_ ~tables:_ ~manifest:_ =
          ~f:(fun () added ->
            Await.Await.Ivar.read Quiver_core.Blocking.await added)
      in
-     let built = Quiver_core.Stopwatch.elapsed began and adding = Quiver_core.Stopwatch.start () in
+     let built = Quiver_core.Stopwatch.elapsed began and updating = Quiver_core.Stopwatch.start () in
+     let target = t.target in
+     let%bind after =
+       Result.map_error
+         (fun (`After_load error) -> After_load error)
+         (After_load.statements t.after (List.map fst tables) ~into:(fun name ->
+              { name with database = Load.renamed target name.database }))
+     in
+     let%bind () =
+       Base.Result.all_unit
+         (Quiver_core.Concurrent.spread ~workers:(Iarray.length t.loaders) (Iarray.of_list after)
+            (fun (into, statements) -> on_idle_loader t (fun link -> run_in link into statements)))
+     in
+     let after_load = Quiver_core.Stopwatch.elapsed updating and adding = Quiver_core.Stopwatch.start () in
      let%bind () =
        Base.Result.all_unit
          (Quiver_core.Concurrent.spread ~workers:(Iarray.length t.loaders)
             (Iarray.of_list (List.rev (Portable.Atomic.get t.foreign)))
             (fun (into, keys) ->
-              on_idle_loader t (fun link -> add_keys link into keys)))
+              on_idle_loader t (fun link -> run_in link into keys)))
      in
      let foreign_keys = Quiver_core.Stopwatch.elapsed adding and creating = Quiver_core.Stopwatch.start () in
-     let target = t.target and objects = Portable.Atomic.get t.objects in
+     let objects = Portable.Atomic.get t.objects in
      let%map () =
        Base.Result.all_unit
          (Quiver_core.Concurrent.spread ~workers:(Iarray.length t.loaders)
@@ -1013,4 +1030,4 @@ let finish t ~source:_ ~tables:_ ~manifest:_ =
                         ~f:(fun () statement -> run link statement)))))
      in
      Portable.Atomic.set t.finishing
-       (Finished { built; foreign_keys; objects = Quiver_core.Stopwatch.elapsed creating }))
+       (Finished { built; after_load; foreign_keys; objects = Quiver_core.Stopwatch.elapsed creating }))

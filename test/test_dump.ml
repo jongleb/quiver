@@ -527,7 +527,7 @@ let holds
                        ( Key.Signed first,
                          Key.Signed (List.fold_left Int64.max first rows) )))
 
-        let read_chunk _ chunk writer =
+        let read_chunk _ chunk (_ : Mask.Table.t) writer =
           let () =
             match pace with
             | Each seconds -> Unix.sleepf seconds
@@ -634,6 +634,7 @@ let holds
                   (match taking with
                   | With_objects -> Filter.With_objects
                   | Without_objects -> Without_objects);
+                masking = Mask.none;
                 opts;
               }
               recorder)

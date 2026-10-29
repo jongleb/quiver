@@ -238,6 +238,10 @@ jobs:
           fi
           echo "id=$(gpg --list-secret-keys --with-colons | awk -F: '$1 == "fpr" { print $10; exit }')" >> "$GITHUB_OUTPUT"
       - run: packaging/repository.sh dist site ${{ steps.key.outputs.id }}
+      # The documentation, from the release binary itself, at the root of the same site.
+      - run: |
+          tar -xzf dist/quiver-*-x86_64-unknown-linux-gnu.tar.gz -C "$RUNNER_TEMP"
+          "$RUNNER_TEMP"/quiver-*-x86_64-unknown-linux-gnu/quiver docs site
       - if: steps.key.outputs.publish == 'tag'
         uses: actions/upload-pages-artifact@v3
         with:

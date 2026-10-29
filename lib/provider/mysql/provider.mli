@@ -62,6 +62,9 @@ type error =
       column : Quiver_core.Ident.t;
       text : string;  (** As the server sent it. *)
     }  (** A key value that cannot bound a chunk, such as a zero date. *)
+  | Warned_expression of { table : Quiver_core.Schema.Name.t; warnings : string list }
+      (** The source warned while evaluating a [--mask sql:] expression of the table:
+          a value cast with loss, or out of the column's range. *)
 [@@deriving sexp_of ~portable]
 
 type binlog_file = { base : string; index : int } [@@deriving sexp_of ~portable]

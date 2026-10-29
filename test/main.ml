@@ -17,6 +17,9 @@ let () =
       ("bisect", Test_bisect.tests);
       ("session", Test_session.tests);
       ("dump", Test_dump.tests);
+      ("mask", Test_mask.tests);
+      ("mask script", Test_mask_script.tests);
+      ("docs", Test_docs.tests);
       ("hostile", Test_hostile.tests);
       ("protection", Test_protection.tests);
       ("frame", Test_frame.tests);

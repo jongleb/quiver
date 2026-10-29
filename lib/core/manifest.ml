@@ -141,6 +141,8 @@ type phases = {
   committed : Core.Time_ns.Span.t;
 }
 
+type masked = { table : Schema.Name.t; column : Ident.t; action : string } [@@deriving yojson_of]
+
 type t = {
   version : int;
   level : Consistency.any;
@@ -149,6 +151,7 @@ type t = {
   threads : threads;
   phases : phases;
   schema : Schema.t;
+  masked : masked list;
   chunks : entry list;
 }
 
@@ -161,6 +164,7 @@ let yojson_of_t
       threads;
       phases = { connected; planned; snapshot; first_part; read; committed };
       schema;
+      masked;
       chunks;
     } =
   `Assoc
@@ -181,10 +185,11 @@ let yojson_of_t
             ("committed_ns", Codec.yojson_of_span committed);
           ] );
       ("schema", Schema.yojson_of_t schema);
+      ("masked", `List (List.map yojson_of_masked masked));
       ("chunks", `List (List.map yojson_of_entry chunks));
     ]
 
-let make ~level ~format ~position ~threads ~phases ~schema chunks =
+let make ~level ~format ~position ~threads ~phases ~schema ~masked chunks =
   {
     version = 1;
     level;
@@ -193,6 +198,7 @@ let make ~level ~format ~position ~threads ~phases ~schema chunks =
     threads;
     phases;
     schema;
+    masked;
     chunks =
       List.map
         (fun ((chunk : Chunk.t), state) ->

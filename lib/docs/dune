@@ -1,0 +1,6 @@
+(library
+ (name quiver_docs)
+ (public_name quiver.docs)
+ (libraries quiver.core)
+ (flags
+  (:standard -open Stdlib_stable)))

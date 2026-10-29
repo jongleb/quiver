@@ -13,6 +13,7 @@
   quiver.load
   quiver.net
   quiver.quiverfile
+  quiver.docs
   file_path)
  (link_flags (:standard -ocamlrunparam d=512))
  (preprocess
@@ -24,3 +25,8 @@
   (with-stdout-to
    %{target}
    (echo "let number = \"%{version:quiver}\"\n"))))
+
+(rule
+ (alias runtest)
+ (action
+  (run ./main.exe docs docs-site)))

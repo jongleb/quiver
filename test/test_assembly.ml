@@ -103,7 +103,7 @@ let timed =
       List.iteri
         (fun step number ->
           if step = sealed_after then seal ();
-          let rendered = Part.render part sealed in
+          let rendered = Part.render part Mask.Table.none sealed in
           entered.(step) <- now ();
           Part.deliver part number rendered;
           left.(step) <- now ();

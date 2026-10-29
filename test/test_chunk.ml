@@ -246,7 +246,7 @@ let indexed_cover =
         Chunk.closed (Chunk.whole table) (Key.Signed (Int64.of_int lowest))
           (Key.Signed (Int64.of_int highest))
       in
-      let sql chunk = Quiver_mysql.Query.sql (Chunk chunk) in
+      let sql chunk = Quiver_mysql.Query.sql (Chunk { chunk; sources = [] }) in
       let through chunk =
         let text = sql chunk in
         match chunk with

@@ -94,6 +94,7 @@ module type S = sig
   val read_chunk :
     session ->
     Chunk.t ->
+    Mask.Table.t ->
     ([> `Provider of error | `Column of Column.error | `Batch of Batch.error ]
      as
      'e)

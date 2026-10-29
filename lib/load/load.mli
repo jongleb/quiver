@@ -22,6 +22,9 @@ type error =
       (** [Into] asks for one target, the dump holds these. *)
   | Non_positive_threads of int
   | Unstarted of Quiver_core.Concurrent.error  (** No loading thread could start. *)
+  | Rejected_after_load of { table : Quiver_core.Schema.Name.t; statement : string; cause : cause }
+      (** The server failed an [after-load] statement of the table; [statement] is cut short. *)
+  | After_load of After_load.error
   | Unreadable_columns of Quiver_core.Schema.Name.t
       (** The server's description of a loaded table's columns. *)
 [@@deriving sexp_of ~portable]
@@ -118,6 +121,7 @@ val run :
   dir:File_path.t ->
   target ->
   keys:keys ->
+  after:After_load.rule list ->
   binlog:binlog ->
   threads:int ->
   ( summary,

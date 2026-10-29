@@ -54,7 +54,8 @@ let tests =
           [
             ("- a\n- b\n", "not settings");
             ("copy: [1, 2]\n", "not settings");
-            ("host: {a: 1}\n", "unusable");
+            ("host: {a: [[1]]}\n", "unusable");
+            ("host: {[1]: 2}\n", "unusable");
             ("host: [[1]]\n", "unusable");
             ("database: shop\n", "scoped");
             ("host: a\nhost: b\n", "unreadable");
@@ -62,6 +63,28 @@ let tests =
             ("a: 1\n---\nb: 2\n", "unreadable");
             ("host: [unclosed\n", "unreadable");
           ];
+        Alcotest.(check (list string))
+          "a map gives KEY=VALUE once per leaf, its keys joined by dots"
+          [
+            "mask=[shop.users.name=shape,shop.users.phone=expr:(phone value),*.*.email=email,shop.orders.note=null]";
+            "after-load=[shop.orders=UPDATE {table} SET a = 1,shop.orders=DELETE FROM {table} WHERE b]";
+          ]
+          (shown
+             (Quiver_quiverfile.Quiverfile.settings
+                (parsed
+                   "copy:\n\
+                   \  mask:\n\
+                   \    shop.users:\n\
+                   \      name: shape\n\
+                   \      phone: \"expr:(phone value)\"\n\
+                   \    \"*.*.email\": email\n\
+                   \    shop:\n\
+                   \      orders.note: \"null\"\n\
+                   \  after-load:\n\
+                   \    shop.orders:\n\
+                   \      - \"UPDATE {table} SET a = 1\"\n\
+                   \      - \"DELETE FROM {table} WHERE b\"\n")
+                ~command:"copy"));
         Alcotest.(check (list string))
           "scoped in a section" [ "database=shop" ]
           (shown (Quiver_quiverfile.Quiverfile.settings (parsed "copy:\n  database: shop\n") ~command:"copy")));

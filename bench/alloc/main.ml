@@ -136,7 +136,7 @@ let () =
              (fun { Quiver_core.Schema.Field.ltype; _ } -> ltype)
              (first :: rest))
       in
-      match Quiver_mysql.Provider.read_chunk session chunk writer with
+      match Quiver_mysql.Provider.read_chunk session chunk Quiver_core.Mask.Table.none writer with
       | Ok () ->
           Option.iter (fun part -> Quiver_sink.Sql.close part ignore) part
       | Error _ -> fail Format.pp_print_string "read failed")

@@ -5,14 +5,17 @@
 type error =
   | Unreadable of string  (** Not YAML, more than one document, or an ambiguous scalar: the parser's message. *)
   | Not_settings of string  (** Not a map of options and commands: where. *)
-  | Unusable of string  (** An option whose value is neither a scalar nor a list of scalars. *)
+  | Unusable of string  (** An option whose value is not a scalar, a list of scalars or a map of them. *)
   | Scoped of string  (** An option at the top that means different things to different commands. *)
 [@@deriving sexp_of]
 
 (** An option's value as the command line would spell it. *)
 type value =
   | Text of string
-  | Texts of string list  (** For an option given once per item. *)
+  | Texts of string list
+      (** For an option given once per item: a list's items, or each leaf of a map as its keys
+          joined by dots, [=], then the value — [{shop.users: {name: shape}}] is
+          [shop.users.name=shape], and a list under a key gives the key once per item. *)
 [@@deriving sexp_of]
 
 type t

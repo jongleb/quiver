@@ -12,6 +12,7 @@ module Make (P : Provider_intf.S) (S : Sink_intf.S) : sig
     filter : Filter.t;
     rows : Filter.rows;
     objects : Filter.objects;
+    masking : Mask.t;  (** Checked against the dump's tables before the snapshot. *)
     opts : Dump_opts.t;
   }
   (** What to dump and how. *)

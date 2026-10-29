@@ -46,6 +46,7 @@ type error =
       column : Quiver_core.Ident.t;
       text : string;
     }
+  | Warned_expression of { table : Quiver_core.Schema.Name.t; warnings : string list }
 [@@deriving sexp_of ~portable]
 
 type binlog_file = { base : string; index : int } [@@deriving sexp_of ~portable, yojson]
@@ -1090,10 +1091,10 @@ let key_span { conn; _ } chunk =
           | _ -> unexpected query)
       | _ -> unexpected query)
 
-let read_chunk { conn; _ } (chunk : Quiver_core.Chunk.t) writer =
+let read_chunk { conn; _ } (chunk : Quiver_core.Chunk.t) mask writer =
   let table = Quiver_core.Chunk.table chunk in
   let fields = Array.of_list (Quiver_core.Schema.Table.columns table) in
-  let query = Query.Chunk chunk in
+  let query = Query.Chunk { chunk; sources = Quiver_core.Mask.Table.sources mask } in
   let failed = function
     | (`Link _ | `Wire _ | `Transport _) as failure ->
         `Provider (Client (Client_error.of_failure (Fetch query) failure))
@@ -1114,12 +1115,12 @@ let read_chunk { conn; _ } (chunk : Quiver_core.Chunk.t) writer =
                (fun (j, { Quiver_core.Schema.Field.ltype; _ }) ->
                  match (ltype, Rows.kind rows j) with
                  | ( (Int8 | Int16 | Int32 | Uint8 | Uint16 | Uint32 | Year),
-                     Integer { width = (W1 | W2 | W4) as width; sign } ) ->
+                     Integer { width; sign } ) ->
                      Ok (Small (width, sign))
                  | (Int64 | Uint64), Integer { width = W8; _ } -> Ok Big
                  | Uint64, Bits -> Ok Bits
                  | Float32, Float32 -> Ok Single
-                 | Float64, Float64 -> Ok Double
+                 | (Float32 | Float64), Float64 -> Ok Double
                  | Date, Date -> Ok Day
                  | (Datetime _ | Timestamp _), Datetime -> Ok Instant
                  | Unchecked_date, Date -> Ok Unchecked_day
@@ -1184,6 +1185,25 @@ let read_chunk { conn; _ } (chunk : Quiver_core.Chunk.t) writer =
         Result.map_error failed
           (Rows.next rows ~row:(fun reader ~bitmap ->
                cells reader bitmap columns 0)))
+  in
+  let result =
+    match (result, Quiver_core.Mask.Table.sources mask, Rows.warnings rows) with
+    | Ok (), _ :: _, warned when warned > 0 -> (
+        match Link.run_query (Conn.link conn) Warnings with
+        | Ok said ->
+            let shown = 5 in
+            Error
+              (`Provider
+                 (Warned_expression
+                    {
+                      table = table.name;
+                      warnings =
+                        List.map
+                          (fun row -> String.concat " " (List.filter_map Fun.id (Array.to_list row)))
+                          (Base.List.take said shown);
+                    }))
+        | Error failure -> Error (failed failure))
+    | (Ok () | Error _), _, _ -> result
   in
   match (result, Rows.close rows) with
   | Ok (), Ok () -> Ok ()

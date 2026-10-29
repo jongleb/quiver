@@ -14,6 +14,8 @@ type error =
   | Several_databases of Quiver_core.Ident.t list
   | Non_positive_threads of int
   | Unstarted of Quiver_core.Concurrent.error
+  | Rejected_after_load of { table : Quiver_core.Schema.Name.t; statement : string; cause : cause }
+  | After_load of After_load.error
   | Unreadable_columns of Quiver_core.Schema.Name.t
 [@@deriving sexp_of ~portable]
 
@@ -67,6 +69,8 @@ type task =
   | Fill of Schedule.slot * data_file
   | Run of { database : Quiver_core.Ident.t; files : File_path.Part.t list }
       (** Schema files of the database's objects, one after another. *)
+  | Update of { into : Quiver_core.Schema.Name.t; statements : string * string list }
+      (** A table's [after-load] statements. *)
   | Stop
 
 (** What a loading thread made of a task. *)
@@ -180,7 +184,7 @@ let create_database target database statement =
     (Base.String.chop_prefix statement
        ~prefix:("CREATE DATABASE " ^ Quiver_core.Ident.backquoted database))
 
-let run config ~dir target ~keys ~binlog ~threads =
+let run config ~dir target ~keys ~after ~binlog ~threads =
   let read file consume =
     match
       In_channel.open_bin
@@ -384,7 +388,7 @@ let run config ~dir target ~keys ~binlog ~threads =
         Error error
   in
   let cause = function
-    | `Load (Rejected { cause; _ }) -> Some cause
+    | `Load (Rejected { cause; _ } | Rejected_after_load { cause; _ }) -> Some cause
     | #cause as cause -> Some cause
     | `Load _ | `Statements _ | `Ident _ -> None
   in
@@ -547,6 +551,31 @@ let run config ~dir target ~keys ~binlog ~threads =
           | Fill (slot, file) ->
               report (fun () -> Result.map (fun () -> Filled slot) (fill link file)) (Filled slot);
               serve ()
+          | Update { into; statements = first, rest } ->
+              report
+                (fun () ->
+                  let mark = "after-load " ^ table_base into in
+                  if Base.Set.mem committed mark then Ok Ran
+                  else
+                    let%bind () = Quiver_mysql.Link.run_statement link (Use into.database) in
+                    let%bind () =
+                      Base.List.fold_result (first :: rest) ~init:() ~f:(fun () statement ->
+                          retried ~cause (fun () ->
+                              Result.map_error
+                                (fun (#cause as cause) ->
+                                  `Load
+                                    (Rejected_after_load
+                                       {
+                                         table = into;
+                                         statement = Base.String.prefix statement 200;
+                                         cause;
+                                       }))
+                                (Quiver_mysql.Link.execute link statement)))
+                    in
+                    let%map () = record link mark in
+                    Ran)
+                Ran;
+              serve ()
           | Run { database; files } ->
               report
                 (fun () ->
@@ -625,12 +654,21 @@ let run config ~dir target ~keys ~binlog ~threads =
     match (started, Base.Result.all_unit workers) with
     | 0, Error error -> Error (`Load (Unstarted error))
     | _, (Ok () | Error _) ->
-        let%bind tables =
+        let%bind created =
           phase
             (List.sort (fun (_, a) (_, b) -> Int.compare (size b) (size a)) tables)
             (fun table -> Create table)
         in
-        let%bind () = fill_all tables in
+        let%bind () = fill_all created in
+        let%bind updates =
+          Result.map_error
+            (fun (`After_load error) -> `Load (After_load error))
+            (After_load.statements after (List.map fst tables) ~into:(fun name ->
+                 { name with database = renamed target name.database }))
+        in
+        let%bind _ =
+          phase updates (fun (into, statements) -> Update { into; statements })
+        in
         let%bind _ = phase (List.concat_map fst objects) Fun.id in
         let%map _ = phase (List.concat_map snd objects) Fun.id in
         ()

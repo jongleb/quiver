@@ -14,6 +14,8 @@ type reading = {
   filter : Quiver_core.Filter.t;
   rows : Quiver_core.Filter.rows;
   objects : Quiver_core.Filter.objects;
+  masking : Quiver_core.Mask.t;
+  scripted_after : Quiver_load.After_load.rule list;  (** The [(after-load …)] forms of mask scripts. *)
   opts : Quiver_core.Dump_opts.t;
 }
 (** What a dump reads and how. *)
@@ -66,17 +68,17 @@ let () =
   in
   let read (type (sink : value mod contended portable))
       (module Sink : Quiver_core.Sink_intf.S with type t = sink) (sink : sink)
-      { conn; mode; filter; rows; objects; opts } ~report ~sink:written =
+      { conn; mode; filter; rows; objects; masking; opts; _ } ~report ~sink:written =
     let module Dump = Quiver_core.Dump.Make (Quiver_mysql.Provider) (Sink) in
     let result =
       match mode with
       | Ftwrl | Backup_stage ->
           Dump.run
-            { conn; mode; level = Snapshot; filter; rows; objects; opts }
+            { conn; mode; level = Snapshot; filter; rows; objects; masking; opts }
             sink
       | Trx_only ->
           Dump.run
-            { conn; mode; level = Best_effort; filter; rows; objects; opts }
+            { conn; mode; level = Best_effort; filter; rows; objects; masking; opts }
             sink
     in
     match result with
@@ -118,6 +120,19 @@ let () =
               Core.Time_ns.Span.pp ended Core.Time_ns.Span.pp spent.reading Core.Time_ns.Span.pp
               spent.waiting)
           (Base.List.take (Quiver_core.Spent.of_tables manifest.chunks) 5);
+        List.iter
+          (fun (masked : Quiver_core.Manifest.masked list) ->
+            Option.iter
+              (fun ({ table; _ } : Quiver_core.Manifest.masked) ->
+                Format.printf "masked in %a: %s@." Quiver_core.Schema.Name.pp table
+                  (String.concat ", "
+                     (List.map
+                        (fun ({ column; action; _ } : Quiver_core.Manifest.masked) ->
+                          Printf.sprintf "%s (%s)" (column :> string) action)
+                        masked)))
+              (Base.List.hd masked))
+          (Base.List.group manifest.masked ~break:(fun a b ->
+               not (Quiver_core.Schema.Name.equal a.table b.table)));
         let { Quiver_core.Manifest.connected; planned; snapshot; first_part; read; committed } =
           manifest.phases
         in
@@ -145,6 +160,18 @@ let () =
           (Quiver_core.Codec.decode Quiver_mysql.Provider.position_of_yojson
              manifest.position);
         0
+    | Error (`Mask (Quiver_core.Mask.Scripted { table; column; error })) ->
+        told
+          (Format.asprintf "masking %a.%s: %s" Quiver_core.Schema.Name.pp table (column :> string)
+             (Quiver_core.Mask_script.describe error))
+    | Error (`Mask (Quiver_core.Mask.Unhandled { table; columns })) ->
+        told
+          (Format.asprintf
+             "masking %a: no rule decides on %s; mask them, or keep them with (keep \"%a.COLUMN\") or \
+              --mask %a.COLUMN=keep"
+             Quiver_core.Schema.Name.pp table
+             (String.concat ", " (List.map (fun (column : Quiver_core.Ident.t) -> (column :> string)) columns))
+             Quiver_core.Schema.Name.pp table Quiver_core.Schema.Name.pp table)
     | Error error -> failed (Dump.sexp_of_error error)
   in
   let files output { consume } =
@@ -307,11 +334,12 @@ let () =
     let () =
       match Quiver_load.Copy.finishing sink with
       | Unfinished -> ()
-      | Finished { built; foreign_keys; objects } ->
+      | Finished { built; after_load; foreign_keys; objects } ->
           Format.printf
-            "after the parts: waited %a for imports and keys, foreign keys %a, objects %a@."
-            Core.Time_ns.Span.pp built Core.Time_ns.Span.pp foreign_keys Core.Time_ns.Span.pp
-            objects
+            "after the parts: waited %a for imports and keys, after-load statements %a, foreign \
+             keys %a, objects %a@."
+            Core.Time_ns.Span.pp built Core.Time_ns.Span.pp after_load Core.Time_ns.Span.pp
+            foreign_keys Core.Time_ns.Span.pp objects
     in
     match loaded with
     | [] -> ()
@@ -469,7 +497,7 @@ let () =
     config
   in
   let collect protection reconnect listen forward output to_server into keys
-      binlog ingest =
+      after binlog ingest =
     match
       match output with
       | Some output -> Ok (`Files output)
@@ -514,6 +542,7 @@ let () =
                   | Error (`Collector error) ->
                       failed (Quiver_net.Collector.sexp_of_error error)
                   | Error (`Sink error) -> failed (S.sexp_of_error error)
+                  | Error (`Mask error) -> failed (Quiver_core.Mask.sexp_of_error error)
                 in
                 match destination with
                 | `Files output ->
@@ -526,7 +555,7 @@ let () =
                       }
                 | `Server to_server -> (
                     match
-                      Quiver_load.Copy.create to_server (target into) ~keys ~binlog ~ingest
+                      Quiver_load.Copy.create to_server (target into) ~keys ~after ~binlog ~ingest
                         ~sessions:(Quiver_net.Collector.chunks session)
                     with
                     | Error (`Sink error) -> failed (Quiver_load.Copy.sexp_of_error error)
@@ -540,7 +569,7 @@ let () =
                         advise (Quiver_load.Copy.advice sink);
                         code)))
   in
-  let copy reading to_server into keys binlog ingest target_threads =
+  let copy reading to_server into keys after binlog ingest target_threads =
     let generated : Quiver_mysql.Provider.generated =
       match ingest with Quiver_load.Copy.Load_data -> Left_out | Tablespaces _ -> Read
     in
@@ -548,7 +577,7 @@ let () =
         (
             let started = Quiver_core.Stopwatch.start () in
             match
-              Quiver_load.Copy.create to_server (target into) ~keys ~binlog ~ingest
+              Quiver_load.Copy.create to_server (target into) ~keys ~after:(after @ reading.scripted_after) ~binlog ~ingest
                 ~sessions:
                   (Option.value target_threads ~default:(Quiver_core.Dump_opts.most_readers reading.opts))
             with
@@ -570,12 +599,12 @@ let () =
                 advise (Quiver_load.Copy.advice sink);
                 code))
   in
-  let load conn dir into keys binlog threads =
+  let load conn dir into keys after binlog threads =
     (
         let started = Quiver_core.Stopwatch.start () in
         match
           Quiver_load.Load.run
-            conn ~dir:(File_path.of_string dir) (target into) ~keys ~binlog ~threads
+            conn ~dir:(File_path.of_string dir) (target into) ~keys ~after ~binlog ~threads
         with
         | Ok { files; rows; bytes; skipped; advice } ->
             Format.printf "loaded %d rows (%d bytes) from %d files in %a@." rows
@@ -706,12 +735,17 @@ let () =
                started with $(b,skip_networking); there is no TLS on it, and \
                it takes no $(b,--host), $(b,--port) or $(b,--tls) options.")
     and user =
-      Arg.(value & opt string "root" & described (names [ "u" ] "user") ~docv:"USER")
+      Arg.(
+        value & opt string "root"
+        & described (names [ "u" ] "user") ~docv:"USER" ~doc:"The account to log in as.")
     and password =
       Arg.(
         value
         & opt (some string) None
         & described (names [ "p" ] "password") ~docv:"PASSWORD"
+            ~doc:
+              "The account's password; none when not given. Prefer the environment variable: \
+               a command line is visible to every user of the machine."
             ~env:
               (match side with
               | `Source -> "MYSQL_PWD"
@@ -835,6 +869,45 @@ let () =
   let server side =
     Cmdliner.Term.(term_result (const (Result.map warned) $ conn side))
   in
+  let mask_key secret =
+    match secret with
+    | Some secret -> Ok (Quiver_core.Keyed.of_secret secret)
+    | None -> (
+        match In_channel.with_open_bin "/dev/urandom" (fun random -> really_input_string random 32) with
+        | exception (Sys_error message | Failure message) ->
+            Error (`Msg ("no random key for masking: " ^ message ^ "; give --mask-secret"))
+        | exception End_of_file -> Error (`Msg "no random key for masking; give --mask-secret")
+        | random ->
+            Format.eprintf
+              "quiver: masking with a key of this run only; --mask-secret masks the same values the \
+               same way every run@.";
+            Ok (Quiver_core.Keyed.of_secret random))
+  in
+  let load_scripts files =
+    Base.List.fold_result files ~init:Quiver_core.Mask_script.empty ~f:(fun script file ->
+        match In_channel.with_open_bin file In_channel.input_all with
+        | exception Sys_error message -> Error (`Msg message)
+        | text ->
+            let load path =
+              let path = if Filename.is_relative path then Filename.concat (Filename.dirname file) path else path in
+              match In_channel.with_open_bin path In_channel.input_all with
+              | exception Sys_error message -> Error message
+              | words -> Ok words
+            in
+            Result.map_error
+              (fun (`Mask_script error) -> `Msg (Quiver_core.Mask_script.describe error))
+              (Quiver_core.Mask_script.parse ~source:file ~within:script ~load text))
+  in
+  let mask_secret =
+    Cmdliner.Arg.(
+      value
+      & opt (some string) None
+      & described [ "mask-secret" ] ~docv:"SECRET"
+          ~doc:
+            "Key $(b,shape), $(b,email), $(b,hash) and the keyed functions of $(b,expr:) with \
+             $(docv), so a value masks the same way in every column and every run; a random key of \
+             this run when not given.")
+  in
   let reading =
     let open Cmdliner in
     let mode =
@@ -932,6 +1005,96 @@ let () =
               "$(b,all) takes the dumped databases' views, triggers, routines \
                and events; $(b,none) takes none of them.")
     in
+    let masking =
+      let mask_rule =
+        Arg.conv
+          ( (fun text ->
+              Result.map_error
+                (function
+                  | `Mask_script error -> `Msg (Quiver_core.Mask_script.describe error)
+                  | (`Mask _ | `Pattern _) as error ->
+                      `Msg
+                        (Sexplib0.Sexp.to_string_hum
+                           ([%sexp_of:
+                              [ `Mask of Quiver_core.Mask.error
+                              | `Pattern of Quiver_core.Pattern.error ]]
+                              error)))
+                (Quiver_core.Mask.rule text)),
+            fun ppf rule -> Sexplib0.Sexp.pp_hum ppf (Quiver_core.Mask.sexp_of_rule rule) )
+      in
+      Term.(
+        term_result
+          (const (fun rules files strict secret ->
+               match (rules, files, strict) with
+               | [], [], [] -> Ok (Quiver_core.Mask.none, [])
+               | _ -> (
+                   match
+                     let%bind script = load_scripts files in
+                     let%bind scripted =
+                       Result.map_error
+                         (fun (`Pattern error) ->
+                           `Msg (Sexplib0.Sexp.to_string_hum (Quiver_core.Pattern.sexp_of_error error)))
+                         (Quiver_core.Mask.scripted script)
+                     in
+                     let%bind strict =
+                       Base.Result.all
+                         (List.map
+                            (fun (written, table) ->
+                              Result.map_error
+                                (fun (`Pattern error) ->
+                                  `Msg (written ^ ": " ^ Sexplib0.Sexp.to_string_hum (Quiver_core.Pattern.sexp_of_error error)))
+                                (Result.map (fun pattern -> (written, pattern)) (Quiver_core.Pattern.table table)))
+                            (List.map (fun table -> ("--mask-strict " ^ table, table)) strict
+                            @ List.map
+                                (fun ({ Quiver_core.Mask_script.source; line; _ }, table) ->
+                                  (Printf.sprintf "%s:%d (strict %s)" source line table, table))
+                                (Quiver_core.Mask_script.strict script)))
+                     in
+                     let%bind after =
+                       Base.Result.all
+                         (List.map
+                            (fun ({ Quiver_core.Mask_script.source; line; _ }, table, statement) ->
+                              Result.map_error
+                                (fun _ -> `Msg (Printf.sprintf "%s:%d: after-load names no DB.TABLE" source line))
+                                (Quiver_load.After_load.rule (table ^ "=" ^ statement)))
+                            (Quiver_core.Mask_script.after_load script))
+                     in
+                     let%map key = mask_key secret in
+                     (Quiver_core.Mask.make key ~script ~strict (rules @ scripted), after)
+                   with
+                   | Ok masking -> Ok masking
+                   | Error (`Msg message) -> Error (`Msg message)))
+          $ Arg.(
+              value & opt_all mask_rule []
+              & described [ "mask" ] ~docv:"DB.TABLE.COLUMN=ACTION"
+                  ~doc:
+                    "Mask the column's values before they leave the reader, repeatable; a column \
+                     takes the first rule naming it, and a rule naming no column of the dump is \
+                     an error. Names take $(b,*) and $(b,?), or backquotes for a name as written. \
+                     $(docv) is $(b,null); $(b,text:)VALUE; $(b,shape) (each letter and digit \
+                     replaced by a keyed one of its kind, the rest kept); $(b,email) (shape \
+                     before the last @, the domain kept); $(b,hash) (a keyed digest of the same \
+                     length, or an integer of the column's type); $(b,sql:)EXPRESSION, \
+                     evaluated by the source for each row and cast to the column's type; or \
+                     $(b,expr:)EXPRESSION of the masking language (see $(b,quiver mask --help)). \
+                     NULL stays NULL but under $(b,null), $(b,sql:) and $(b,expr:). Key columns \
+                     cannot be masked.")
+          $ Arg.(
+              value & opt_all file []
+              & described [ "mask-script" ] ~docv:"FILE"
+                  ~doc:
+                    "Read definitions and $(b,(mask \"DB.TABLE.COLUMN\" EXPRESSION)) rules of the \
+                     masking language from $(docv), repeatable: a later file calls an earlier \
+                     one's definitions, and its rules come after those of $(b,--mask). Its \
+                     $(b,(after-load …)) forms run with $(b,copy). See $(b,quiver mask --help).")
+          $ Arg.(
+              value & opt_all string []
+              & described [ "mask-strict" ] ~docv:"DB.TABLE"
+                  ~doc:
+                    "Every column of $(docv) must be masked or kept ($(b,=keep)) by a rule, \
+                     repeatable; a column nobody decided on stops the run before anything is read.")
+          $ mask_secret))
+    in
     let threads =
       Arg.(
         value
@@ -960,7 +1123,12 @@ let () =
         & described [ "chunk-bytes" ] ~docv:"BYTES" ~doc:"Target size of one chunk.")
     in
     let batch_bytes =
-      Arg.(value & opt int (256 * 1024) & described [ "batch-bytes" ] ~docv:"BYTES")
+      Arg.(
+        value & opt int (256 * 1024)
+        & described [ "batch-bytes" ] ~docv:"BYTES"
+            ~doc:
+              "A reader hands a batch of rows on once it holds this many bytes; larger batches \
+               are not faster, smaller ones cost more per row.")
     in
     let order =
       Arg.(
@@ -998,7 +1166,7 @@ let () =
       term_result
         (const
            (fun
-             conn mode filter rows objects threads render_threads chunk_bytes
+             conn mode filter rows objects masking threads render_threads chunk_bytes
              batch_bytes order declaring ->
              Result.map_error
                (fun error ->
@@ -1019,8 +1187,9 @@ let () =
                          (Quiver_mysql.Local.machine conn.Quiver_mysql.Provider.route))
                     ~batch_bytes ~order ~declaring
                 in
-                { conn; mode; filter; rows; objects; opts }))
-        $ server `Source $ mode $ filter $ rows $ objects $ threads $ render_threads
+                let masking, scripted_after = masking in
+                { conn; mode; filter; rows; objects; masking; scripted_after; opts }))
+        $ server `Source $ mode $ filter $ rows $ objects $ masking $ threads $ render_threads
         $ chunk_bytes
         $ batch_bytes $ order $ declaring))
   in
@@ -1030,7 +1199,8 @@ let () =
       Arg.(
         value
         & opt (enum [ ("sql", `Sql); ("csv", `Csv) ]) `Sql
-        & described [ "format" ] ~docv:"FORMAT")
+        & described [ "format" ] ~docv:"FORMAT"
+            ~doc:"$(b,sql): INSERT statements myloader and mysql read; $(b,csv): one CSV file per chunk.")
     and dialect =
       Arg.(
         value
@@ -1038,13 +1208,21 @@ let () =
             (choices Quiver_core.Output_format.string_of_dialect
                Quiver_core.Output_format.all_of_dialect)
             Quiver_core.Output_format.Rfc4180
-        & described [ "csv-dialect" ] ~docv:"DIALECT")
+        & described [ "csv-dialect" ] ~docv:"DIALECT"
+            ~doc:
+              "$(b,rfc4180): RFC 4180 with a header line and CRLF; $(b,mysql-load-data): what \
+               LOAD DATA reads with backslash escapes and no header.")
     and compress =
       Arg.(
         value
         & opt (enum [ ("none", `None); ("zstd", `Zstd) ]) `None
-        & described [ "compress" ] ~docv:"CODEC")
-    and level = Arg.(value & opt int 3 & described [ "zstd-level" ] ~docv:"LEVEL")
+        & described [ "compress" ] ~docv:"CODEC"
+            ~doc:"$(b,zstd) compresses every data file, which zstd -d reads back; $(b,none) does not.")
+    and level =
+      Arg.(
+        value & opt int 3
+        & described [ "zstd-level" ] ~docv:"LEVEL"
+            ~doc:"The zstd level of $(b,--compress zstd), from 1 (fastest) to 19.")
     and statement_bytes =
       Arg.(
         value & opt int 1_000_000
@@ -1093,6 +1271,31 @@ let () =
              them with their primary key only and adds secondary and foreign \
              keys once a table's data is in, so InnoDB builds each index by \
              sorting, which pays off when indexes outgrow memory.")
+  in
+  let after_load =
+    let open Cmdliner in
+    let after_rule =
+      Arg.conv
+        ( (fun text ->
+            Result.map_error
+              (fun error ->
+                `Msg
+                  (Sexplib0.Sexp.to_string_hum
+                     ([%sexp_of:
+                        [ `After_load of Quiver_load.After_load.error
+                        | `Pattern of Quiver_core.Pattern.error ]]
+                        error)))
+              (Quiver_load.After_load.rule text)),
+          fun ppf rule -> Sexplib0.Sexp.pp_hum ppf (Quiver_load.After_load.sexp_of_rule rule) )
+    in
+    Arg.(
+      value & opt_all after_rule []
+      & described [ "after-load" ] ~docv:"DB.TABLE=STATEMENT"
+          ~doc:
+            "Run $(docv) on the target once every table's rows and keys are in, before foreign \
+             keys, views and triggers, repeatable: in the target's database of the table, \
+             $(b,{table}) standing for its name there; a table's statements in the given order, \
+             tables at once. Names take $(b,*) and $(b,?); a rule naming no table is an error.")
   in
   let ingest =
     let open Cmdliner in
@@ -1175,7 +1378,7 @@ let () =
     in
     Cmd.v
       (Cmd.info "load" ~doc:"Load a quiver dump into MySQL or MariaDB")
-      Term.(const load $ server `Source $ dir $ into $ keys $ binlog $ threads)
+      Term.(const load $ server `Source $ dir $ into $ keys $ after_load $ binlog $ threads)
   in
   let copy_cmd =
     let open Cmdliner in
@@ -1192,7 +1395,7 @@ let () =
            "Copy MySQL or MariaDB into another server, with no files: each \
             reading session's chunks stream into a loading session of its own")
       Term.(
-        const copy $ reading $ server `Target $ into $ keys $ binlog $ ingest
+        const copy $ reading $ server `Target $ into $ keys $ after_load $ binlog $ ingest
         $ Arg.(
             value
             & opt (some int) None
@@ -1418,10 +1621,10 @@ let () =
             $(b,--to-) options)")
       Term.(
         const
-          (fun protection reconnect listen forward dir output target into keys
+          (fun protection reconnect listen forward dir output target into keys after
                binlog ingest ->
             collect protection reconnect listen forward (Option.map output dir)
-              target into keys binlog ingest)
+              target into keys after binlog ingest)
         $ wire $ reconnect $ listen
         $ Arg.(
             value
@@ -1433,9 +1636,231 @@ let () =
                    counts once every target committed it.")
         $ Arg.value
             (outputdir ~doc:"Write files here instead of loading into a server.")
-        $ output $ conn `Target $ into $ keys $ binlog $ ingest)
+        $ output $ conn `Target $ into $ keys $ after_load $ binlog $ ingest)
   in
-  let commands = [ dump_cmd; load_cmd; copy_cmd; agent_cmd; collect_cmd; relay_cmd ] in
+  let mask_cmd =
+    let open Cmdliner in
+    let kind =
+      Arg.(
+        value
+        & opt
+            (enum
+               [
+                 ("text", (Text : Quiver_core.Mask_script.kind));
+                 ("int", Int);
+                 ("date", Date);
+                 ("datetime", Datetime);
+               ])
+            (Text : Quiver_core.Mask_script.kind)
+        & described [ "kind" ] ~docv:"KIND"
+            ~doc:
+              "The column's kind: $(b,text) (text, binary, JSON, ENUM, SET, DECIMAL), $(b,int), \
+               $(b,date) (DATE) or $(b,datetime) (DATETIME, TIMESTAMP).")
+    and row =
+      let parse text =
+        let kinds : (string * Quiver_core.Mask_script.kind) list =
+          [ ("text", Text); ("int", Int); ("date", Date); ("datetime", Datetime) ]
+        in
+        match Base.String.lsplit2 text ~on:'=' with
+        | None -> Error (`Msg "expected NAME=VALUE or NAME:KIND=VALUE")
+        | Some (named, value) -> (
+            let name, kind =
+              match Base.String.rsplit2 named ~on:':' with
+              | Some (name, kind) -> (name, List.assoc_opt kind kinds)
+              | None -> (named, Some Text)
+            in
+            match kind with
+            | None -> Error (`Msg ("the kind of " ^ name ^ " is text, int, date or datetime"))
+            | Some kind -> (
+                match Quiver_core.Mask_script.read_value kind value with
+                | Null -> Error (`Msg (value ^ " is not of that kind"))
+                | read -> Ok (name, (kind, read))))
+      in
+      Arg.(
+        value
+        & opt_all (conv (parse, fun ppf (name, _) -> Format.pp_print_string ppf name)) []
+        & described [ "row" ] ~docv:"NAME=VALUE"
+            ~doc:
+              "Another column of the row, as $(b,(row NAME)) reads it, repeatable; $(b,NAME:int=), \
+               $(b,NAME:date=) or $(b,NAME:datetime=) for another kind than text.")
+    and scripts =
+      Arg.(
+        value & opt_all file []
+        & described [ "mask-script" ] ~docv:"FILE"
+            ~doc:"Definitions the expression may call, repeatable.")
+    and expression =
+      Arg.(required & pos 0 (some string) None & info [] ~docv:"EXPRESSION" ~doc:"What a column takes.")
+    and values =
+      Arg.(
+        value & pos_right 0 string []
+        & info [] ~docv:"VALUE"
+            ~doc:"The column's values, each line of standard input when none is given; $(b,\\\\N) is NULL.")
+    in
+    let run (kind : Quiver_core.Mask_script.kind) rows scripts expression values secret =
+      match
+        let%bind script = load_scripts scripts in
+        let%bind parsed =
+          Result.map_error
+            (fun (`Mask_script error) -> `Msg (Quiver_core.Mask_script.describe error))
+            (Quiver_core.Mask_script.expression ~source:"EXPRESSION" expression)
+        in
+        let found name =
+          List.find_opt (fun (given, _) -> String.equal (String.lowercase_ascii given) (String.lowercase_ascii name)) rows
+        in
+        let%bind compiled =
+          Result.map_error
+            (fun (`Mask_script error) -> `Msg (Quiver_core.Mask_script.describe error))
+            (Quiver_core.Mask_script.compile script parsed ~value:kind
+               ~result:kind
+               ~columns:(fun name ->
+                 Option.map (fun (_, (kind, _)) -> kind) (found name)))
+        in
+        let%map key = mask_key secret in
+        (compiled, key)
+      with
+      | Error (`Msg message) -> told message
+      | Ok (compiled, key) ->
+          let row =
+            Array.of_list
+              (List.map
+                 (fun name ->
+                   Option.fold
+                     (List.find_opt
+                        (fun (given, _) -> String.equal (String.lowercase_ascii given) (String.lowercase_ascii name))
+                        rows)
+                     ~none:Quiver_core.Mask_script.Null ~some:(fun (_, (_, value)) -> value))
+                 (Quiver_core.Mask_script.reads compiled))
+          in
+          let masked text =
+            let value : Quiver_core.Mask_script.value =
+              if String.equal text "\\N" then Null else Quiver_core.Mask_script.read_value kind text
+            in
+            print_endline (Quiver_core.Mask_script.shown (Quiver_core.Mask_script.run compiled key ~value ~row))
+          in
+          let () =
+            match values with
+            | [] -> In_channel.fold_lines (fun () line -> masked line) () stdin
+            | _ :: _ -> List.iter masked values
+          in
+          0
+    in
+    let man =
+           [
+             `S "THE MASKING LANGUAGE";
+             `P
+               "$(b,--mask 'DB.TABLE.COLUMN=expr:EXPRESSION') and $(b,(mask \"DB.TABLE.COLUMN\" \
+                EXPRESSION)) in a $(b,--mask-script) file give each row of the column the \
+                expression's value. It is typed against the table before anything is read and \
+                always ends: there are no loops, and a definition calls only those above it.";
+             `P
+               "Values are text, integers (64 bits), truth values, dates, dates with times, and \
+                NULL. A function given NULL gives NULL, as in SQL, except $(b,is-null), \
+                $(b,coalesce), $(b,and), $(b,or) and $(b,if), which take NULL as false. A column of \
+                text, binary, JSON, ENUM, SET or DECIMAL is text; one of integers an integer; DATE a \
+                date; DATETIME and TIMESTAMP a date with a time; other types cannot take an \
+                expression (use $(b,sql:)).";
+             `I ("$(b,value)", "The column's value in this row.");
+             `I ("$(b,(row NAME))", "Another column of the row, as read, before any masking.");
+             `I ("$(b,\"text\"), $(b,42), $(b,true), $(b,false), $(b,null)", "Constants.");
+             `I ("$(b,if), $(b,cond), $(b,let)", "(if C A B); (cond (C A) … (else B)); (let ((NAME E) …) BODY).");
+           ]
+           @ List.concat_map
+               (fun ({ title; doc; entries } : Quiver_core.Mask_script.section) ->
+                 (`S (String.uppercase_ascii title) :: `P doc
+                 :: List.map
+                      (fun (entry : Quiver_core.Mask_script.entry) ->
+                        `I (Quiver_docs.Docs.signature entry, entry.doc))
+                      entries))
+               Quiver_core.Mask_script.reference
+           @ [
+             `S "SCRIPT FORMS";
+             `I ("(define (NAME PARAMETER …) BODY)", "A function, calling only those above it.");
+             `I
+               ( "(mask SELECTOR BODY)",
+                 "SELECTOR is \"DB.TABLE.COLUMN\" with * and ?, or (where (table \"DB.TABLE\") \
+                  (column \"NAME\") (type TYPE …)) with any clause left out, TYPE one of text, binary, \
+                  json, integer, decimal, float, date, datetime, timestamp, time, year, enum, set, \
+                  geometry. A column takes the first rule naming it." );
+             `I ("(keep SELECTOR)", "Its columns are copied as they are, and count as decided.");
+             `I
+               ( "(strict \"DB.TABLE\" …)",
+                 "Every column of these tables must be masked or kept by some rule, or nothing is read." );
+             `I ("(words NAME \"FILE\")", "Lines of FILE, beside the script, for $(b,pick-word); # starts a comment.");
+             `I ("(after-load \"DB.TABLE\" \"STATEMENT\")", "With $(b,copy), as $(b,--after-load).");
+             `S Manpage.s_examples;
+             `Pre
+               "(define (phone p) (concat \"+7 (9\" (digits p 2) \") \" (digits (concat p \"/\") 3) \"-\" (right p 4)))\n\
+                (words names \"names.txt\")\n\
+                (strict \"shop.users\")\n\
+                (keep \"shop.users.id\")\n\
+                (mask \"shop.users.phone\" (phone value))\n\
+                (mask \"shop.users.name\" (concat (pick-word value names) \" \" (shape (after value \" \"))))\n\
+                (mask \"shop.users.born\" (keyed-date (str (row id)) (make-date (year value) 1 1) (make-date (year value) 12 31)))\n\
+                (mask (where (table \"shop.*\") (column \"*email*\") (type text)) (email value))\n\
+                (mask (where (table \"shop.users\") (type binary)) (hash-bytes value))";
+           ]
+    in
+    Cmd.v
+      (Cmd.info "mask" ~doc:"Try an expression of the masking language on values, with no server" ~man)
+      Term.(const run $ kind $ row $ scripts $ expression $ values $ mask_secret)
+  in
+  let documented = [ dump_cmd; load_cmd; copy_cmd; agent_cmd; collect_cmd; relay_cmd; mask_cmd ] in
+  let docs_cmd =
+    let open Cmdliner in
+    let run dir =
+      let help name =
+        let buffer = Buffer.create 8192 in
+        let formatter = Format.formatter_of_buffer buffer in
+        let (_ : (int Cmd.eval_ok, Cmd.eval_error) result) =
+          Cmd.eval_value ~help:formatter ~err:formatter ~env:(fun _ -> None)
+            ~argv:[| "quiver"; name; "--help=plain" |]
+            (Cmd.group (Cmd.info "quiver" ~version:Version.number) documented)
+        in
+        Format.pp_print_flush formatter ();
+        Buffer.contents buffer
+      in
+      let commands =
+        List.map
+          (fun command ->
+            let name = Cmd.name command in
+            Quiver_docs.Docs.command ~name ~help:(help name))
+          documented
+      in
+      match
+        let%bind () =
+          match List.concat_map (fun command -> List.map (fun line -> command.Quiver_docs.Docs.name ^ ": " ^ line) (Quiver_docs.Docs.undocumented command)) commands with
+          | [] -> Ok ()
+          | lines -> Error ("options with no description:\n  " ^ String.concat "\n  " lines)
+        in
+        Base.List.fold_result
+          (Quiver_docs.Docs.site ~version:Version.number ~commands)
+          ~init:() ~f:(fun () (path, content) ->
+            let file = Filename.concat dir path in
+            match
+              let () = if not (Sys.file_exists dir) then Sys.mkdir dir 0o755 in
+              Out_channel.with_open_bin file (fun channel -> Out_channel.output_string channel content)
+            with
+            | () -> Ok ()
+            | exception Sys_error message -> Error message)
+      with
+      | Ok () ->
+          Format.printf "documentation of quiver %s in %s@." Version.number dir;
+          0
+      | Error message -> told message
+    in
+    Cmd.v
+      (Cmd.info "docs"
+         ~doc:
+           "Write quiver's documentation as a website into a directory: every command's options and the \
+            masking language, from this binary itself")
+      Term.(
+        const run
+        $ Arg.(
+            required
+            & pos 0 (some string) None
+            & info [] ~docv:"DIR" ~doc:"Where the pages go; made when missing."))
+  in
+  let commands = documented @ [ docs_cmd ] in
   let given = Array.to_list Sys.argv in
   let chosen, argv =
     let rec go acc = function

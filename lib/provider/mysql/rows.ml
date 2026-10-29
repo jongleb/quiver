@@ -15,7 +15,7 @@ type kind =
 [@@deriving sexp_of ~portable]
 
 (** Whether the server still has rows of the result to send. *)
-type state = Streaming | Finished
+type state = Streaming | Finished of { warnings : int }
 
 type t = {
   link : Link.t;
@@ -134,6 +134,7 @@ let open_ link sql =
     }
 
 let width t = Array.length t.kinds
+let warnings t = match t.state with Streaming -> 0 | Finished { warnings } -> warnings
 let kind t j = t.kinds.(j)
 
 let next t ~row =
@@ -147,16 +148,21 @@ let next t ~row =
     else if
       first = Wire.eof_byte && Wire.Cursor.remaining reader < Wire.frame_limit
     then (
-      t.state <- Finished;
+      Wire.Cursor.skip reader 1;
+      let (_ : int) = Wire.Cursor.lenenc_int reader in
+      let (_ : int) = Wire.Cursor.lenenc_int reader in
+      let status_bytes = 2 in
+      Wire.Cursor.skip reader status_bytes;
+      t.state <- Finished { warnings = Wire.Cursor.uint16 reader };
       Ok Quiver_core.Batch_writer.End)
     else if first = Wire.err_byte then (
       Wire.Cursor.skip reader 1;
-      t.state <- Finished;
+      t.state <- Finished { warnings = 0 };
       Error (Link.refused reader))
     else Error (`Link (Link.Unexpected_packet first))
   in
   match t.state with
-  | Finished -> Ok Quiver_core.Batch_writer.End
+  | Finished _ -> Ok Quiver_core.Batch_writer.End
   | Streaming -> Link.receive_on t.link step [@nontail]
 
 let close t =

@@ -1,5 +1,6 @@
 #define CAML_NAME_SPACE
 #include <pthread.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -447,6 +448,45 @@ value quiver_sha(value algorithm, value text)
     caml_raise_out_of_memory();
   result = caml_alloc_string(length);
   memcpy(Bytes_val(result), digest, length);
+  CAMLreturn(result);
+}
+
+/* HMAC-SHA256 under [key] (at most one 64-byte block) of the 8-byte
+   big-endian [prefix] followed by [text]. Each thread keeps its own digest
+   context, so no lock is needed; [key] and [text] are read before the one
+   OCaml allocation. */
+value quiver_hmac_sha256(value key, value prefix, value text)
+{
+  CAMLparam3(key, prefix, text);
+  CAMLlocal1(result);
+  static _Thread_local EVP_MD *md = NULL;
+  static _Thread_local EVP_MD_CTX *ctx = NULL;
+  unsigned char pad[64], inner[32], outer[32], head[8];
+  unsigned int length = 0;
+  size_t key_length = caml_string_length(key);
+  uint64_t number = (uint64_t)Int64_val(prefix);
+  int i, ok;
+  if (md == NULL) md = EVP_MD_fetch(NULL, "SHA256", NULL);
+  if (ctx == NULL) ctx = EVP_MD_CTX_new();
+  if (md == NULL || ctx == NULL || key_length > sizeof pad)
+    caml_raise_out_of_memory();
+  for (i = 0; i < 8; i++) head[i] = (unsigned char)(number >> (56 - 8 * i));
+  memset(pad, 0x36, sizeof pad);
+  for (i = 0; i < (int)key_length; i++) pad[i] ^= (unsigned char)Byte_u(key, i);
+  ok = EVP_DigestInit_ex(ctx, md, NULL)
+       && EVP_DigestUpdate(ctx, pad, sizeof pad)
+       && EVP_DigestUpdate(ctx, head, sizeof head)
+       && EVP_DigestUpdate(ctx, String_val(text), caml_string_length(text))
+       && EVP_DigestFinal_ex(ctx, inner, &length);
+  memset(pad, 0x5c, sizeof pad);
+  for (i = 0; i < (int)key_length; i++) pad[i] ^= (unsigned char)Byte_u(key, i);
+  ok = ok && EVP_DigestInit_ex(ctx, md, NULL)
+       && EVP_DigestUpdate(ctx, pad, sizeof pad)
+       && EVP_DigestUpdate(ctx, inner, sizeof inner)
+       && EVP_DigestFinal_ex(ctx, outer, &length);
+  if (!ok) caml_raise_out_of_memory();
+  result = caml_alloc_string(sizeof outer);
+  memcpy(Bytes_val(result), outer, sizeof outer);
   CAMLreturn(result);
 }
 

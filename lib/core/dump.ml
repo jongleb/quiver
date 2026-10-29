@@ -16,6 +16,7 @@ module Make (P : Provider_intf.S) (S : Sink_intf.S) = struct
     | Render of {
         batch : Batch.sealed;
         part : Part.t @@ aliased many;
+        mask : Mask.Table.t @@ aliased many;
         ticket : int;
         pool : Batch_pool.t @@ aliased many;
       }
@@ -30,6 +31,7 @@ module Make (P : Provider_intf.S) (S : Sink_intf.S) = struct
     filter : Filter.t;
     rows : Filter.rows;
     objects : Filter.objects;
+    masking : Mask.t;
     opts : Dump_opts.t;
   }
 
@@ -62,7 +64,7 @@ module Make (P : Provider_intf.S) (S : Sink_intf.S) = struct
   }
   (** Every object of the dump, known once each database's catalog is. *)
 
-  let run { conn; mode; level; filter; rows; objects; opts } sink :
+  let run { conn; mode; level; filter; rows; objects; masking; opts } sink :
       (Manifest.t, error) result =
     let began = Stopwatch.start () in
     let%bind supports = P.supports mode level in
@@ -73,9 +75,10 @@ module Make (P : Provider_intf.S) (S : Sink_intf.S) = struct
     in
     let%bind connections = P.connect conn sessions in
     let connected = Stopwatch.elapsed began in
-    let%bind schema, chunks =
+    let%bind schema, masks, chunks =
       match
         let%bind schema = P.introspect connections filter in
+        let%bind masks = Mask.resolve masking schema.tables in
         let%bind { with_rows; _ } = Filter.split rows schema.tables in
         let%bind read = Schema.make with_rows in
         let%map chunks =
@@ -88,7 +91,7 @@ module Make (P : Provider_intf.S) (S : Sink_intf.S) = struct
                     ~f:(fun { Schema.Table.estimate = { bytes; _ }; _ } -> bytes))
                ~readers:(P.opened connections))
         in
-        (schema, chunks)
+        (schema, Iarray.of_list masks, chunks)
       with
       | Ok planned -> Ok planned
       | Error error ->
@@ -291,8 +294,8 @@ module Make (P : Provider_intf.S) (S : Sink_intf.S) = struct
           | This job -> (
               match Handoff.own job with
               | Stop -> ()
-              | Render { batch; part; ticket; pool } ->
-                  let rendered = Part.render part (borrow_ batch) in
+              | Render { batch; part; mask; ticket; pool } ->
+                  let rendered = Part.render part mask (borrow_ batch) in
                   Batch_pool.give pool (Batch.unseal batch);
                   Part.deliver part ticket rendered;
                   take ())
@@ -410,6 +413,7 @@ module Make (P : Provider_intf.S) (S : Sink_intf.S) = struct
           with
           | Error error -> fail (`Sink error)
           | Ok part -> (
+              let mask = Iarray.get masks (Portable.Atomic_array.get chunk_tables position) in
               let started = Stopwatch.start ()
               and since = Stopwatch.elapsed began
               and waited = Batch_pool.waited pool
@@ -434,7 +438,7 @@ module Make (P : Provider_intf.S) (S : Sink_intf.S) = struct
                             let ticket = !tickets in
                             incr tickets;
                             Portable_mpmc_queue.push jobs
-                              (Render { batch; part; ticket; pool });
+                              (Render { batch; part; mask; ticket; pool });
                             Await.Await.Semaphore.release ready;
                             Ok ()
                         end)
@@ -446,10 +450,10 @@ module Make (P : Provider_intf.S) (S : Sink_intf.S) = struct
                         Option.bind (Chunk.bounds remaining) (fun (lo, _) ->
                             Chunk.divide remaining (Int64.add lo width))
                       with
-                      | None -> P.read_chunk session remaining writer
+                      | None -> P.read_chunk session remaining mask writer
                       | Some (front, rest) ->
                           let step = Stopwatch.start () in
-                          let%bind () = P.read_chunk session front writer in
+                          let%bind () = P.read_chunk session front mask writer in
                           let took =
                             Float.max 1e-6
                               (Core.Time_ns.Span.to_sec (Stopwatch.elapsed step))
@@ -477,7 +481,7 @@ module Make (P : Provider_intf.S) (S : Sink_intf.S) = struct
                     in
                     let%map () =
                       match Chunk.bounds bounded with
-                      | None -> P.read_chunk session bounded writer
+                      | None -> P.read_chunk session bounded mask writer
                       | Some (lo, hi) ->
                           let given = Portable.Atomic_array.get widths position in
                           stepped bounded
@@ -511,7 +515,7 @@ module Make (P : Provider_intf.S) (S : Sink_intf.S) = struct
                           (Manifest.Done { part; reading; writing });
                         committed ()
                     | Failed error ->
-                        fail (`Sink error);
+                        fail (error :> error);
                         committed ()))
         in
         let read position =
@@ -823,7 +827,16 @@ module Make (P : Provider_intf.S) (S : Sink_intf.S) = struct
                   read;
                   committed;
                 }
-              ~schema entries
+              ~schema
+              ~masked:
+                (List.concat
+                   (List.map2
+                      (fun ({ Schema.Table.name; _ } : Schema.Table.t) mask ->
+                        List.map
+                          (fun (column, action) -> { Manifest.table = name; column; action })
+                          (Mask.Table.masked mask))
+                      schema.tables (Iarray.to_list masks)))
+              entries
           in
           let rows = Base.Hashtbl.create (module Schema.Name) in
           List.iter

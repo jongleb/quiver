@@ -1,10 +1,12 @@
 module Make (S : Sink_intf.S) = struct
+  type failure = [ `Sink of S.error | `Mask of Mask.error ]
+
   type outcome =
     | Closed of { part : Manifest.part; writing : Manifest.writing }
-    | Failed of S.error
+    | Failed of failure
 
   type rendered = {
-    result : (S.rendered, S.error) result;
+    result : (S.rendered, failure) result;
     took : Core.Time_ns.Span.t;
   }
 
@@ -13,7 +15,7 @@ module Make (S : Sink_intf.S) = struct
     | Open
     | Sealed of { batches : int; told : outcome -> unit @@ portable }
         (** [told] hears the outcome once batch [batches - 1] is appended. *)
-    | Broken of S.error  (** Discarded, not sealed yet. *)
+    | Broken of failure  (** Discarded, not sealed yet. *)
     | Ended
 
   type state = {
@@ -58,12 +60,15 @@ module Make (S : Sink_intf.S) = struct
               Guarded.hold state (fun { part; _ } -> S.renderer part);
           }
 
-  let render t batch =
+  let render t mask batch =
     let started = Stopwatch.start () in
     let result =
-      match S.render t.renderer batch with
-      | Ok rendered -> Ok rendered
-      | Error (`Sink error) -> Error error
+      match Mask.Table.apply mask batch with
+      | Error (`Mask error) -> Error (`Mask error)
+      | Ok () -> (
+          match S.render t.renderer batch with
+          | Ok rendered -> Ok rendered
+          | Error (`Sink error) -> Error (`Sink error))
     in
     { result; took = Stopwatch.elapsed started }
 
@@ -89,7 +94,7 @@ module Make (S : Sink_intf.S) = struct
                          committing = Stopwatch.elapsed closing;
                        };
                    })
-          | Error error -> told (Failed error))
+          | Error error -> told (Failed (`Sink error)))
     | Open | Sealed _ | Broken _ | Ended -> ()
 
   let break state error =
@@ -112,7 +117,7 @@ module Make (S : Sink_intf.S) = struct
             Core.Time_ns.Span.( + ) state.appending (Stopwatch.elapsed started);
           match appended with
           | Ok () -> state.next <- state.next + 1
-          | Error (`Sink error) -> break state error
+          | Error (`Sink error) -> break state (`Sink error)
         in
         let rec drain () =
           match (state.stage, Hashtbl.find_opt state.pending state.next) with

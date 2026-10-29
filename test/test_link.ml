@@ -533,5 +533,78 @@ let lossy_load =
           loaded ~enums:[ "a" ] ~stored:3 ~warned:2 ();
         ])
 
+let result_warnings =
+  Alcotest.test_case "a result's rows end with the warnings the server counted" `Quick (fun () ->
+      let streamed warned =
+        let listener, route = listening Over_tcp in
+        let lenenc text = String.make 1 (Char.chr (String.length text)) ^ text in
+        let definition =
+          String.concat "" (List.map lenenc [ "def"; "db"; "t"; "t"; "v"; "v" ])
+          ^ "\012\063\000\020\000\000\000\008\000\000\000\000\000"
+        in
+        let terminator =
+          let counts = Bytes.create 2 in
+          Bytes.set_uint16_le counts 0 warned;
+          "\254\000\000\034\000" ^ Bytes.to_string counts
+        in
+        let server =
+          Support.start (fun () ->
+              let client, _ = Unix.accept listener in
+              send client (greeting "mysql_native_password");
+              ignore (receive client);
+              send client (ok 2);
+              ignore (receive client);
+              send client
+                (packet 1 "\000\001\000\000\000\001\000\000\000\000\000\000"
+                ^ packet 2 definition);
+              ignore (receive client);
+              send client
+                (String.concat ""
+                   [
+                     packet 1 "\001";
+                     packet 2 definition;
+                     packet 3 ("\000\000" ^ "\007\000\000\000\000\000\000\000");
+                     packet 4 ("\000\000" ^ "\009\000\000\000\000\000\000\000");
+                     packet 5 terminator;
+                   ]);
+              ignore (receive client);
+              Unix.close client)
+        in
+        let streamed =
+          Result.bind
+            (Quiver_mysql.Link.connect ~local_data:Without_local_data route
+               ~timeouts:
+                 {
+                   connecting = Core.Time_ns.Span.of_int_sec 5;
+                   silence = Core.Time_ns.Span.of_int_sec 5;
+                 }
+               ~user:"root" ~password:None)
+            (fun link ->
+              let streamed =
+                Result.bind (Quiver_mysql.Rows.open_ link "SELECT v") (fun rows ->
+                    let rec drain count =
+                      match Quiver_mysql.Rows.next rows ~row:(fun _ ~bitmap:_ -> Ok ()) with
+                      | Ok Row -> drain (count + 1)
+                      | Ok End ->
+                          let warnings = Quiver_mysql.Rows.warnings rows in
+                          Result.map (fun () -> (count, warnings)) (Quiver_mysql.Rows.close rows)
+                      | Error _ as error -> error
+                    in
+                    drain 0)
+              in
+              Quiver_mysql.Link.close link;
+              streamed)
+        in
+        Support.join server;
+        Unix.close listener;
+        match streamed with
+        | Ok (rows, warnings) -> Printf.sprintf "%d rows, %d warnings" rows warnings
+        | Error _ -> "broken"
+      in
+      Alcotest.(check (list string))
+        "streamed"
+        [ "2 rows, 0 warnings"; "2 rows, 1 warnings"; "2 rows, 300 warnings" ]
+        (List.map streamed [ 0; 1; 300 ]))
+
 let tests =
-  [ handshake; proxysql; cleartext; sealed; short_scramble; unreachable; timeouts; lossy_load; discovered ]
+  [ handshake; proxysql; cleartext; sealed; short_scramble; unreachable; timeouts; lossy_load; result_warnings; discovered ]

@@ -80,6 +80,9 @@ type phases = {
 }
 (** When the dump reached each phase, since it began. *)
 
+type masked = { table : Schema.Name.t; column : Ident.t; action : string }
+(** A column whose values the dump masked, and the name of the action. *)
+
 type t = private {
   version : int;
   level : Consistency.any;
@@ -88,6 +91,7 @@ type t = private {
   threads : threads;
   phases : phases;
   schema : Schema.t;
+  masked : masked list;
   chunks : entry list;
 }
 (** Everything needed to inspect or resume a dump. *)
@@ -101,6 +105,7 @@ val make :
   threads:threads ->
   phases:phases ->
   schema:Schema.t ->
+  masked:masked list ->
   (Chunk.t * state) list ->
   t
 

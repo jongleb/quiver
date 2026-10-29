@@ -12,6 +12,21 @@ let of_string ?file ~commands ~scoped text =
     | String (_, s) -> Some s
     | Null _ | Seq _ | Map _ -> None
   in
+  let rec assignments prefix (v : YAMLx.value) =
+    match (v, scalar v) with
+    | _, Some text -> Some [ prefix ^ "=" ^ text ]
+    | Null _, None -> Some []
+    | Seq (_, items), None ->
+        Option.map List.concat (Base.Option.all (List.map (fun item -> Option.map (fun text -> [ prefix ^ "=" ^ text ]) (scalar item)) items))
+    | Map (_, pairs), None ->
+        Option.map List.concat
+          (Base.Option.all
+             (List.map
+                (fun ((_, key, value) : YAMLx.loc * YAMLx.value * YAMLx.value) ->
+                  Option.bind (scalar key) (fun key -> assignments (prefix ^ "." ^ key) value))
+                pairs))
+    | (Bool _ | Int _ | Float _ | String _), None -> None
+  in
   let option name (v : YAMLx.value) =
     match (v, scalar v) with
     | Null _, _ -> Ok None
@@ -19,7 +34,16 @@ let of_string ?file ~commands ~scoped text =
     | Seq (_, items), None ->
         Option.fold (Base.Option.all (List.map scalar items)) ~none:(fail (Unusable name)) ~some:(fun texts ->
             Ok (Some (name, Texts texts)))
-    | (Bool _ | Int _ | Float _ | String _ | Map _), None -> fail (Unusable name)
+    | Map (_, pairs), None ->
+        Option.fold
+          (Base.Option.all
+             (List.map
+                (fun ((_, key, value) : YAMLx.loc * YAMLx.value * YAMLx.value) ->
+                  Option.bind (scalar key) (fun key -> assignments key value))
+                pairs))
+          ~none:(fail (Unusable name))
+          ~some:(fun texts -> Ok (Some (name, Texts (List.concat texts))))
+    | (Bool _ | Int _ | Float _ | String _), None -> fail (Unusable name)
   in
   let options where pairs =
     List.fold_left

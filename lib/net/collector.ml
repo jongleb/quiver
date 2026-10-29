@@ -369,7 +369,7 @@ module Make (S : Quiver_core.Sink_intf.S) = struct
   module Part = Quiver_core.Assembly.Make (S)
 
   type failure : value mod contended portable =
-    [ `Sink of S.error | `Collector of error ]
+    [ `Sink of S.error | `Collector of error | `Mask of Quiver_core.Mask.error ]
 
   (** Whether requests are still applied, or skipped after a refusal. *)
   type stance = Accepting | Refusing
@@ -493,6 +493,7 @@ module Make (S : Quiver_core.Sink_intf.S) = struct
                ~replace_with:(Some error));
           Sexplib0.Sexp.to_string_hum (S.sexp_of_error error)
       | `Collector error -> Sexplib0.Sexp.to_string_hum (sexp_of_error error)
+      | `Mask error -> Sexplib0.Sexp.to_string_hum (Quiver_core.Mask.sexp_of_error error)
     in
     let hear steering replies =
       while steering.first < replies && not (Queue.is_empty steering.unheard) do
@@ -646,7 +647,7 @@ module Make (S : Quiver_core.Sink_intf.S) = struct
             Some
               (match Await.Await.Ivar.read Quiver_core.Blocking.await closed with
               | Closed { part; _ } -> Ok part
-              | Failed error -> Error (`Sink error))
+              | Failed error -> Error (error :> failure))
         | Ended _, Error error -> Some (Error (`Sink error))
       in
       Quiver_core.Guarded.hold owners (fun owners -> Hashtbl.remove owners id);
@@ -978,7 +979,7 @@ module Make (S : Quiver_core.Sink_intf.S) = struct
                             | Ragged { column; length; rows } ->
                                 Ragged { column; length; rows })))
                 | Ok sealed ->
-                    Part.deliver part seq (Part.render part sealed);
+                    Part.deliver part seq (Part.render part Quiver_core.Mask.Table.none sealed);
                     Ok ()))
       in
       let acknowledged =
@@ -1188,4 +1189,5 @@ module Make (S : Quiver_core.Sink_intf.S) = struct
     | None, Ok () -> Ok ()
     | None, Error (`Sink error) -> Error (`Sink error)
     | None, Error (`Collector error) -> Error (`Collector error)
+    | None, Error (`Mask error) -> Error (`Mask error)
 end

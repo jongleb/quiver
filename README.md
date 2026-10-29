@@ -370,6 +370,11 @@ change differently:
 
 ### Masking
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/masking-dark.svg">
+  <img src="assets/masking.svg" alt="MySQL, one snapshot, sql: rules evaluated by the source; readers put real values into batches in memory; the renderers mask them, keyed by --mask-secret; only masked values go to files, the wire or a live server. One row of shop.users copied with examples/shop.scm: id 1 to 283289981 by permute, ivan.petrov1@mail.ru to dvjv.cainmk1@omkz.vx by permute, Мария Смирнова to Борис Ltsiikhent, +7 (912) 001-01-01 to +7 (974) 438-01-01, 1960-01-02 to 1960-07-02, salary 50037 to 49000, card 4276000000000031 to 4276007180515102 with a valid Luhn digit, payload ip 10.0.1.1 to 0.0.0.0 by the source" width="100%">
+</picture>
+
 Personal data can be masked as it is read, so the real values never leave the reader: not in
 dump files, not on the wire, not in the target. `dump`, `copy` and `agent` take the same rules.
 
@@ -419,6 +424,12 @@ written; a column takes the first rule naming it.
 quiver copy … --mask 'shop.users.id=permute' --mask 'shop.users.email=permute' --mask-secret "$MASK_SECRET"
 # masked in shop.orders: user_id (permute (a reference)), email (permute (a reference))
 ```
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/references-dark.svg">
+  <img src="assets/references.svg" alt="permute on users.id spreads to users.manager_id, addresses.user_id, orders.user_id and, through a declared reference, events.user_ref; permute on users.email spreads to orders.email; permute on orders.id spreads to items.order_id and payments.order_id. User 1 becomes 283289981 and keeps its 2 orders; order 20000 becomes 7516915763705941 and keeps its 2 items. A hash of 20 M ids into INT gives about 93 000 pairs of rows one id, permute none. Every join of the copy holds as in prod, and four ways of copying give one CHECKSUM" width="100%">
+</picture>
+
 - **Never longer.** `shape`, `email` and `hash` keep the number of characters and never add
   bytes, so a value still fits its column. NULL stays NULL but under `null` and `sql:`.
 - **Refused, not guessed.** A rule naming no column of the dump, a key column under an action

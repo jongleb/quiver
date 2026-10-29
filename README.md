@@ -555,7 +555,10 @@ item. quiver reads `--quiverfile FILE`, else the file in `QUIVERFILE`, else `qui
 the current directory, and says which. The command line wins over the environment, and both win
 over the file: each option also reads `QUIVER_<NAME>` (`QUIVER_THREADS`, `QUIVER_TO_HOST`, …).
 An unknown key is an error, as is a key whose meaning differs between commands (`database`) at
-the top. See [quiverfile.example.yaml](quiverfile.example.yaml).
+the top. A list at the top goes only to the commands that take that option. See
+[quiverfile.example.yaml](quiverfile.example.yaml): a production source, test copies by `dump`,
+`copy` and agent → collector, and masking with the policy in [examples/shop.scm](examples/shop.scm),
+keys included.
 
 ## Across the network
 

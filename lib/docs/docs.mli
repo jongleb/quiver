@@ -15,6 +15,9 @@ type command = { name : string; summary : string; help : string }
 val command : name:string -> help:string -> command
 (** The summary is what follows [ - ] on the NAME line of the plain help. *)
 
+val options : command -> string list
+(** The long names of the options of the plain help, without their dashes. *)
+
 val undocumented : command -> string list
 (** The options of the plain help that say nothing of themselves, as their first lines. *)
 

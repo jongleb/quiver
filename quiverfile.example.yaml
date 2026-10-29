@@ -1,48 +1,73 @@
-# A quiverfile: defaults for quiver's options, by their long names (quiver <command> --help).
-# Copy it to quiverfile.yaml in the directory you run quiver from, or pass --quiverfile FILE,
-# or set QUIVERFILE. The command line and QUIVER_<NAME> variables win over it.
+# quiverfile.yaml — test and dev copies of shop, personal data masked. Copy it to
+# quiverfile.yaml where you run quiver, or pass --quiverfile FILE, or set QUIVERFILE.
+# Keys are long option names (quiver <command> --help). At the top: every command that has
+# the option; under a command's name: that command alone. The command line and QUIVER_*
+# variables win over this file. Secrets stay out of it:
+#   MYSQL_PWD, QUIVER_TO_PWD — passwords; QUIVER_MASK_SECRET — the masking key.
 
-# At the top: every command that has the option.
-host: db1.internal            # the source; without host, the local socket as mysql finds it
-user: dumper
+# The source
+host: db-prod.internal
+port: 3306
+user: quiver_reader
 tls-ca: /etc/ssl/db-ca.pem
+connect-timeout: 10
 net-timeout: 600
+snapshot: ftwrl                # one consistent point for every table
 
-# Under a command's name: that command alone.
+# Masking: dump, copy and agent all take it
+mask-script: [examples/shop.scm]   # the policy: definitions, keys, rules; words beside it
+mask-strict: [shop.orders]     # added to the script's (strict …)
+mask:                          # before the script's rules; a column takes the first that names it
+  shop.orders:
+    total: keep
+  shop.events:
+    payload: "sql:JSON_SET(payload, '$.ip', '0.0.0.0')"   # evaluated by the source
+
 dump:
-  database: [shop, billing]   # a list gives the option once per item
-  outputdir: /backups/today
-  threads: 16
+  database: shop
+  outputdir: /backups/shop-masked
+  threads: 8
+  format: sql
   compress: zstd
+  zstd-level: 3
   objects: all
 
-copy:
+copy:                          # straight from prod into the test server, no files
   database: shop
-  to-host: db2.internal
-  to-user: loader
-  to-database: shop_copy
+  to-host: db-test.internal
+  to-port: 3306
+  to-user: quiver_loader
+  to-tls-ca: /etc/ssl/db-ca.pem
+  to-database: shop_test
   threads: 8
   target-threads: 16
-  secondary-keys: after-data
-  ingest: tablespace          # MySQL 8.4 target on this machine
+  ingest: tablespace           # MySQL 8.4 target whose datadir this machine sees
   binlog: skip
-  tablespace-keys: server     # quiver (the default): keys it can order built into the file
-  read-order: largest-tables  # largest-chunks (the default): the largest chunks first
-  declare-tables: all-at-once # before-rows (the default): a table just before its rows
-  sort-dir: /fast/scratch
-  build-threads: 8
-  data-table: [shop.orders, shop.items]
-  mask:                       # masked as read: null, text:VALUE, shape, email, hash, keep, sql:…, expr:…
-    shop.users:               # a map gives the option once per leaf: shop.users.name=shape …
-      name: shape
-      passport: hash
-    "*.*.email": email        # quote keys that start with *
-  mask-script: [policy.scm]   # your own masking policy in S-expressions: quiver mask --help
-  mask-strict: [shop.users]   # every column of these tables masked or kept, or nothing is read
-  mask-secret: change-me      # the same secret masks the same value the same way every run
-  after-load:                 # run on the target once the rows and keys are in, {table} its name
-    shop.orders: "UPDATE {table} SET comment = NULL"
+  secondary-keys: after-data
+  after-load:                  # on the target once rows and keys are in; {table} — its name there
+    shop.orders: "UPDATE {table} SET comment = 'masked' WHERE comment IS NULL"
 
-load:
-  directory: /backups/today
+agent:                         # next to prod: reads, masks, sends
+  database: shop
+  collector: dev-loader.internal:4710
+  streams: 8
+  max-rate: 200                # MB/s on the wire, all streams together
+  wire-cert: /etc/quiver/agent.pem
+  wire-key: /etc/quiver/agent.key
+  wire-peers: /etc/quiver/ca.pem
+
+collect:                       # next to the test server: receives, loads
+  listen: 0.0.0.0:4710
+  to-host: db-test.internal
+  to-user: quiver_loader
+  to-database: shop_test
+  ingest: tablespace
+  binlog: skip
+  wire-cert: /etc/quiver/loader.pem
+  wire-key: /etc/quiver/loader.key
+  wire-peers: /etc/quiver/ca.pem
+
+load:                          # a masked dump into the test server
+  directory: /backups/shop-masked
+  database: shop_test
   threads: 8

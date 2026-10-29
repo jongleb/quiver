@@ -1854,27 +1854,21 @@ let () =
       Term.(const run $ kind $ row $ scripts $ expression $ values $ mask_secret)
   in
   let documented = [ dump_cmd; load_cmd; copy_cmd; agent_cmd; collect_cmd; relay_cmd; mask_cmd ] in
+  let help name =
+    let buffer = Buffer.create 8192 in
+    let formatter = Format.formatter_of_buffer buffer in
+    let (_ : (int Cmdliner.Cmd.eval_ok, Cmdliner.Cmd.eval_error) result) =
+      Cmdliner.Cmd.eval_value ~help:formatter ~err:formatter ~env:(fun _ -> None)
+        ~argv:[| "quiver"; name; "--help=plain" |]
+        (Cmdliner.Cmd.group (Cmdliner.Cmd.info "quiver" ~version:Version.number) documented)
+    in
+    Format.pp_print_flush formatter ();
+    Quiver_docs.Docs.command ~name ~help:(Buffer.contents buffer)
+  in
   let docs_cmd =
     let open Cmdliner in
     let run dir =
-      let help name =
-        let buffer = Buffer.create 8192 in
-        let formatter = Format.formatter_of_buffer buffer in
-        let (_ : (int Cmd.eval_ok, Cmd.eval_error) result) =
-          Cmd.eval_value ~help:formatter ~err:formatter ~env:(fun _ -> None)
-            ~argv:[| "quiver"; name; "--help=plain" |]
-            (Cmd.group (Cmd.info "quiver" ~version:Version.number) documented)
-        in
-        Format.pp_print_flush formatter ();
-        Buffer.contents buffer
-      in
-      let commands =
-        List.map
-          (fun command ->
-            let name = Cmd.name command in
-            Quiver_docs.Docs.command ~name ~help:(help name))
-          documented
-      in
+      let commands = List.map (fun command -> help (Cmd.name command)) documented in
       match
         let%bind () =
           match List.concat_map (fun command -> List.map (fun line -> command.Quiver_docs.Docs.name ^ ": " ^ line) (Quiver_docs.Docs.undocumented command)) commands with
@@ -1940,7 +1934,8 @@ let () =
         | Ok text -> (
             match
               Quiver_quiverfile.Quiverfile.of_string ~file:path
-                ~commands:(List.map Cmdliner.Cmd.name commands)
+                ~commands:
+                  (List.filter (fun name -> not (Hashtbl.mem options name)) (List.map Cmdliner.Cmd.name commands))
                 ~scoped:[ "database" ] text
             with
             | Error (`Quiverfile error) ->
@@ -1955,11 +1950,13 @@ let () =
                       name ^ " means different things to different commands: put it under the command's name")
             | Ok file ->
                 Format.eprintf "quiver: settings from %s@." path;
+                let accepted = lazy (Quiver_docs.Docs.options (help command)) in
                 Base.List.fold_result (Quiver_quiverfile.Quiverfile.settings file ~command)
                   ~init:(program :: command :: rest, []) ~f:(fun (argv, variables) (name, value) ->
                     match (Hashtbl.find_opt options name, value) with
                     | None, _ -> Error ("quiverfile " ^ path ^ ": quiver has no option --" ^ name)
                     | Some (_, variable), Text text -> Ok (argv, (variable, text) :: variables)
+                    | Some _, Texts _ when not (List.mem name (Lazy.force accepted)) -> Ok (argv, variables)
                     | Some (names, _), Texts texts ->
                         let spelled name = if String.length name = 1 then "-" ^ name else "--" ^ name in
                         let mentioned arg =

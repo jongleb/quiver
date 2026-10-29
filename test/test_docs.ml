@@ -152,6 +152,31 @@ let undocumented =
         (Quiver_docs.Docs.undocumented (Quiver_docs.Docs.command ~name:"x" ~help))
         (List.filter_map (fun (name, doc) -> match doc with None -> Some name | Some _ -> None) options))
 
+let options =
+  QCheck2.Test.make ~count:500 ~name:"the long names of every option of a help are found, and only they"
+    ~print:QCheck2.Print.(list (pair string (option string)))
+    QCheck2.Gen.(
+      list_size (int_range 0 8)
+        (pair
+           (string_size ~gen:(oneof_list [ 'a'; 'b'; '-' ]) (int_range 1 5))
+           (option (oneof_list [ "-x, "; "-y DIR, " ]))))
+    (fun options ->
+      let body =
+        String.concat ""
+          (List.mapi
+             (fun i (name, short) ->
+               let value = if i mod 2 = 0 then "=X (absent QUIVER_X env)" else "" in
+               "       " ^ Option.value short ~default:"" ^ "--" ^ name ^ value ^ "\n           Like --zzz, with -q.\n\n")
+             options)
+      in
+      let help =
+        "NAME\n       quiver-x - X\n\nOPTIONS\n" ^ body ^ "COMMON OPTIONS\n       --help[=FMT] (default=auto)\n           Show.\n\n"
+        ^ "ENVIRONMENT\n       QUIVER_X\n           Like --x.\n"
+      in
+      List.equal String.equal
+        (Quiver_docs.Docs.options (Quiver_docs.Docs.command ~name:"x" ~help))
+        (List.map fst options @ [ "help" ]))
+
 let kinds : Mask_script.kind list = [ Text; Int; Bool; Date; Datetime ]
 
 let literal (kind : Mask_script.kind) =
@@ -293,6 +318,7 @@ let tests =
     QCheck_alcotest.to_alcotest pages_are_whole;
     QCheck_alcotest.to_alcotest summaries;
     QCheck_alcotest.to_alcotest undocumented;
+    QCheck_alcotest.to_alcotest options;
     QCheck_alcotest.to_alcotest signatures_hold;
     Alcotest.test_case "every documented example gives what it says" `Quick examples_hold;
   ]

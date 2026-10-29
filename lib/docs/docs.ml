@@ -55,6 +55,27 @@ let command ~name ~help =
   in
   { name; summary = after_name lines; help }
 
+let options { help; _ } =
+  let heading line = String.length line > 0 && line.[0] <> ' ' in
+  let named piece =
+    Option.map
+      (fun rest ->
+        let ends =
+          Base.String.lfindi rest ~f:(fun _ c -> not (Base.Char.is_alphanum c || Char.equal c '-'))
+        in
+        String.sub rest 0 (Option.value ends ~default:(String.length rest)))
+      (Base.String.chop_prefix piece ~prefix:"--")
+  in
+  let rec scan within acc = function
+    | [] -> List.rev acc
+    | line :: rest when heading line -> scan (Base.String.is_suffix line ~suffix:"OPTIONS") acc rest
+    | line :: rest when within && String.starts_with ~prefix:"       -" line ->
+        let pieces = Base.String.split_on_chars (String.trim line) ~on:[ ',' ] in
+        scan within (List.rev_append (List.filter_map (fun piece -> named (String.trim piece)) pieces) acc) rest
+    | _ :: rest -> scan within acc rest
+  in
+  scan false [] (String.split_on_char '\n' help)
+
 let undocumented { help; _ } =
   let option line = String.starts_with ~prefix:"       -" line in
   let heading line = String.length line > 0 && line.[0] <> ' ' in

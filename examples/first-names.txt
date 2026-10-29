@@ -1,9 +1,9 @@
-# first names for masked people
-Анна
-Борис
-Вера
-Глеб
-Дарья
-Егор
-Жанна
-Захар
+# first names for masked people, one per line
+Anna
+Boris
+Clara
+David
+Emma
+Felix
+Grace
+Henry

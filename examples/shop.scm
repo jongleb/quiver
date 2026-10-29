@@ -7,8 +7,8 @@
 
 (define (phone p)                         ; +7 (912) 345-67-89 → +7 (9xx) xxx-67-89
   (concat "+7 (9" (digits p 2) ") " (digits (concat p "/") 3) "-" (right p 5)))
-(define (person n)                        ; Иван Петров → Мария Gzhfmpb
-  (concat (pick-word n first-names) " " (title (translit (shape (after n " "))))))
+(define (person n)                        ; a first name from the list, the surname shaped
+  (concat (pick-word n first-names) " " (title (shape (after n " ")))))
 (define (card c)                          ; same bank (first 6 digits), valid check digit
   (let ((body (concat (left c 6) (digits c 9)))) (concat body (luhn body))))
 

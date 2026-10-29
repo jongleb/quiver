@@ -372,7 +372,7 @@ change differently:
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/masking-dark.svg">
-  <img src="assets/masking.svg" alt="MySQL, one snapshot, sql: rules evaluated by the source; readers put real values into batches in memory; the renderers mask them, keyed by --mask-secret; only masked values go to files, the wire or a live server. One row of shop.users copied with examples/shop.scm: id 1 to 283289981 by permute, ivan.petrov1@mail.ru to dvjv.cainmk1@omkz.vx by permute, Мария Смирнова to Борис Ltsiikhent, +7 (912) 001-01-01 to +7 (974) 438-01-01, 1960-01-02 to 1960-07-02, salary 50037 to 49000, card 4276000000000031 to 4276007180515102 with a valid Luhn digit, payload ip 10.0.1.1 to 0.0.0.0 by the source" width="100%">
+  <img src="assets/masking.svg" alt="MySQL, one snapshot, sql: rules evaluated by the source; readers put real values into batches in memory; the renderers mask them, keyed by --mask-secret; only masked values go to files, the wire or a live server. One row of shop.users copied with examples/shop.scm: id 1 to 283289981 by permute, ivan.petrov1@mail.ru to dvjv.cainmk1@omkz.vx by permute, Mary Johnson to Clara Ctbcmze, +7 (912) 001-01-01 to +7 (974) 438-01-01, 1960-01-02 to 1960-07-02, salary 50037 to 49000, card 4276000000000031 to 4276007180515102 with a valid Luhn digit, payload ip 10.0.1.1 to 0.0.0.0 by the source" width="100%">
 </picture>
 
 Personal data can be masked as it is read, so the real values never leave the reader: not in
@@ -399,7 +399,7 @@ written; a column takes the first rule naming it.
 | `permute:LOW..HIGH` | an integer to another from `LOW` to `HIGH`, at least a million of them |
 | `null` | NULL |
 | `text:VALUE` | this value: text, binary, an `ENUM` member or `SET` members |
-| `shape` | each letter and digit replaced by a keyed one of the same kind (Latin, Cyrillic, digit), the rest kept: `+7 (912) 345-67-89` → `+3 (481) 905-12-77`, `Иван Smith` → `Жуэр Qmpwa` |
+| `shape` | each letter and digit replaced by a keyed one of the same kind (Latin, Cyrillic, digit), the rest kept: `+7 (912) 345-67-89` → `+9 (331) 996-11-65`, `John Smith` → `Amdj Yslza` |
 | `email` | `shape` before the last `@`, the domain kept |
 | `hash` | a keyed digest of the same length in hex digits or bytes, or any integer of the column's type |
 | `sql:EXPRESSION` | the expression, evaluated by the source for each row and cast to the column's type |
@@ -456,10 +456,10 @@ defined above it.
 ; policy.scm
 (words names "names.txt")                 ; one fake first name per line, beside the script
 
-(define (phone p)                         ; +7 (912) 345-67-89 → +7 (937) 482-67-89
+(define (phone p)                         ; +7 (912) 345-67-89 → +7 (975) 023-67-89
   (concat "+7 (" (str (keyed-int p 900 999)) ") " (digits p 3) "-" (right p 5)))
-(define (person n)                        ; Иван Петров → Дарья Kknyayyubae
-  (concat (pick-word n names) " " (title (translit (shape (after n " "))))))
+(define (person n)                        ; John Smith → Boris Camgm
+  (concat (pick-word n names) " " (title (shape (after n " ")))))
 
 (strict "shop.users")                     ; every column of users decided, or nothing is read
 (keep "shop.users.id")

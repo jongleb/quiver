@@ -8,6 +8,7 @@ type t =
   | Tables
   | Columns
   | Indexes of Server.t
+  | Foreign_keys
   | Key_bounds of {
       table : Quiver_core.Schema.Name.t;
       key : Quiver_core.Ident.t;
@@ -137,6 +138,13 @@ let sql = function
          SUB_PART, IFNULL(CARDINALITY, 0), INDEX_TYPE = 'BTREE' AND %{usable} \
          FROM information_schema.STATISTICS WHERE TABLE_SCHEMA NOT IN %{system} \
          ORDER BY TABLE_SCHEMA, TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX"]
+  | Foreign_keys ->
+      [%string
+        "SELECT TABLE_SCHEMA, TABLE_NAME, CONSTRAINT_NAME, COLUMN_NAME, \
+         REFERENCED_TABLE_SCHEMA, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME \
+         FROM information_schema.KEY_COLUMN_USAGE WHERE REFERENCED_TABLE_NAME IS NOT NULL \
+         AND TABLE_SCHEMA NOT IN %{system} \
+         ORDER BY TABLE_SCHEMA, TABLE_NAME, CONSTRAINT_NAME, ORDINAL_POSITION"]
   | Key_bounds { table; key } ->
       [%string "SELECT MIN(%{Quiver_core.Ident.backquoted key}), MAX(%{Quiver_core.Ident.backquoted key}) FROM %{qualified table}"]
   | Read_threads server -> (

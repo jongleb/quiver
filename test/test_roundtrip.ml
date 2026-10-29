@@ -621,9 +621,9 @@ let messages =
              let+ byte_order = oneof_list Quiver_net.Message.all_of_byte_order in
              Quiver_net.Message.Hello { session; byte_order; streams; chunks });
             map2 (fun name ddl -> Quiver_net.Message.Database { name; ddl }) name text;
-            (let* table = table and* ddl = text in
-             let+ parts = count in
-             Quiver_net.Message.Table { table; ddl; parts });
+            (let* table = table and* ddl = text and* parts = count in
+             let+ order = oneof_list [ Quiver_core.Schema.Key_order; Masked_key ] in
+             Quiver_net.Message.Table { table; ddl; parts; order });
             map (fun table -> Quiver_net.Message.Grown { table }) table_name;
             map2
               (fun database definitions -> Quiver_net.Message.Objects { database; definitions })
@@ -743,7 +743,7 @@ let unchecked_sexp =
           Printf.sprintf "((name c)(ltype %s)(nullability %s))" ltype nullability
         in
         Printf.sprintf
-          "(Table(table((name(db t))(fields(%s()))(key %s)(estimate((rows 0)(bytes 0)))))(ddl \"\")(parts 1))"
+          "(Table(table((name(db t))(fields(%s()))(key %s)(estimate((rows 0)(bytes 0)))))(ddl \"\")(parts 1)(order Key_order))"
           field
           (match key with
           | `Primary -> Printf.sprintf "(Primary(%s()))" field

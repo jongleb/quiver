@@ -4,7 +4,7 @@
  (libraries base base_bigstring unix)
  (foreign_stubs
   (language c)
-  (names openssl_stubs)
+  (names openssl_stubs ff1_stubs)
   (flags
    (:standard
     (:include c_flags.sexp))))

@@ -33,3 +33,21 @@ val digits : t -> string -> int -> string
 
 val hex : t -> string -> int -> string
 (** [n] hex digits. *)
+
+type permutation : value mod contended portable
+(** A bijection under the key, one per label: FF1 of NIST SP 800-38G with cycle walking. *)
+
+val permutation : t -> label:string -> permutation
+
+val permute_integer : permutation -> low:int64 -> high:int64 -> int64 -> int64
+(** A value from [low] to [high] to another, both counted from [low] without sign: two values
+    never give one. *)
+
+val permute_text : permutation -> string -> string option
+(** Each digit, Latin and Cyrillic letter to one of its kind in the same place, the case and
+    every other character kept, so as many characters and bytes: two texts never give one,
+    nor two texts equal but for case or trailing spaces two that differ in more. [None] when
+    the text has too many letters and digits (beyond 2^8192 texts of its form). *)
+
+val permute_bytes : permutation -> string -> string option
+(** Each value to another of its length; [None] beyond 1024 bytes. *)

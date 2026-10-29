@@ -3,7 +3,8 @@
 (** A language of S-expressions for masking a column: each row's value, the other columns of
     its row as read, constants, text, number and date functions, words from files and the keyed
     functions of {!Keyed}. A script holds [(define (NAME PARAMETER …) BODY)], [(mask SELECTOR
-    BODY)], [(keep SELECTOR)], [(strict "DATABASE.TABLE" …)], [(after-load "DATABASE.TABLE"
+    BODY)], [(keep SELECTOR)], [(permute SELECTOR [LOW HIGH])], [(references "DB.TABLE.COLUMN"
+    "DB.TABLE.COLUMN")], [(strict "DATABASE.TABLE" …)], [(after-load "DATABASE.TABLE"
     "STATEMENT")] and [(words NAME "FILE")] forms. Programs are typed before anything is read and
     always end: a definition calls only those before it, and nothing loops. NULL goes through
     functions as in SQL. *)
@@ -97,7 +98,10 @@ type selector =
       (** [(where (table …) (column …) (type …))]: patterns, and the column types it takes, any when empty. *)
 
 (** What a rule does with its columns. *)
-type target = Masked of expression | Kept
+type target =
+  | Masked of expression
+  | Kept
+  | Permuted of (int64 * int64) option  (** [(permute SELECTOR)], or with its domain [LOW HIGH]. *)
 
 type rule = { at : position; selector : selector; target : target }
 
@@ -109,6 +113,10 @@ val strict : t -> (position * string) list
 
 val after_load : t -> (position * string * string) list
 (** Table and statement of each [(after-load …)] form. *)
+
+val references : t -> ((string * string * string) * (string * string * string)) list
+(** Each [(references "DB.TABLE.COLUMN" "DB.TABLE.COLUMN")] form: a column that refers to
+    another though no foreign key says so, as database, table and column. *)
 
 val sexp_of_expression : expression -> Sexplib0.Sexp.t
 

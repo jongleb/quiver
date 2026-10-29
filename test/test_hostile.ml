@@ -22,7 +22,7 @@ module Anything = struct
 
   let format () = Output_format.Sql
   let database () _ ~ddl:_ = Ok ()
-  let table () _ ~ddl:_ ~parts:_ = Ok ()
+  let table () _ ~ddl:_ ~parts:_ ~order:_ = Ok ()
   let add_part () _ = Ok ()
   let objects () _ _ = Ok ()
   let part () _ ~index:_ = Ok ()
@@ -103,7 +103,7 @@ let controls =
         map
           (fun n ->
             Quiver_net.Message.sexp_of_control
-              (Table { table = table n; ddl = ""; parts = 1 + n }))
+              (Table { table = table n; ddl = ""; parts = 1 + n; order = Key_order }))
           n;
         pure
           (Quiver_net.Message.sexp_of_control
@@ -400,7 +400,7 @@ let hostile_collector =
               Atomic.set stage "declaring the database";
               ignore (Quiver_net.Remote.database agent (ident "db") ~ddl:"");
               Atomic.set stage "declaring the table";
-              ignore (Quiver_net.Remote.table agent (table 0) ~ddl:"" ~parts);
+              ignore (Quiver_net.Remote.table agent (table 0) ~ddl:"" ~parts ~order:Key_order);
               for index = 0 to parts - 1 do
                 Atomic.set stage (Printf.sprintf "opening part %d" index);
                 match Quiver_net.Remote.part agent (table 0) ~index with

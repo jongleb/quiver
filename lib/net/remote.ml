@@ -1128,8 +1128,8 @@ let waited_for_acks t =
   Core.Time_ns.Span.of_int_ns (Portable.Atomic.get t.unacknowledged_wait)
 let database t name ~ddl = sent t (Database { name; ddl })
 
-let table t (table : Quiver_core.Schema.Table.t) ~ddl ~parts =
-  sent t (Table { table; ddl; parts })
+let table t (table : Quiver_core.Schema.Table.t) ~ddl ~parts ~order =
+  sent t (Table { table; ddl; parts; order })
 
 let add_part t (table : Quiver_core.Schema.Table.t) =
   sent t (Grown { table = table.name })

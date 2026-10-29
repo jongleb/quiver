@@ -23,6 +23,8 @@ module Field = struct
   [@@deriving sexp ~portable, equal ~portable, yojson]
 end
 
+type order = Key_order | Masked_key [@@deriving sexp ~portable]
+
 type error =
   | No_fields of Name.t
   | Duplicate_field of { table : Name.t; field : Ident.t }

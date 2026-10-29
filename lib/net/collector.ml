@@ -835,11 +835,11 @@ module Make (S : Quiver_core.Sink_intf.S) = struct
         | Database { name; ddl } ->
             let%bind () = answered (fun () -> S.database sink name ~ddl) in
             next stage channel
-        | Table { table; ddl; parts } ->
+        | Table { table; ddl; parts; order } ->
             let%bind () =
               answered (fun () ->
                   Hashtbl.replace tables table.Quiver_core.Schema.Table.name table;
-                  S.table sink table ~ddl ~parts)
+                  S.table sink table ~ddl ~parts ~order)
             in
             next stage channel
         | Grown { table = name } -> (

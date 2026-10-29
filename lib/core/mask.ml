@@ -1,6 +1,9 @@
 open Base.Result.Let_syntax
 
+type domain = { low : int64; high : int64 }
+
 type action =
+  | Permute of domain option
   | Null
   | Text of string
   | Shape
@@ -15,7 +18,6 @@ type error =
   | Malformed of string @@ aliased
   | Unknown_action of string @@ aliased
   | Unused of string @@ aliased
-  | Key_column of { table : Schema.Name.t @@ aliased; column : Ident.t @@ aliased }
   | Generated_column of { table : Schema.Name.t @@ aliased; column : Ident.t @@ aliased }
   | Generated_values of Schema.Name.t @@ aliased
   | Not_nullable of { table : Schema.Name.t @@ aliased; column : Ident.t @@ aliased }
@@ -41,9 +43,31 @@ type error =
   | Rewritten of Column.error @@ aliased
   | Unhandled of { table : Schema.Name.t @@ aliased; columns : Ident.t list @@ aliased }
   | Finer_than_column of { table : Schema.Name.t @@ aliased; column : Ident.t @@ aliased }
+  | Not_injective of { table : Schema.Name.t @@ aliased; column : Ident.t @@ aliased; action : string @@ aliased }
+  | Split_reference of {
+      table : Schema.Name.t @@ aliased;
+      column : Ident.t @@ aliased;
+      other : Schema.Name.t @@ aliased;
+      other_column : Ident.t @@ aliased;
+    }
+  | Small_domain of {
+      table : Schema.Name.t @@ aliased;
+      column : Ident.t @@ aliased;
+      low : int64 @@ aliased;
+      high : int64 @@ aliased;
+    }
+  | Outside_domain of {
+      table : Schema.Name.t @@ aliased;
+      column : Ident.t @@ aliased;
+      low : int64 @@ aliased;
+      high : int64 @@ aliased;
+    }
+  | Too_long of { table : Schema.Name.t @@ aliased; column : Ident.t @@ aliased }
 [@@deriving sexp_of]
 
 let action_name = function
+  | Permute None -> "permute"
+  | Permute (Some { low; high }) -> Printf.sprintf "permute:%Ld..%Ld" low high
   | Null -> "null"
   | Text _ -> "text"
   | Shape -> "shape"
@@ -64,20 +88,30 @@ let rule written =
   | Some (named, spelled) ->
       let prefixed prefix = Base.String.chop_prefix spelled ~prefix in
       let action =
+        let domain text =
+          match String.split_on_char '.' text with
+          | [ low; ""; high ] -> (
+              match (Int64.of_string_opt low, Int64.of_string_opt high) with
+              | Some low, Some high when Int64.compare low high <= 0 -> Ok (Permute (Some { low; high }))
+              | _ -> Error (`Mask (Malformed written)))
+          | _ -> Error (`Mask (Malformed written))
+        in
         match spelled with
+        | "permute" -> Ok (Permute None)
         | "null" -> Ok Null
         | "shape" -> Ok Shape
         | "email" -> Ok Email
         | "hash" -> Ok Hash
         | "keep" -> Ok Keep
         | _ -> (
-            match (prefixed "text:", prefixed "sql:", prefixed "expr:") with
-            | Some value, _, _ -> Ok (Text value)
-            | None, Some "", _ -> Error (`Mask (Malformed written))
-            | None, Some expression, _ -> Ok (Source expression)
-            | None, None, Some text ->
+            match (prefixed "text:", prefixed "sql:", prefixed "expr:", prefixed "permute:") with
+            | Some value, _, _, _ -> Ok (Text value)
+            | None, Some "", _, _ -> Error (`Mask (Malformed written))
+            | None, Some expression, _, _ -> Ok (Source expression)
+            | None, None, Some text, _ ->
                 Result.map (fun expression -> Expression expression) (Mask_script.expression ~source:written text)
-            | None, None, None -> Error (`Mask (Unknown_action spelled)))
+            | None, None, None, Some range -> domain range
+            | None, None, None, None -> Error (`Mask (Unknown_action spelled)))
       in
       let%bind action = action in
       Result.map (fun pattern -> { pattern; types = []; written; action }) (Pattern.column named)
@@ -90,7 +124,13 @@ let scripted script =
            match selector with
            | Named named -> (named, [])
            | Where { table; column; types } -> (table ^ "." ^ column, types)
-         and action = match target with Masked body -> Expression body | Kept -> Keep in
+         and action =
+           match target with
+           | Masked body -> Expression body
+           | Kept -> Keep
+           | Permuted None -> Permute None
+           | Permuted (Some (low, high)) -> Permute (Some { low; high })
+         in
          Result.map
            (fun pattern ->
              { pattern; types; written = Printf.sprintf "%s:%d (%s %s)" source line (action_name action) named; action })
@@ -112,6 +152,9 @@ type step =
   | Texts of { index : int; field : Ident.t; f : string -> string @@ portable }
   | Ints of { index : int; field : Ident.t; f : int -> int @@ portable }
   | Int64s of { index : int; field : Ident.t; f : int64 -> int64 @@ portable }
+  | Bounded_ints of { index : int; field : Ident.t; f : int -> int option @@ portable; domain : domain }
+  | Bounded_int64s of { index : int; field : Ident.t; f : int64 -> int64 option @@ portable; domain : domain }
+  | Limited_texts of { index : int; field : Ident.t; f : string -> string option @@ portable }
   | Present of { index : int; field : Ident.t }
   | Computed of {
       index : int;
@@ -156,6 +199,19 @@ module Table = struct
               match Column.presence column i with
               | Null -> read (i - 1) (None :: acc)
               | Present -> read (i - 1) (Some (f (Column.get column i)) :: acc)
+          in
+          read (rows - 1) [] [@nontail]
+        in
+        let attempted (type a) (column : a Column.t @ local) (f : a -> a option) =
+          let rec read i acc =
+            if i < 0 then Some acc
+            else
+              match Column.presence column i with
+              | Null -> read (i - 1) (None :: acc)
+              | Present -> (
+                  match f (Column.get column i) with
+                  | None -> None
+                  | Some value -> read (i - 1) (Some value :: acc))
           in
           read (rows - 1) [] [@nontail]
         in
@@ -259,6 +315,30 @@ module Table = struct
               match Column.repr column with
               | Int64 -> Ok (Some (Int64_column (index, values column f)))
               | Bool | Text | Int | Float -> mismatched field)
+          | Bounded_ints { index; field; f; domain = { low; high } } -> (
+              let (Column.Any column) = Iarray.get columns index in
+              match Column.repr column with
+              | Int ->
+                  Option.fold (attempted column f)
+                    ~none:(Error (`Mask (Outside_domain { table = t.table; column = field; low; high })))
+                    ~some:(fun values -> Ok (Some (Int_column (index, values))))
+              | Bool | Text | Int64 | Float -> mismatched field)
+          | Bounded_int64s { index; field; f; domain = { low; high } } -> (
+              let (Column.Any column) = Iarray.get columns index in
+              match Column.repr column with
+              | Int64 ->
+                  Option.fold (attempted column f)
+                    ~none:(Error (`Mask (Outside_domain { table = t.table; column = field; low; high })))
+                    ~some:(fun values -> Ok (Some (Int64_column (index, values))))
+              | Bool | Text | Int | Float -> mismatched field)
+          | Limited_texts { index; field; f } -> (
+              let (Column.Any column) = Iarray.get columns index in
+              match Column.repr column with
+              | Text ->
+                  Option.fold (attempted column f)
+                    ~none:(Error (`Mask (Too_long { table = t.table; column = field })))
+                    ~some:(fun values -> Ok (Some (Text_column (index, values))))
+              | Bool | Int | Int64 | Float -> mismatched field)
           | Present { index; field } ->
               let (Column.Any column) = Iarray.get columns index in
               let rec check i =
@@ -319,7 +399,6 @@ module Table = struct
           | Malformed text -> Malformed text
           | Unknown_action text -> Unknown_action text
           | Unused text -> Unused text
-          | Key_column { table; column } -> Key_column { table; column }
           | Generated_column { table; column } -> Generated_column { table; column }
           | Generated_values table -> Generated_values table
           | Not_nullable { table; column } -> Not_nullable { table; column }
@@ -332,12 +411,18 @@ module Table = struct
           | Rewritten error -> Rewritten error
           | Unhandled { table; columns } -> Unhandled { table; columns }
           | Finer_than_column { table; column } -> Finer_than_column { table; column }
+          | Not_injective { table; column; action } -> Not_injective { table; column; action }
+          | Split_reference { table; column; other; other_column } ->
+              Split_reference { table; column; other; other_column }
+          | Small_domain { table; column; low; high } -> Small_domain { table; column; low; high }
+          | Outside_domain { table; column; low; high } -> Outside_domain { table; column; low; high }
+          | Too_long { table; column } -> Too_long { table; column }
         in
         let outcome = match planned [] t.steps with Ok writes -> written writes [@nontail] | Error _ as error -> error in
         match outcome with Ok () -> Ok () | Error (`Mask error) -> Error (`Mask (fresh error))
 end
 
-let resolve { key; script; rules; strict } tables =
+let resolve { key; script; rules; strict } ~relations tables =
   let kind_of (ltype : Ltype.t) : Mask_script.kind option =
     match ltype with
     | String | Bytes | Json | Enum _ | Set _ | Decimal _ -> Some Text
@@ -363,6 +448,70 @@ let resolve { key; script; rules; strict } tables =
     | Set _ -> "set"
     | Geometry -> "geometry"
   in
+  let%bind relations = match rules with [] -> Ok Relations.none | _ :: _ -> relations () in
+  let%bind declared =
+    Base.Result.all
+      (List.map
+         (fun ((database, table, column), (parent_database, parent_table, parent_column)) ->
+           let malformed = Error (`Mask (Malformed (String.concat "." [ database; table; column ]))) in
+           match
+             ( Ident.of_string database,
+               Ident.of_string table,
+               Ident.of_string column,
+               Ident.of_string parent_database,
+               Ident.of_string parent_table,
+               Ident.of_string parent_column )
+           with
+           | Ok database, Ok table, Ok column, Ok parent_database, Ok parent_table, Ok parent_column ->
+               Ok
+                 {
+                   Relations.child = { database; table };
+                   parent = { database = parent_database; table = parent_table };
+                   columns = ((column, parent_column), []);
+                 }
+           | _ -> malformed)
+         (Mask_script.references script))
+  in
+  let relations = { relations with foreign = relations.foreign @ declared } in
+  let domain_of name (field : Schema.Field.t) spec =
+    let column = field.name in
+    let range =
+      match
+        List.find_opt
+          (fun ({ table; column = narrow; _ } : Relations.range) ->
+            Schema.Name.equal table name && String.equal (String.lowercase_ascii (narrow :> string)) (String.lowercase_ascii (column :> string)))
+          relations.ranges
+      with
+      | Some { low; high; _ } -> Some (low, high, `Narrow)
+      | None -> (
+          match field.ltype with
+          | Int8 -> Some (-128L, 127L, `Narrow)
+          | Int16 -> Some (-32768L, 32767L, `Narrow)
+          | Int32 -> Some (-0x8000_0000L, 0x7FFF_FFFFL, `Narrow)
+          | Uint8 -> Some (0L, 255L, `Narrow)
+          | Uint16 -> Some (0L, 65535L, `Narrow)
+          | Uint32 -> Some (0L, 0xFFFF_FFFFL, `Narrow)
+          | Int64 | Uint64 -> Some (Int64.min_int, Int64.max_int, `Wide)
+          | Bool | Float32 | Float64 | Decimal _ | String | Bytes | Json | Date | Year | Unchecked_date
+          | Unchecked_datetime _ | Time _ | Datetime _ | Timestamp _ | Geometry | Enum _ | Set _ ->
+              None)
+    in
+    let unfit () = Error (`Mask (Unfit { table = name; column; action = action_name (Permute spec); ltype = field.ltype })) in
+    match range with
+    | None -> unfit ()
+    | Some (least, most, width) -> (
+        let least = match field.ltype with Uint64 -> 0L | _ -> least in
+        let low, high =
+          match (spec, width) with
+          | Some { low; high }, _ -> (low, high)
+          | None, `Wide -> (1L, 9007199254740991L)
+          | None, `Narrow -> (1L, Int64.div most 2L)
+        in
+        if Int64.compare low least < 0 || Int64.compare high most > 0 then unfit ()
+        else if Int64.unsigned_compare (Int64.sub high low) 999_999L < 0 then
+          Error (`Mask (Small_domain { table = name; column; low; high }))
+        else Ok { low; high })
+  in
   let step (table : Schema.Table.t) (field : Schema.Field.t) index action =
     let name = table.name and column = field.name in
     let unfit () =
@@ -370,6 +519,28 @@ let resolve { key; script; rules; strict } tables =
     in
     let texts f = Ok (Some (Texts { index; field = column; f })) in
     match action with
+    | Permute spec -> (
+        match (field.ltype, spec) with
+        | String, None ->
+            let permutation = Keyed.permutation key ~label:"text" in
+            Ok (Some (Limited_texts { index; field = column; f = (fun text -> Keyed.permute_text permutation text) }))
+        | Bytes, None ->
+            let permutation = Keyed.permutation key ~label:"bytes" in
+            Ok (Some (Limited_texts { index; field = column; f = (fun value -> Keyed.permute_bytes permutation value) }))
+        | _ -> (
+            match domain_of name field spec with
+            | Error _ as error -> error
+            | Ok ({ low; high } as domain) -> (
+                let permutation = Keyed.permutation key ~label:(Printf.sprintf "int:%Ld:%Ld" low high) in
+                let (permute @ portable) value =
+                  if Int64.compare value low < 0 || Int64.compare value high > 0 then None
+                  else Some (Keyed.permute_integer permutation ~low ~high value)
+                in
+                match field.ltype with
+                | Int64 | Uint64 -> Ok (Some (Bounded_int64s { index; field = column; f = permute; domain }))
+                | _ ->
+                    let (f @ portable) value = Option.map Int64.to_int (permute (Int64.of_int value)) in
+                    Ok (Some (Bounded_ints { index; field = column; f; domain })))))
     | Null -> (
         match field.nullability with
         | Nullable -> Ok (Some (Nulls index))
@@ -447,6 +618,10 @@ let resolve { key; script; rules; strict } tables =
     | Keep -> Ok None
     | Custom { text; _ } -> ( match field.ltype with String | Bytes -> texts text | _ -> unfit ())
   in
+  let lower (name : Ident.t) = String.lowercase_ascii (name :> string) in
+  let same_column (table : Schema.Name.t) (column : Ident.t) (table' : Schema.Name.t) (column' : Ident.t) =
+    Schema.Name.equal table table' && String.equal (lower column) (lower column')
+  in
   let rules = Array.of_list rules in
   let uses = Array.make (Array.length rules) 0 in
   let first name ({ name = column; ltype; _ } : Schema.Field.t) =
@@ -459,16 +634,10 @@ let resolve { key; script; rules; strict } tables =
     in
     find 0
   in
-  let strict_uses = Array.make (List.length strict) 0 in
-  let table_masking (table : Schema.Table.t) =
+  let chosen (table : Schema.Table.t) =
     let name = table.name in
     let fields = fst table.fields :: snd table.fields in
-    let keys =
-      match table.key with
-      | Primary (first, rest) | Unique { fields = first, rest; _ } -> first :: rest
-      | Indexed _ | No_key -> []
-    in
-    let%bind () =
+    let%map () =
       match
         List.find_map
           (fun (field : Schema.Field.t) ->
@@ -482,17 +651,207 @@ let resolve { key; script; rules; strict } tables =
       | Some field -> Error (`Mask (Generated_column { table = name; column = field.name }))
       | None -> Ok ()
     in
-    let masked =
-      List.filter_map Fun.id
-        (List.mapi
-           (fun index (field : Schema.Field.t) ->
-             Option.map
-               (fun i ->
-                 uses.(i) <- uses.(i) + 1;
-                 (index, field, rules.(i).action))
-               (first name field))
-           fields)
-    in
+    ( table,
+      List.mapi
+        (fun index (field : Schema.Field.t) ->
+          ( index,
+            field,
+            Option.map
+              (fun i ->
+                uses.(i) <- uses.(i) + 1;
+                rules.(i).action)
+              (first name field) ))
+        fields )
+  in
+  let%bind chosen = Base.Result.all (List.map chosen tables) in
+  let referenced =
+    List.concat_map
+      (fun ({ parent; columns = first, rest; _ } : Relations.foreign) ->
+        List.map (fun (_, column) -> (parent, column)) (first :: rest))
+      relations.foreign
+  in
+  let classes = Hashtbl.create 64 in
+  let node (table : Schema.Name.t) column =
+    String.concat "\000" [ (table.database :> string); (table.table :> string); lower column ]
+  in
+  let rec root node =
+    match Hashtbl.find_opt classes node with
+    | None -> node
+    | Some parent when String.equal parent node -> node
+    | Some parent -> root parent
+  in
+  List.iter
+    (fun ({ child; parent; columns = first, rest } : Relations.foreign) ->
+      List.iter
+        (fun (column, parent_column) ->
+          let a = root (node child column) and b = root (node parent parent_column) in
+          if not (String.equal a b) then Hashtbl.replace classes a b)
+        (first :: rest))
+    relations.foreign;
+  let members =
+    List.concat_map
+      (fun ((table : Schema.Table.t), fields) ->
+        List.map (fun (index, (field : Schema.Field.t), action) -> (root (node table.name field.name), (table, index, field, action))) fields)
+      chosen
+  in
+  let linked =
+    List.filter
+      (fun (root, _) -> List.length (List.filter (fun (other, _) -> String.equal other root) members) > 1)
+      members
+  in
+  let roots = List.sort_uniq String.compare (List.map fst linked) in
+  let%bind propagated =
+    Base.Result.all
+      (List.map
+         (fun root ->
+           let group = List.filter_map (fun (other, member) -> if String.equal other root then Some member else None) linked in
+           let split ((a : Schema.Table.t), _, (field : Schema.Field.t), _) ((b : Schema.Table.t), _, (other : Schema.Field.t), _) =
+             Error (`Mask (Split_reference { table = a.name; column = field.name; other = b.name; other_column = other.name }))
+           in
+           let parent_side ((table : Schema.Table.t), _, (field : Schema.Field.t), _) =
+             List.exists (fun (parent, column) -> same_column table.name field.name parent column) referenced
+           in
+           let shape (_, _, _, action) =
+             match action with
+             | None | Some Keep -> `Identity
+             | Some (Permute spec) -> `Permuted spec
+             | Some Null -> `Nulled
+             | Some (Text _ | Shape | Email | Hash | Source _ | Expression _ | Custom _) -> `Other
+           in
+           let permuted = List.filter (fun member -> match shape member with `Permuted _ -> true | _ -> false) group in
+           match permuted with
+           | [] -> (
+               let others = List.filter (fun member -> match shape member with `Other -> true | _ -> false) group in
+               match others with
+               | ((table, _, (field : Schema.Field.t), _) as changed) :: _ ->
+                   Option.fold ~none:(Ok [])
+                     ~some:(fun other -> split changed other)
+                     (List.find_opt
+                        (fun ((other : Schema.Table.t), _, (column : Schema.Field.t), _) ->
+                          not (same_column table.Schema.Table.name field.name other.name column.name))
+                        group)
+               | [] ->
+                   let unnulled_child (((table : Schema.Table.t), _, (field : Schema.Field.t), _) as parent) =
+                     match shape parent with
+                     | `Nulled when parent_side parent ->
+                         List.find_map
+                           (fun ({ child; parent = referred; columns = first, rest } : Relations.foreign) ->
+                             List.find_map
+                               (fun (child_column, parent_column) ->
+                                 if same_column referred parent_column table.name field.name then
+                                   List.find_opt
+                                     (fun (((other : Schema.Table.t), _, (column : Schema.Field.t), _) as member) ->
+                                       same_column other.name column.name child child_column
+                                       && match shape member with `Nulled -> false | _ -> true)
+                                     group
+                                   |> Option.map (fun child -> (parent, child))
+                                 else None)
+                               (first :: rest))
+                           relations.foreign
+                     | _ -> None
+                   in
+                   Option.fold (List.find_map unnulled_child group) ~none:(Ok []) ~some:(fun (parent, child) ->
+                       split parent child))
+           | source :: _ ->
+               let spec = match shape source with `Permuted spec -> spec | _ -> None in
+               let resolved ((table : Schema.Table.t), _, (field : Schema.Field.t), _) =
+                 match (field.ltype, spec) with
+                 | String, None -> Ok `Text
+                 | Bytes, None -> Ok `Bytes
+                 | _ -> Result.map (fun domain -> `Integers domain) (domain_of table.name field spec)
+               in
+               let%bind wanted = resolved source in
+               let%bind () =
+                 Base.Result.all_unit
+                   (List.map
+                      (fun member ->
+                        match shape member with
+                        | `Identity | `Permuted _ ->
+                            let%bind found = resolved member in
+                            if found = wanted then Ok () else split source member
+                        | `Nulled | `Other -> Ok ())
+                      group)
+               in
+               let conflict =
+                 List.find_opt
+                   (fun member ->
+                     match (member, shape member) with
+                     | (_, _, _, Some Keep), _ -> true
+                     | _, `Identity -> false
+                     | _, `Permuted spec' -> spec' <> spec
+                     | _, `Nulled -> parent_side member
+                     | _, `Other -> true)
+                   group
+               in
+               Option.fold conflict
+                 ~some:(fun member -> split source member)
+                 ~none:
+                   (Ok
+                      (List.filter_map
+                         (fun ((table : Schema.Table.t), _, (field : Schema.Field.t), action) ->
+                           match action with
+                           | None -> Some ((table.name, field.name), Permute spec)
+                           | Some _ -> None)
+                         group)))
+         roots)
+  in
+  let propagated = List.concat propagated in
+  let final =
+    List.map
+      (fun ((table : Schema.Table.t), fields) ->
+        ( table,
+          List.filter_map
+            (fun (index, (field : Schema.Field.t), action) ->
+              match action with
+              | Some action -> Some (index, field, action, `Ruled)
+              | None ->
+                  Option.map
+                    (fun action -> (index, field, action, `Propagated))
+                    (List.find_map
+                       (fun ((table', column), action) ->
+                         if same_column table.name field.name table' column then Some action else None)
+                       propagated))
+            fields ))
+      chosen
+  in
+  let injective (field : Schema.Field.t) = function
+    | Keep | Permute _ -> `Injective
+    | Null -> ( match field.nullability with Nullable -> `Injective | Not_null -> `Merging)
+    | Text _ | Shape | Email | Hash | Source _ | Expression _ | Custom _ -> `Merging
+  in
+  let%bind () =
+    Base.Result.all_unit
+      (List.map
+         (fun ((table : Schema.Table.t), assigned) ->
+           let keys =
+             let read =
+               match table.key with
+               | Primary (first, rest) | Unique { fields = first, rest; _ } ->
+                   [ List.map (fun (field : Schema.Field.t) -> field.name) (first :: rest) ]
+               | Indexed _ | No_key -> []
+             in
+             read
+             @ List.filter_map
+                 (fun ({ table = owner; columns = first, rest } : Relations.unique) ->
+                   if Schema.Name.equal owner table.name then Some (first :: rest) else None)
+                 relations.unique
+           in
+           match
+             List.find_opt
+               (fun (_, (field : Schema.Field.t), action, _) ->
+                 let keyed = List.exists (List.exists (fun column -> String.equal (lower column) (lower field.name))) keys in
+                 match injective field action with `Merging -> keyed | `Injective -> false)
+               assigned
+           with
+           | Some (_, field, action, _) ->
+               Error (`Mask (Not_injective { table = table.name; column = field.name; action = action_name action }))
+           | None -> Ok ())
+         final)
+  in
+  let strict_uses = Array.make (List.length strict) 0 in
+  let table_masking ((table : Schema.Table.t), assigned) =
+    let name = table.name in
+    let fields = fst table.fields :: snd table.fields in
     let%bind () =
       let watched =
         List.filteri
@@ -507,7 +866,7 @@ let resolve { key; script; rules; strict } tables =
       let unhandled =
         List.filter
           (fun (field : Schema.Field.t) ->
-            not (List.exists (fun (_, (taken : Schema.Field.t), _) -> Ident.equal taken.name field.name) masked))
+            not (List.exists (fun (_, (taken : Schema.Field.t), _, _) -> Ident.equal taken.name field.name) assigned))
           fields
       in
       match (watched, unhandled) with
@@ -516,25 +875,15 @@ let resolve { key; script; rules; strict } tables =
             (`Mask (Unhandled { table = name; columns = List.map (fun (field : Schema.Field.t) -> field.name) unhandled }))
       | [], _ | _, [] -> Ok ()
     in
-    let masked =
-      List.filter (fun (_, _, action) -> match action with Keep -> false | _ -> true) masked
-    in
-    let%bind () =
-      match
-        List.find_opt
-          (fun (_, (field : Schema.Field.t), _) ->
-            List.exists (fun (key : Schema.Field.t) -> Ident.equal key.name field.name) keys)
-          masked
-      with
-      | Some (_, field, _) -> Error (`Mask (Key_column { table = name; column = field.name }))
-      | None -> Ok ()
-    in
+    let masked = List.filter (fun (_, _, action, _) -> match action with Keep -> false | _ -> true) assigned in
     let%bind () =
       match (masked, table.generated) with
       | _ :: _, _ :: _ -> Error (`Mask (Generated_values name))
       | [], _ | _, [] -> Ok ()
     in
-    let%map steps = Base.Result.all (List.map (fun (index, field, action) -> step table field index action) masked) in
+    let%map steps =
+      Base.Result.all (List.map (fun (index, field, action, _) -> step table field index action) masked)
+    in
     match masked with
     | [] -> Table.Unmasked
     | _ :: _ ->
@@ -545,15 +894,21 @@ let resolve { key; script; rules; strict } tables =
             steps = List.filter_map Fun.id steps;
             sources =
               List.filter_map
-                (fun (_, (field : Schema.Field.t), action) ->
+                (fun (_, (field : Schema.Field.t), action, _) ->
                   match action with
                   | Source expression -> Some (field.name, expression)
-                  | Null | Text _ | Shape | Email | Hash | Expression _ | Keep | Custom _ -> None)
+                  | Permute _ | Null | Text _ | Shape | Email | Hash | Expression _ | Keep | Custom _ -> None)
                 masked;
-            masked = List.map (fun (_, (field : Schema.Field.t), action) -> (field.name, action_name action)) masked;
+            masked =
+              List.map
+                (fun (_, (field : Schema.Field.t), action, origin) ->
+                  match origin with
+                  | `Ruled -> (field.name, action_name action)
+                  | `Propagated -> (field.name, action_name action ^ " (a reference)"))
+                masked;
           }
   in
-  let%bind masking = Base.Result.all (List.map table_masking tables) in
+  let%bind masking = Base.Result.all (List.map table_masking final) in
   match
     ( Base.Array.findi uses ~f:(fun _ uses -> uses = 0),
       Base.List.findi strict ~f:(fun i _ -> strict_uses.(i) = 0) )

@@ -17,6 +17,7 @@ type unsuitable =
   | Cfg of Quiver_innodb.Cfg.error
   | Layout of Quiver_innodb.Layout.error
   | Space of Quiver_innodb.Tablespace.error
+  | Masked_key
 [@@deriving sexp_of ~portable]
 
 type builder = Quiver | Server [@@deriving sexp_of ~portable]

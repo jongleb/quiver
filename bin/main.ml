@@ -172,6 +172,40 @@ let () =
              Quiver_core.Schema.Name.pp table
              (String.concat ", " (List.map (fun (column : Quiver_core.Ident.t) -> (column :> string)) columns))
              Quiver_core.Schema.Name.pp table Quiver_core.Schema.Name.pp table)
+    | Error (`Mask (Quiver_core.Mask.Not_injective { table; column; action })) ->
+        told
+          (Format.asprintf
+             "masking %a.%s: %s can give two values one, and the column is in a primary or unique \
+              key; use permute"
+             Quiver_core.Schema.Name.pp table (column :> string) action)
+    | Error (`Mask (Quiver_core.Mask.Split_reference { table; column; other; other_column })) ->
+        told
+          (Format.asprintf
+             "masking %a.%s and %a.%s differently, though foreign keys tie them: references would \
+              point nowhere; permute one of them and leave the others to follow, or give all the \
+              same permute"
+             Quiver_core.Schema.Name.pp table (column :> string) Quiver_core.Schema.Name.pp other
+             (other_column :> string))
+    | Error (`Mask (Quiver_core.Mask.Unfit { table; column; action; ltype })) ->
+        let hint =
+          if String.starts_with ~prefix:"permute" action then " (a permutation's domain must lie within the column's type)"
+          else ""
+        in
+        told
+          (Format.asprintf "masking %a.%s: %s gives no value of its type %a%s" Quiver_core.Schema.Name.pp table
+             (column :> string) action Sexplib0.Sexp.pp (Quiver_core.Ltype.sexp_of_t ltype) hint)
+    | Error (`Mask (Quiver_core.Mask.Small_domain { table; column; low; high })) ->
+        told
+          (Format.asprintf
+             "masking %a.%s: a permutation from %Ld to %Ld has fewer than a million values, too few \
+              to hide one"
+             Quiver_core.Schema.Name.pp table (column :> string) low high)
+    | Error (`Mask (Quiver_core.Mask.Outside_domain { table; column; low; high })) ->
+        told
+          (Format.asprintf
+             "masking %a.%s: a value lies outside the permutation's %Ld..%Ld; give the rule \
+              permute:LOW..HIGH holding every value"
+             Quiver_core.Schema.Name.pp table (column :> string) low high)
     | Error error -> failed (Dump.sexp_of_error error)
   in
   let files output { consume } =
@@ -904,9 +938,10 @@ let () =
       & opt (some string) None
       & described [ "mask-secret" ] ~docv:"SECRET"
           ~doc:
-            "Key $(b,shape), $(b,email), $(b,hash) and the keyed functions of $(b,expr:) with \
-             $(docv), so a value masks the same way in every column and every run; a random key of \
-             this run when not given.")
+            "Key $(b,permute), $(b,shape), $(b,email), $(b,hash) and the keyed functions of \
+             $(b,expr:) with $(docv), so a value masks the same way in every column and every run; \
+             a random key of this run when not given. Whoever holds $(docv) can undo \
+             $(b,permute): keep it apart from the copies, one per environment.")
   in
   let reading =
     let open Cmdliner in
@@ -1071,14 +1106,22 @@ let () =
                     "Mask the column's values before they leave the reader, repeatable; a column \
                      takes the first rule naming it, and a rule naming no column of the dump is \
                      an error. Names take $(b,*) and $(b,?), or backquotes for a name as written. \
-                     $(docv) is $(b,null); $(b,text:)VALUE; $(b,shape) (each letter and digit \
-                     replaced by a keyed one of its kind, the rest kept); $(b,email) (shape \
-                     before the last @, the domain kept); $(b,hash) (a keyed digest of the same \
-                     length, or an integer of the column's type); $(b,sql:)EXPRESSION, \
-                     evaluated by the source for each row and cast to the column's type; or \
-                     $(b,expr:)EXPRESSION of the masking language (see $(b,quiver mask --help)). \
-                     NULL stays NULL but under $(b,null), $(b,sql:) and $(b,expr:). Key columns \
-                     cannot be masked.")
+                     $(docv) is $(b,permute) (a keyed bijection, FF1 of NIST SP 800-38G: an \
+                     integer to another from 1 to half its type's largest, or to 2^53 - 1 for \
+                     BIGINT; text keeping each character's kind, case and place; binary of the \
+                     same length), $(b,permute:)LOW..HIGH (integers among those); $(b,null); \
+                     $(b,text:)VALUE; $(b,shape) (each letter and digit replaced by a keyed one \
+                     of its kind, the rest kept); $(b,email) (shape before the last @, the domain \
+                     kept); $(b,hash) (a keyed digest of the same length, or an integer of the \
+                     column's type); $(b,sql:)EXPRESSION, evaluated by the source for each row \
+                     and cast to the column's type; or $(b,expr:)EXPRESSION of the masking \
+                     language (see $(b,quiver mask --help)). NULL stays NULL but under $(b,null), \
+                     $(b,sql:) and $(b,expr:). A column of a primary or unique key takes only \
+                     $(b,permute), $(b,keep) or $(b,null) where it may be NULL, since another \
+                     action can give two values one. A $(b,permute) spreads along the foreign keys \
+                     of the source to every column tied to the one it masks that no rule names, \
+                     so references keep pointing at their rows; tied columns masked differently \
+                     are an error.")
           $ Arg.(
               value & opt_all file []
               & described [ "mask-script" ] ~docv:"FILE"
@@ -1782,6 +1825,12 @@ let () =
                   json, integer, decimal, float, date, datetime, timestamp, time, year, enum, set, \
                   geometry. A column takes the first rule naming it." );
              `I ("(keep SELECTOR)", "Its columns are copied as they are, and count as decided.");
+             `I
+               ( "(permute SELECTOR [LOW HIGH])",
+                 "As $(b,--mask DB.TABLE.COLUMN=permute): a keyed bijection, spreading along foreign keys." );
+             `I
+               ( "(references \"DB.TABLE.COLUMN\" \"DB.TABLE.COLUMN\")",
+                 "The first column refers to the second though no foreign key says so." );
              `I
                ( "(strict \"DB.TABLE\" …)",
                  "Every column of these tables must be masked or kept by some rule, or nothing is read." );

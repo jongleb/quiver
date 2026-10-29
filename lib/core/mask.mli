@@ -1,8 +1,16 @@
 @@ portable
 
+type domain = { low : int64; high : int64 }
+(** The integers a permutation moves among, both ends included. *)
+
 (** What a rule puts in place of a column's values. A NULL stays NULL under every
     action but [Null] and [Source]. *)
 type action =
+  | Permute of domain option
+      (** A keyed bijection: two values never give one, so keys stay keys, and a rule on a key
+          masks every column a foreign key ties to it the same way. An integer goes to another
+          of the domain (by default from 1 to half the type's largest, or [2^53 - 1] for
+          [BIGINT]); text keeps each character's kind, case and place; binary its length. *)
   | Null  (** NULL in every row. *)
   | Text of string  (** This value in every row: text, binary, an [ENUM] member or [SET] members. *)
   | Shape
@@ -24,8 +32,6 @@ type error =
   | Unknown_action of string @@ aliased
   | Unused of string @@ aliased
       (** No column of the dump takes the rule: it names none, or earlier rules take them all. *)
-  | Key_column of { table : Schema.Name.t @@ aliased; column : Ident.t @@ aliased }
-      (** A column of the key the table is read and ordered by. *)
   | Generated_column of { table : Schema.Name.t @@ aliased; column : Ident.t @@ aliased }
       (** Computed by the target, never written back. *)
   | Generated_values of Schema.Name.t @@ aliased
@@ -62,6 +68,31 @@ type error =
       (** Columns of a strict table no rule takes, neither masked nor kept. *)
   | Finer_than_column of { table : Schema.Name.t @@ aliased; column : Ident.t @@ aliased }
       (** An expression's time has more fractional digits than the column keeps. *)
+  | Not_injective of { table : Schema.Name.t @@ aliased; column : Ident.t @@ aliased; action : string @@ aliased }
+      (** A column of a primary or unique key under an action that can give two values one. *)
+  | Split_reference of {
+      table : Schema.Name.t @@ aliased;
+      column : Ident.t @@ aliased;
+      other : Schema.Name.t @@ aliased;
+      other_column : Ident.t @@ aliased;
+    }
+      (** Two columns a foreign key ties, masked differently: references would point nowhere. *)
+  | Small_domain of {
+      table : Schema.Name.t @@ aliased;
+      column : Ident.t @@ aliased;
+      low : int64 @@ aliased;
+      high : int64 @@ aliased;
+    }
+      (** A permutation of fewer than a million values: too few to hide one. *)
+  | Outside_domain of {
+      table : Schema.Name.t @@ aliased;
+      column : Ident.t @@ aliased;
+      low : int64 @@ aliased;
+      high : int64 @@ aliased;
+    }
+      (** A value the column's permutation does not move. *)
+  | Too_long of { table : Schema.Name.t @@ aliased; column : Ident.t @@ aliased }
+      (** A value with more letters and digits, or bytes, than a permutation takes. *)
 [@@deriving sexp_of]
 
 type rule [@@deriving sexp_of]
@@ -69,8 +100,9 @@ type rule [@@deriving sexp_of]
 
 val rule :
   string -> (rule, [> `Mask of error | `Mask_script of Mask_script.error | `Pattern of Pattern.error ]) result
-(** [DATABASE.TABLE.COLUMN=ACTION], where [ACTION] is [null], [text:VALUE], [shape], [email],
-    [hash], [keep], [sql:EXPRESSION] or [expr:EXPRESSION] of {!Mask_script}. *)
+(** [DATABASE.TABLE.COLUMN=ACTION], where [ACTION] is [permute], [permute:LOW..HIGH], [null],
+    [text:VALUE], [shape], [email], [hash], [keep], [sql:EXPRESSION] or [expr:EXPRESSION] of
+    {!Mask_script}. *)
 
 val scripted : Mask_script.t -> (rule list, [> `Pattern of Pattern.error ]) result
 (** The script's [(mask …)] and [(keep …)] forms, in order; a [where] selector takes only
@@ -107,5 +139,11 @@ module Table : sig
   (** Rewrites the masked columns in place. *)
 end
 
-val resolve : t -> Schema.Table.t list -> (Table.t list, [> `Mask of error ]) result
-(** Each table's masking, in order, once every rule takes a column. *)
+val resolve :
+  t ->
+  relations:(unit -> (Relations.t, ([> `Mask of error ] as 'e)) result) ->
+  Schema.Table.t list ->
+  (Table.t list, 'e) result
+(** Each table's masking, in order, once every rule takes a column. A [Permute] spreads to every
+    column of the tables that foreign keys tie to a column it takes and no rule names; the
+    relations are read only when there are rules. *)

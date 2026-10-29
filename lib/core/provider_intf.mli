@@ -57,6 +57,11 @@ module type S = sig
       | `Ident of Ident.error ] )
     result
 
+  val relations :
+    connections -> (Relations.t, [> `Provider of error | `Ident of Ident.error ]) result
+  (** The foreign keys, unique keys and narrow integer columns of every table outside the
+      system schemas. *)
+
   val plan :
     connections ->
     Schema.t ->

@@ -350,6 +350,11 @@ let key keyless_read ~(fields : Quiver_core.Schema.Field.t list) ~keyable indexe
          | [] -> false)
        groups)
 
+let name database table =
+  let%bind database = Quiver_core.Ident.of_string database in
+  let%bind table = Quiver_core.Ident.of_string table in
+  Ok { Quiver_core.Schema.Name.database; table }
+
 let introspect connections (filter : Quiver_core.Filter.t) =
   let tables, (columns, indexes) =
     Quiver_core.Concurrent.both
@@ -362,11 +367,6 @@ let introspect connections (filter : Quiver_core.Filter.t) =
   let%bind tables = provider tables
   and columns = provider columns
   and indexes = provider indexes in
-  let name database table =
-    let%bind database = Quiver_core.Ident.of_string database in
-    let%bind table = Quiver_core.Ident.of_string table in
-    Ok { Quiver_core.Schema.Name.database; table }
-  in
   let number =
     Option.fold ~none:0 ~some:(fun n ->
         Option.value ~default:0 (int_of_string_opt n))
@@ -621,6 +621,97 @@ type planning =
   | `Chunk of Quiver_core.Chunk.error
   | `Key of Quiver_core.Key.error
   | `Ident of Quiver_core.Ident.error ]
+
+let relations connections =
+  let foreign, (columns, indexes) =
+    Quiver_core.Concurrent.both
+      (fun () -> fetch connections Foreign_keys)
+      (fun () ->
+        Quiver_core.Concurrent.both
+          (fun () -> fetch connections Columns)
+          (fun () -> fetch connections (Indexes connections.server)))
+  in
+  let%bind foreign = provider foreign and columns = provider columns and indexes = provider indexes in
+  let grouped rows =
+    let rec go acc = function
+      | [] -> List.rev acc
+      | (group, item) :: rest -> (
+          match acc with
+          | (seen, items) :: earlier when Stdlib.( = ) seen group -> go ((seen, item :: items) :: earlier) rest
+          | _ -> go ((group, [ item ]) :: acc) rest)
+    in
+    List.map (fun (group, items) -> (group, List.rev items)) (go [] rows)
+  in
+  let%bind foreign =
+    Base.Result.all
+      (List.map
+         (function
+           | [ Some database; Some table; Some constraint_; Some column; Some parent_database; Some parent_table;
+               Some parent_column ] ->
+               let%bind child = name database table and parent = name parent_database parent_table in
+               let%bind column = Quiver_core.Ident.of_string column
+               and parent_column = Quiver_core.Ident.of_string parent_column in
+               Ok ((child, parent, constraint_), (column, parent_column))
+           | _ -> unexpected Foreign_keys)
+         foreign)
+  in
+  let%bind unique =
+    Base.Result.all
+      (List.map
+         (function
+           | [ Some database; Some table; Some index; column; Some non_unique; _; _; _ ] ->
+               let%bind table = name database table in
+               let%map column =
+                 Option.fold ~none:(Ok None)
+                   ~some:(fun column -> Result.map Option.some (Quiver_core.Ident.of_string column))
+                   column
+               in
+               let uniqueness = if String.equal non_unique "0" then `Unique else `Repeating in
+               ((table, index, uniqueness), column)
+           | _ -> unexpected (Indexes connections.server))
+         indexes)
+  in
+  let%bind ranges =
+    Base.Result.all
+      (List.filter_map
+         (function
+           | Some database :: Some table :: Some column :: Some data_type :: Some column_type :: _ :: precision :: _ -> (
+               let range low high =
+                 Some
+                   (let%bind table = name database table in
+                    let%map column = Quiver_core.Ident.of_string column in
+                    { Quiver_core.Relations.table; column; low; high })
+               in
+               let unsigned = Base.List.mem (String.split_on_char ' ' column_type) "unsigned" ~equal:String.equal in
+               match (String.lowercase_ascii data_type, unsigned) with
+               | "mediumint", true -> range 0L 16777215L
+               | "mediumint", false -> range (-8388608L) 8388607L
+               | "bit", _ -> (
+                   match Option.bind precision int_of_string_opt with
+                   | Some width when width < 64 -> range 0L (Int64.pred (Int64.shift_left 1L width))
+                   | Some _ | None -> None)
+               | _ -> None)
+           | _ -> Some (unexpected Columns))
+         columns)
+  in
+  Ok
+    {
+      Quiver_core.Relations.foreign =
+        List.filter_map
+          (fun ((child, parent, _), pairs) ->
+            match pairs with
+            | first :: rest -> Some { Quiver_core.Relations.child; parent; columns = (first, rest) }
+            | [] -> None)
+          (grouped foreign);
+      unique =
+        List.filter_map
+          (fun ((table, _, unique), columns) ->
+            match (unique, Base.Option.all columns) with
+            | `Unique, Some (first :: rest) -> Some { Quiver_core.Relations.table; columns = (first, rest) }
+            | `Unique, (Some [] | None) | `Repeating, _ -> None)
+          (grouped unique);
+      ranges;
+    }
 
 let plan connections (schema : Quiver_core.Schema.t)
     ({ chunk_bytes } : Quiver_core.Plan_opts.t) =

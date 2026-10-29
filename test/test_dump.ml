@@ -128,7 +128,7 @@ module Recorder = struct
     logged t (fun log -> log.databases <- database :: log.databases);
     Ok ()
 
-  let table t ({ name; _ } : Schema.Table.t) ~ddl:_ ~parts =
+  let table t ({ name; _ } : Schema.Table.t) ~ddl:_ ~parts ~order:_ =
     logged t (fun log ->
         (match List.mem name.database log.databases with
         | true -> ()
@@ -494,6 +494,7 @@ let holds
         let opened n = n
         let disconnect _ = ()
         let introspect _ _ = Schema.make schema
+        let relations _ = Ok Relations.none
         let plan _ (read : Schema.t) _ =
           Ok
             (List.filter

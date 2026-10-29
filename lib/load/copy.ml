@@ -148,6 +148,7 @@ type declaration = {
   table : Quiver_core.Schema.Table.t;
   ddl : string;
   parts : int;
+  order : Quiver_core.Schema.order;
   declared : (unit, error) result Await.Await.Ivar.t;
 }
 
@@ -257,7 +258,7 @@ let on_idle_loader t work =
   Await.Await.Mpmc_queue.push t.idle loader;
   result
 
-let declare t { table = { name; _ } as table; ddl; parts; declared } =
+let declare t { table = { name; _ } as table; ddl; parts; order; declared } =
   let into = { name with database = Load.renamed t.target name.database } in
   let remember foreign =
     match foreign with
@@ -340,10 +341,13 @@ let declare t { table = { name; _ } as table; ddl; parts; declared } =
         Ok ()
   in
   let created =
-    match t.mode with
-    | Physical_at { datadir; collations; builder; sorting } when parts > 0 ->
+    match (t.mode, order) with
+    | Physical_at _, Masked_key when parts > 0 ->
+        Portable.Atomic.update t.fallbacks ~pure_f:(fun fallbacks -> (name, Physical.Masked_key) :: fallbacks);
+        plain ()
+    | Physical_at { datadir; collations; builder; sorting }, Key_order when parts > 0 ->
         physical datadir collations builder sorting
-    | Physical_at _ | Plain -> plain ()
+    | (Physical_at _ | Plain), (Key_order | Masked_key) -> plain ()
   in
   Result.iter_error
     (fun error ->
@@ -561,11 +565,11 @@ let database t database ~ddl =
      Quiver_core.Guarded.hold t.control (fun control ->
          run control (Load.create_database target database ddl)))
 
-let table t ({ name; _ } as table : Quiver_core.Schema.Table.t) ~ddl ~parts =
+let table t ({ name; _ } as table : Quiver_core.Schema.Table.t) ~ddl ~parts ~order =
   let declared = Await.Await.Ivar.create () in
   ignore (Portable_lockfree_htbl.set t.declared ~key:name ~data:declared);
   Portable.Atomic.update t.declaring ~pure_f:(fun declaring -> declared :: declaring);
-  let declaration = { table; ddl; parts; declared } in
+  let declaration = { table; ddl; parts; order; declared } in
   match Quiver_core.Pool.submit t.preparing ~priority:table.estimate.bytes declaration with
   | Queued -> Ok ()
   | Unqueued ->

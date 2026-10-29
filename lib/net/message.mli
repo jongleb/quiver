@@ -24,7 +24,7 @@ type control =
       chunks : int;  (** At most so many chunks begun and not answered. *)
     }
   | Database of { name : Quiver_core.Ident.t; ddl : string }
-  | Table of { table : Quiver_core.Schema.Table.t; ddl : string; parts : int }
+  | Table of { table : Quiver_core.Schema.Table.t; ddl : string; parts : int; order : Quiver_core.Schema.order }
   | Grown of { table : Quiver_core.Schema.Name.t }
       (** The table has one part more than announced. *)
   | Objects of {

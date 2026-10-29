@@ -19,6 +19,7 @@ let () =
       ("dump", Test_dump.tests);
       ("mask", Test_mask.tests);
       ("mask script", Test_mask_script.tests);
+      ("permute", Test_permute.tests);
       ("docs", Test_docs.tests);
       ("hostile", Test_hostile.tests);
       ("protection", Test_protection.tests);

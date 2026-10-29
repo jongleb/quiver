@@ -133,7 +133,7 @@ module Recorder = struct
   let format _ = Output_format.Sql
   let database _ _ ~ddl:_ = Ok ()
 
-  let table t ({ name; _ } : Schema.Table.t) ~ddl:_ ~parts:_ =
+  let table t ({ name; _ } : Schema.Table.t) ~ddl:_ ~parts:_ ~order:_ =
     match t.refuse with
     | Some (Creating refused) when Schema.Name.equal refused name ->
         Error (`Sink (Refused_table name))
@@ -596,7 +596,7 @@ let property
     (fun n parts ->
       ignore
         (Quiver_net.Remote.table agent (table n) ~ddl:""
-           ~parts:(List.length parts)))
+           ~parts:(List.length parts) ~order:Key_order))
     tables;
   let jobs =
     Array.of_list

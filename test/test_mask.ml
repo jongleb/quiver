@@ -274,7 +274,7 @@ let masked_by asks rows =
              (action_of asked))
          (List.tl columns) asks)
   in
-  match Mask.resolve (Mask.make key ~script:Mask_script.empty ~strict:[] rules) [ table ] with
+  match Mask.resolve (Mask.make key ~script:Mask_script.empty ~strict:[] rules) ~relations:(fun () -> Ok Relations.none) [ table ] with
   | Error (`Mask error) -> Error error
   | Ok [ mask ] ->
       with_batch
@@ -366,7 +366,7 @@ let same_values_mask_alike =
       let masked secret action =
         let table = Support.table [ ("id", Int64, Not_null); ("s", String, Nullable) ] in
         let rule = ok action (Mask.rule ("db.t.s=" ^ action)) in
-        match Mask.resolve (Mask.make (Keyed.of_secret secret) ~script:Mask_script.empty ~strict:[] [ rule ]) [ table ] with
+        match Mask.resolve (Mask.make (Keyed.of_secret secret) ~script:Mask_script.empty ~strict:[] [ rule ]) ~relations:(fun () -> Ok Relations.none) [ table ] with
         | Ok [ mask ] ->
             with_batch [ Int64; String ]
               (List.mapi (fun id text -> [ Big (Int64.of_int id); Text text ]) (texts @ texts))
@@ -408,11 +408,19 @@ type table_case = {
 type rule_case = { database : string; table : string; column : string; action : string }
 [@@deriving sexp_of]
 
+(** A foreign key of a resolve scenario: a child column and the parent column it refers to. *)
+type link_case = { child : (string * string) * string; parent : (string * string) * string } [@@deriving sexp_of]
+
+let table_names = [ ("d1", "t1"); ("d1", "t2"); ("d2", "t1") ]
+
 let resolve_scenario =
   QCheck2.Gen.(
     let ltype =
-      oneof_list
-        Ltype.[ Int32; Int64; Uint8; String; Bytes; Json; Date; Enum [ "x"; "y" ]; Set [ "x"; "y" ]; Float64 ]
+      oneof_weighted
+        [
+          (6, oneof_list Ltype.[ Int32; Int64; String ]);
+          (4, oneof_list Ltype.[ Uint8; Bytes; Json; Date; Enum [ "x"; "y" ]; Set [ "x"; "y" ]; Float64 ]);
+        ]
     in
     let field name =
       let* ltype = ltype and* nullability = oneof_list [ Schema.Field.Nullable; Not_null ] in
@@ -421,7 +429,8 @@ let resolve_scenario =
     let table_case name =
       let* count = int_range 1 4 in
       let* fields = flatten_list (List.map field (Base.List.take [ "a"; "b"; "c"; "d" ] count)) in
-      let* key = oneof_list [ `Primary; `Unique; `Indexed; `None ] and* generated = bool in
+      let* key = oneof_list [ `Primary; `Unique; `Indexed; `None ]
+      and* generated = oneof_weighted [ (5, pure false); (1, pure true) ] in
       let fields =
         match (key, fields) with
         | `None, _ | _, [] -> fields
@@ -431,22 +440,70 @@ let resolve_scenario =
     in
     let* tables =
       let* count = int_range 1 3 in
-      flatten_list
-        (List.map table_case (Base.List.take [ ("d1", "t1"); ("d1", "t2"); ("d2", "t1") ] count))
+      flatten_list (List.map table_case (Base.List.take table_names count))
+    in
+    let columns = List.concat_map (fun case -> List.map (fun (column, _, _) -> (case.name, column)) case.fields) tables in
+    let* unique = list_size (int_bound 2) (oneof_list columns) in
+    let parents =
+      unique
+      @ List.filter_map
+          (fun case ->
+            match case.key with
+            | `Primary | `Unique ->
+                let column, _, _ = List.hd case.fields in
+                Some (case.name, column)
+            | `Indexed | `None -> None)
+          tables
+    in
+    let* links =
+      match parents with
+      | [] -> pure []
+      | _ :: _ ->
+          let typed column = Option.map (fun (_, ltype, _) -> ltype) (List.find_map (fun case -> if case.name = fst column then List.find_opt (fun (c, _, _) -> String.equal c (snd column)) case.fields else None) tables) in
+          let link =
+            let* parent = oneof_list parents in
+            let alike = List.filter (fun column -> column <> parent && typed column = typed parent) columns in
+            let* child =
+              match alike with
+              | [] -> oneof_list columns
+              | _ :: _ -> oneof_weighted [ (4, oneof_list alike); (1, oneof_list columns) ]
+            in
+            pure { child; parent }
+          in
+          oneof_weighted [ (1, pure []); (4, list_size (int_range 1 3) link) ]
     in
     let* rules =
-      list_size (int_range 1 4)
-        (let* database = oneof_list [ "d1"; "d2"; "*"; "d?" ]
-         and* table = oneof_list [ "t1"; "t2"; "*"; "x" ]
-         and* column = oneof_list [ "a"; "B"; "c"; "g"; "*"; "?" ]
-         and* action = oneof_list [ "null"; "text:x"; "text:x,y"; "text:z"; "shape"; "email"; "hash"; "sql:1"; "keep" ] in
+      let linked = List.concat_map (fun { child; parent } -> [ child; parent ]) links in
+      let named =
+        let* (database, table), column =
+          match linked with
+          | [] -> oneof_list columns
+          | _ :: _ -> oneof_weighted [ (1, oneof_list columns); (1, oneof_list linked) ]
+        in
+        pure (database, table, column)
+      in
+      let loose =
+        let* database = oneof_list [ "d1"; "d2"; "*"; "d?" ]
+        and* table = oneof_list [ "t1"; "t2"; "*"; "x" ]
+        and* column = oneof_list [ "a"; "B"; "c"; "g"; "*"; "?" ] in
+        pure (database, table, column)
+      in
+      list_size (int_range 1 3)
+        (let* database, table, column = oneof_weighted [ (5, named); (1, loose) ]
+         and* action =
+           oneof_weighted
+             [
+               (6, oneof_list [ "null"; "text:x"; "text:x,y"; "text:z"; "shape"; "email"; "hash"; "sql:1"; "keep" ]);
+               (8, oneof_list [ "permute"; "permute"; "permute:1..2000000"; "permute:1..10" ]);
+             ]
+         in
          pure { database; table; column; action })
     in
     let* strict =
       oneof_weighted
-        [ (4, pure []); (1, list_size (int_range 1 2) (oneof_list [ "d1.t1"; "d1.*"; "*.*"; "d9.*" ])) ]
+        [ (8, pure []); (1, list_size (int_range 1 2) (oneof_list [ "d1.t1"; "d1.*"; "*.*"; "d9.*" ])) ]
     in
-    pure (tables, rules, strict))
+    pure (tables, unique, links, rules, strict))
 
 let schema_table { name = database, table; fields; key; generated } =
   let fields = List.map (fun (name, ltype, nullability) -> { Schema.Field.name = Support.ident name; ltype; nullability }) fields in
@@ -466,15 +523,29 @@ let schema_table { name = database, table; fields; key; generated } =
        ~name:{ database = Support.ident database; table = Support.ident table }
        ~fields ~generated ~key ~estimate:{ rows = 0; bytes = 0 })
 
+let relations_of unique links =
+  let name (database, table) = { Schema.Name.database = Support.ident database; table = Support.ident table } in
+  {
+    Relations.foreign =
+      List.map
+        (fun { child = child, column; parent = parent, parent_column } ->
+          { Relations.child = name child; parent = name parent; columns = ((Support.ident column, Support.ident parent_column), []) })
+        links;
+    unique = List.map (fun (table, column) -> { Relations.table = name table; columns = (Support.ident column, []) }) unique;
+    ranges = [];
+  }
+
 let resolve_is_sound_and_complete =
-  QCheck2.Test.make ~count:3000
-    ~name:"resolving rules fails only for a reason the tables and rules show, and masks the first rule's columns otherwise"
-    ~print:(fun case -> Sexplib0.Sexp.to_string_hum ([%sexp_of: table_case list * rule_case list * string list] case))
+  QCheck2.Test.make ~count:10000
+    ~name:
+      "resolving rules fails only for a reason the tables, keys and rules show, and masks the first rule's columns and \
+       the references a permutation spreads to otherwise"
+    ~print:(fun case ->
+      Sexplib0.Sexp.to_string_hum
+        ([%sexp_of: table_case list * ((string * string) * string) list * link_case list * rule_case list * string list] case))
     resolve_scenario
-    (fun (tables, rules, strict) ->
-      let names text name =
-        glob_model (chars text) (chars name)
-      in
+    (fun (tables, unique, links, rules, strict) ->
+      let names text name = glob_model (chars text) (chars name) in
       let first (database, table) column =
         Base.List.findi rules ~f:(fun _ rule ->
             names rule.database database && names rule.table table
@@ -488,10 +559,129 @@ let resolve_is_sound_and_complete =
         List.concat_map
           (fun case ->
             List.filter_map
-              (fun ((column, _, _, _) as entry) ->
-                Option.map (fun (i, rule) -> (case, entry, i, rule)) (first case.name column))
+              (fun ((column, _, _, _) as entry) -> Option.map (fun (i, rule) -> (case, entry, i, rule)) (first case.name column))
               (columns case))
           tables
+      in
+      let ruled table column =
+        List.find_map
+          (fun (case, (c, _, _, place), _, (rule : rule_case)) ->
+            if case.name = table && String.equal c column && place = `Field then Some rule.action else None)
+          named
+      in
+      let field_of (table, column) =
+        List.find_map
+          (fun case -> if case.name = table then List.find_opt (fun (c, _, _) -> String.equal c column) case.fields else None)
+          tables
+      in
+      let permute_spec action =
+        match action with
+        | "permute" -> Some `Default
+        | "permute:1..2000000" -> Some `Million
+        | "permute:1..10" -> Some `Ten
+        | _ -> None
+      in
+      let resolution ltype spec =
+        match (ltype, spec) with
+        | Ltype.String, `Default -> Ok `Text
+        | Ltype.Bytes, `Default -> Ok `Bytes
+        | Ltype.Int32, `Default -> Ok (`Range (1, 1073741823))
+        | Ltype.Int64, `Default -> Ok (`Range (1, 9007199254740991))
+        | Ltype.Uint8, (`Default | `Ten) | Ltype.(Int32 | Int64), `Ten -> Error `Small_domain
+        | Ltype.(Int32 | Int64), `Million -> Ok (`Range (1, 2000000))
+        | _ -> Error `Unfit
+      in
+      let rec closure classes =
+        let merged =
+          List.fold_left
+            (fun classes { child; parent } ->
+              let with_child = List.find_opt (fun c -> List.mem child c) classes and with_parent = List.find_opt (fun c -> List.mem parent c) classes in
+              match (with_child, with_parent) with
+              | Some a, Some b when a == b -> classes
+              | Some a, Some b -> (a @ b) :: List.filter (fun c -> c != a && c != b) classes
+              | Some a, None -> (parent :: a) :: List.filter (fun c -> c != a) classes
+              | None, Some b -> (child :: b) :: List.filter (fun c -> c != b) classes
+              | None, None -> [ child; parent ] :: classes)
+            classes links
+        in
+        if List.length merged = List.length classes then merged else closure merged
+      in
+      let classes =
+        List.map (List.sort_uniq compare) (closure [])
+        |> List.filter (fun members -> List.length members > 1)
+      in
+      let is_parent member = List.exists (fun { parent; _ } -> parent = member) links in
+      let shape (table, column) =
+        match ruled table column with
+        | None | Some "keep" -> `Identity
+        | Some "null" -> `Nulled
+        | Some action -> ( match permute_spec action with Some spec -> `Permuted spec | None -> `Other)
+      in
+      let class_violations, propagated =
+        List.fold_left
+          (fun (violations, propagated) members ->
+            let splits = List.map (fun (table, column) -> `Split (table, column)) members in
+            let permuted = List.filter_map (fun member -> match shape member with `Permuted spec -> Some (member, spec) | _ -> None) members in
+            match permuted with
+            | [] ->
+                let changed = List.filter (fun member -> match shape member with `Other -> true | _ -> false) members in
+                let orphaned =
+                  List.exists
+                    (fun member ->
+                      shape member = `Nulled
+                      && List.exists (fun { child; parent } -> parent = member && shape child <> `Nulled) links)
+                    members
+                in
+                if changed <> [] || orphaned then (splits @ violations, propagated) else (violations, propagated)
+            | (_, spec) :: _ ->
+                let conflicted =
+                  List.exists
+                    (fun ((table, column) as member) ->
+                      match (ruled table column, shape member) with
+                      | Some "keep", _ -> true
+                      | _, `Permuted spec' -> spec' <> spec
+                      | _, `Nulled -> is_parent member
+                      | _, `Identity -> false
+                      | _, `Other -> true)
+                    members
+                in
+                let resolutions =
+                  List.filter_map
+                    (fun member ->
+                      match shape member with
+                      | `Identity | `Permuted _ ->
+                          Option.map (fun (_, ltype, _) -> (member, resolution ltype spec)) (field_of member)
+                      | `Nulled | `Other -> None)
+                    members
+                in
+                let failed =
+                  List.filter_map
+                    (fun (((table, column) : (string * string) * string), resolved) ->
+                      match resolved with
+                      | Error `Small_domain -> Some (`Small_domain (table, column))
+                      | Error `Unfit -> Some (`Unfit (table, column))
+                      | Ok _ -> None)
+                    resolutions
+                in
+                let distinct = List.sort_uniq compare (List.filter_map (fun (_, r) -> Result.to_option r) resolutions) in
+                if conflicted || failed <> [] || List.length distinct > 1 then (splits @ failed @ violations, propagated)
+                else
+                  ( violations,
+                    List.filter_map
+                      (fun ((table, column) as member) ->
+                        match ruled table column with
+                        | None ->
+                            let name = match spec with `Default -> "permute" | `Million -> "permute:1..2000000" | `Ten -> "permute:1..10" in
+                            Some (member, name)
+                        | Some _ -> None)
+                      members
+                    @ propagated ))
+          ([], []) classes
+      in
+      let final table column =
+        match ruled table column with
+        | Some action -> Some (action, `Ruled)
+        | None -> Option.map (fun action -> (action, `Propagated)) (List.assoc_opt (table, column) propagated)
       in
       let fits action ltype =
         match (action, ltype) with
@@ -503,54 +693,76 @@ let resolve_is_sound_and_complete =
         | "hash", Ltype.(String | Bytes | Int32 | Int64 | Uint8) -> true
         | _ -> false
       in
+      let keyed case column =
+        List.mem (case.name, column) unique
+        ||
+        match case.key with
+        | `Primary | `Unique ->
+            let c, _, _ = List.hd case.fields in
+            String.equal c column
+        | `Indexed | `None -> false
+      in
       let named_in case = List.filter (fun (c, _, _, _) -> c == case) named in
       let violations =
-        List.concat_map
-          (fun case ->
-            let mine = named_in case in
-            let fields = List.filter (fun (_, (_, _, _, place), _, _) -> place = `Field) mine in
-            List.concat_map
-              (fun (_, (column, ltype, nullability, place), _, (rule : rule_case)) ->
-                let key_column = let c, _, _ = List.hd case.fields in c in
-                let generated =
-                  match place with `Generated -> [ `Generated_column (case.name, column) ] | `Field -> []
-                and keyed =
-                  match (place, case.key) with
-                  | `Field, (`Primary | `Unique) when String.equal column key_column && rule.action <> "keep" ->
-                      [ `Key_column (case.name, column) ]
-                  | _ -> []
-                and nulled =
-                  match (place, rule.action, nullability) with
-                  | `Field, "null", Schema.Field.Not_null -> [ `Not_nullable (case.name, column) ]
-                  | _ -> []
-                and typed =
-                  match (place, rule.action, ltype) with
-                  | `Generated, _, _ -> []
-                  | `Field, ("text:z" | "text:x,y"), Ltype.Enum _ -> [ `Not_member (case.name, column) ]
-                  | `Field, "text:z", Ltype.Set _ -> [ `Not_member (case.name, column) ]
-                  | `Field, action, ltype when not (fits action ltype) -> [ `Unfit (case.name, column) ]
-                  | `Field, _, _ -> []
-                in
-                generated @ keyed @ nulled @ typed)
-              mine
-            @ (let masked = List.filter (fun (_, _, _, (rule : rule_case)) -> rule.action <> "keep") fields in
-               if masked <> [] && case.generated then [ `Generated_values case.name ] else [])
-            @
-            let watched =
-              List.exists
-                (fun pattern ->
-                  match String.split_on_char '.' pattern with
-                  | [ d; t ] -> names d (fst case.name) && names t (snd case.name)
-                  | _ -> false)
-                strict
-            in
-            let undecided =
-              List.filter
-                (fun (column, _, _) -> not (List.exists (fun (_, (c, _, _, _), _, _) -> String.equal c column) fields))
-                case.fields
-            in
-            if watched && undecided <> [] then [ `Unhandled case.name ] else [])
-          tables
+        class_violations
+        @ List.concat_map
+            (fun case ->
+              let mine = named_in case in
+              let generated =
+                List.filter_map
+                  (fun (_, (column, _, _, place), _, _) ->
+                    match place with `Generated -> Some (`Generated_column (case.name, column)) | `Field -> None)
+                  mine
+              in
+              let decided =
+                List.filter_map
+                  (fun (column, ltype, nullability) ->
+                    Option.map (fun (action, _) -> (column, ltype, nullability, action)) (final case.name column))
+                  case.fields
+              in
+              generated
+              @ List.concat_map
+                  (fun (column, ltype, nullability, action) ->
+                    let injective =
+                      match (permute_spec action, action, nullability) with
+                      | Some _, _, _ | None, "keep", _ | None, "null", Schema.Field.Nullable -> true
+                      | None, _, _ -> false
+                    in
+                    let unique = if keyed case column && not injective then [ `Not_injective (case.name, column) ] else [] in
+                    let nulled =
+                      match (action, nullability) with
+                      | "null", Schema.Field.Not_null -> [ `Not_nullable (case.name, column) ]
+                      | _ -> []
+                    in
+                    let typed =
+                      match (permute_spec action, action, ltype) with
+                      | Some spec, _, _ -> (
+                          match resolution ltype spec with
+                          | Ok _ -> []
+                          | Error `Small_domain -> [ `Small_domain (case.name, column) ]
+                          | Error `Unfit -> [ `Unfit (case.name, column) ])
+                      | None, ("text:z" | "text:x,y"), Ltype.Enum _ -> [ `Not_member (case.name, column) ]
+                      | None, "text:z", Ltype.Set _ -> [ `Not_member (case.name, column) ]
+                      | None, action, ltype when not (fits action ltype) -> [ `Unfit (case.name, column) ]
+                      | None, _, _ -> []
+                    in
+                    unique @ nulled @ typed)
+                  decided
+              @ (if List.exists (fun (_, _, _, action) -> action <> "keep") decided && case.generated then
+                   [ `Generated_values case.name ]
+                 else [])
+              @
+              let watched =
+                List.exists
+                  (fun pattern ->
+                    match String.split_on_char '.' pattern with
+                    | [ d; t ] -> names d (fst case.name) && names t (snd case.name)
+                    | _ -> false)
+                  strict
+              in
+              let undecided = List.length decided < List.length case.fields in
+              if watched && undecided then [ `Unhandled case.name ] else [])
+            tables
         @ List.filter_map
             (fun pattern ->
               let fitting =
@@ -584,7 +796,12 @@ let resolve_is_sound_and_complete =
             match Pattern.table pattern with Ok table -> ("strict " ^ pattern, table) | Error _ -> Alcotest.fail pattern)
           strict
       in
-      match Mask.resolve (Mask.make key ~script:Mask_script.empty ~strict parsed) (List.map schema_table tables) with
+      match
+        Mask.resolve
+          (Mask.make key ~script:Mask_script.empty ~strict parsed)
+          ~relations:(fun () -> Ok (relations_of unique links))
+          (List.map schema_table tables)
+      with
       | Ok masks ->
           violations = []
           && List.for_all2
@@ -593,15 +810,19 @@ let resolve_is_sound_and_complete =
                    (fun (c, a) (c', a') -> String.equal c c' && String.equal a a')
                    (List.map (fun (column, action) -> ((column : Ident.t :> string), action)) (Mask.Table.masked mask))
                    (List.filter_map
-                      (fun (_, (column, _, _, _), _, (rule : rule_case)) ->
-                        if String.equal rule.action "keep" then None
-                        else
-                          Some
-                            ( column,
-                              match String.index_opt rule.action ':' with
-                              | Some at -> String.sub rule.action 0 at
-                              | None -> rule.action ))
-                      (named_in case)))
+                      (fun (column, _, _) ->
+                        match final case.name column with
+                        | None | Some ("keep", _) -> None
+                        | Some (action, origin) ->
+                            let shown =
+                              match (permute_spec action, String.index_opt action ':') with
+                              | Some _, _ | None, None -> action
+                              | None, Some at -> String.sub action 0 at
+                            in
+                            Some
+                              ( column,
+                                match origin with `Ruled -> shown | `Propagated -> shown ^ " (a reference)" ))
+                      case.fields))
                tables masks
       | Error (`Mask error) -> (
           let has v = List.mem v violations in
@@ -609,9 +830,15 @@ let resolve_is_sound_and_complete =
           | Generated_column { table; column } ->
               let t, c = pair table column in
               has (`Generated_column (t, c))
-          | Key_column { table; column } ->
+          | Not_injective { table; column; _ } ->
               let t, c = pair table column in
-              has (`Key_column (t, c))
+              has (`Not_injective (t, c))
+          | Split_reference { table; column; other; other_column } ->
+              let t, c = pair table column and t', c' = pair other other_column in
+              has (`Split (t, c)) && has (`Split (t', c'))
+          | Small_domain { table; column; _ } ->
+              let t, c = pair table column in
+              has (`Small_domain (t, c))
           | Not_nullable { table; column } ->
               let t, c = pair table column in
               has (`Not_nullable (t, c))
@@ -625,7 +852,7 @@ let resolve_is_sound_and_complete =
           | Unused written -> has (`Unused written)
           | Unhandled { table; _ } -> has (`Unhandled ((table.database :> string), (table.table :> string)))
           | Malformed _ | Unknown_action _ | Scripted _ | Null_from_source _ | Null_from_expression _
-          | Mismatched_column _ | Rewritten _ | Finer_than_column _ ->
+          | Mismatched_column _ | Rewritten _ | Finer_than_column _ | Outside_domain _ | Too_long _ ->
               false))
 
 let table_refusals () =
@@ -637,7 +864,7 @@ let table_refusals () =
     match Mask.rule rule with
     | Error _ -> "parse"
     | Ok rule -> (
-        match Mask.resolve (Mask.make key ~script:Mask_script.empty ~strict:[] [ rule ]) [ table ] with
+        match Mask.resolve (Mask.make key ~script:Mask_script.empty ~strict:[] [ rule ]) ~relations:(fun () -> Ok Relations.none) [ table ] with
         | Ok _ -> "fine"
         | Error (`Mask error) -> Sexplib0.Sexp.to_string (Mask.sexp_of_error error))
   in
@@ -655,14 +882,23 @@ let table_refusals () =
       "(Not_member(table(db t))(column s)(value x,z))";
       "(Not_nullable(table(db t))(column n))";
       "(Unfit(table(db t))(column d)(action shape)(ltype Date))";
-      "(Key_column(table(db t))(column id))";
+      "(Not_injective(table(db t))(column id)(action hash))";
       "fine";
+      "fine";
+      "(Small_domain(table(db t))(column id)(low 1)(high 999999))";
+      "fine";
+      "(Unfit(table(db t))(column d)(action permute)(ltype Date))";
+      "(Unfit(table(db t))(column n)(action permute:1..2000000)(ltype String))";
+      "parse";
+      "parse";
       "(Unused db.t.zzz=null)";
     ]
     (List.map told
        [
          "db.t.e=text:x"; "db.t.e=text:z"; "db.t.e=text:x,y"; "db.t.s=text:x,y"; "db.t.s=text:x,z"; "db.t.n=null";
-         "db.t.d=shape"; "db.t.id=hash"; "db.t.id=keep"; "db.t.zzz=null";
+         "db.t.d=shape"; "db.t.id=hash"; "db.t.id=keep"; "db.t.id=permute"; "db.t.id=permute:1..999999";
+         "db.t.id=permute:1..1000000"; "db.t.d=permute"; "db.t.n=permute:1..2000000"; "db.t.id=permute:9..1";
+         "db.t.id=permute:1-9"; "db.t.zzz=null";
        ])
 
 let source_query () =
@@ -762,6 +998,7 @@ let dump_through rules ~null_source =
     let opened n = n
     let disconnect _ = ()
     let introspect _ _ = Schema.make [ table ]
+    let relations _ = Ok Relations.none
     let plan _ _ _ = Ok [ Chunk.whole table ]
 
     let snapshot () n =
@@ -830,7 +1067,7 @@ let dump_through rules ~null_source =
     let sexp_of_error Never = Sexplib0.Sexp.Atom "never"
     let format _ = Output_format.Sql
     let database _ _ ~ddl:_ = Ok ()
-    let table _ _ ~ddl:_ ~parts:_ = Ok ()
+    let table _ _ ~ddl:_ ~parts:_ ~order:_ = Ok ()
     let add_part _ _ = Ok ()
     let objects _ _ _ = Ok ()
     let part owner _ ~index:_ = Ok { owner; kept = [] }
@@ -935,14 +1172,381 @@ let null_from_source () =
   | Error _ -> Alcotest.fail "another failure"
   | Ok _ -> Alcotest.fail "a NULL in a NOT NULL column went through"
 
+let nulled_references () =
+  let name table = { Schema.Name.database = Support.ident "db"; table = Support.ident table } in
+  let make table fields =
+    Support.get_ok
+      (Schema.Table.make ~name:(name table)
+         ~fields:(List.map (fun (column, ltype, nullability) -> { Schema.Field.name = Support.ident column; ltype; nullability }) fields)
+         ~generated:[] ~key:(Primary (Support.ident "id", [])) ~estimate:{ rows = 0; bytes = 0 })
+  in
+  let tables =
+    [ make "u" [ ("id", Int64, Not_null); ("alt", Int64, Nullable) ]; make "o" [ ("id", Int64, Not_null); ("owner", Int64, Nullable) ] ]
+  in
+  let relations =
+    {
+      Relations.foreign = [ { child = name "o"; parent = name "u"; columns = ((Support.ident "owner", Support.ident "alt"), []) } ];
+      unique = [ { table = name "u"; columns = (Support.ident "alt", []) } ];
+      ranges = [];
+    }
+  in
+  let told rules =
+    let rules = List.map (fun text -> match Mask.rule text with Ok rule -> rule | Error _ -> Alcotest.fail text) rules in
+    match Mask.resolve (Mask.make key ~script:Mask_script.empty ~strict:[] rules) ~relations:(fun () -> Ok relations) tables with
+    | Error (`Mask error) -> Sexplib0.Sexp.to_string (Mask.sexp_of_error error)
+    | Ok masks ->
+        String.concat "; "
+          (List.concat_map
+             (fun mask -> List.map (fun ((column : Ident.t), action) -> (column :> string) ^ "=" ^ action) (Mask.Table.masked mask))
+             masks)
+  in
+  Alcotest.(check (list string))
+    "NULL in a referring column, and in a referred one"
+    [
+      "owner=null";
+      "(Split_reference(table(db u))(column alt)(other(db o))(other_column owner))";
+      "alt=permute; owner=null";
+      "(Split_reference(table(db o))(column owner)(other(db u))(other_column alt))";
+      "alt=null; owner=null";
+    ]
+    (List.map told
+       [
+         [ "db.o.owner=null" ];
+         [ "db.u.alt=null" ];
+         [ "db.u.alt=permute"; "db.o.owner=null" ];
+         [ "db.o.owner=permute"; "db.u.alt=null" ];
+         [ "db.u.alt=null"; "db.o.owner=null" ];
+       ])
+
+let outside_domain () =
+  let () =
+    match dump_through [ "db.t.id=permute:100..2000000" ] ~null_source:false with
+    | Error (`Mask (Mask.Outside_domain { column; low; high; _ })) ->
+        Alcotest.(check (triple string int64 int64)) "the column and its domain" ("id", 100L, 2000000L) ((column :> string), low, high)
+    | Error _ -> Alcotest.fail "another failure"
+    | Ok _ -> Alcotest.fail "ids below the domain went through"
+  in
+  let () =
+    match dump_through [ "db.t.id=permute:-2000000..-1" ] ~null_source:false with
+    | Error (`Mask (Mask.Outside_domain _)) -> ()
+    | Error _ -> Alcotest.fail "another failure"
+    | Ok _ -> Alcotest.fail "ids above the domain went through"
+  in
+  match dump_through [ "db.t.id=permute:0..2000000"; "db.t.code=permute:0..2000000" ] ~null_source:false with
+  | Ok { rows; _ } ->
+      let ids = List.filter_map (function Big id :: _ -> Some id | _ -> None) rows in
+      Alcotest.(check int) "every row" 40 (List.length (List.sort_uniq compare ids));
+      Alcotest.(check bool)
+        "ids and codes permuted alike within one domain" true
+        (List.for_all (function [ Big id; _; Int code; _ ] -> Int64.to_int id = code | _ -> false) rows)
+  | Error _ -> Alcotest.fail "ids within the domain were refused"
+
 let unmasked_key () =
   match dump_through [ "db.t.id=hash" ] ~null_source:false with
-  | Error (`Mask (Mask.Key_column _)) -> ()
+  | Error (`Mask (Mask.Not_injective _)) -> ()
   | Error _ | Ok _ -> Alcotest.fail "a key column was masked"
+
+let references_through_a_dump () =
+  let name table = { Schema.Name.database = Support.ident "db"; table = Support.ident table } in
+  let field (column, ltype, nullability) = { Schema.Field.name = Support.ident column; ltype; nullability } in
+  let make table fields =
+    Support.get_ok
+      (Schema.Table.make ~name:(name table) ~fields:(List.map field fields) ~generated:[]
+         ~key:(Primary (Support.ident "id", [])) ~estimate:{ rows = 0; bytes = 0 })
+  in
+  let users = make "users" [ ("id", Int64, Not_null); ("email", String, Not_null) ]
+  and orders = make "orders" [ ("id", Int64, Not_null); ("user_id", Int64, Not_null); ("mail", String, Nullable) ] in
+  let (email @ portable) i = Printf.sprintf "User.%d@example.com" i in
+  let ordered = name "orders" in
+  let declared = Portable.Atomic.make [] in
+  let module Provider = struct
+    type conn_config = unit
+    type position = unit
+    type session = int
+    type error = Never
+
+    let sexp_of_error Never = Sexplib0.Sexp.Atom "never"
+
+    type snapshot_mode = unit
+    type 'lvl supports = unit
+    type connections = int
+
+    let supports () _ = Ok ()
+    let connect () (_ : Provider_intf.sessions) = Ok 1
+    let opened n = n
+    let disconnect _ = ()
+    let introspect _ _ = Schema.make [ users; orders ]
+
+    let relations _ =
+      Ok
+        {
+          Relations.foreign =
+            [
+              { child = name "orders"; parent = name "users"; columns = ((Support.ident "user_id", Support.ident "id"), []) };
+              { child = name "orders"; parent = name "users"; columns = ((Support.ident "mail", Support.ident "email"), []) };
+            ];
+          unique = [ { table = name "users"; columns = (Support.ident "email", []) } ];
+          ranges = [];
+        }
+
+    let plan _ _ _ = Ok [ Chunk.whole users; Chunk.whole orders ]
+
+    let snapshot () n =
+      Ok (Array.init n (fun session -> Await.Capsule.Await.With_mutex.create (fun () -> session)), ())
+
+    let ddl _ _ = Ok ""
+    let key_span _ _ = Ok None
+
+    let read_chunk _ chunk _ writer =
+      let ordering = Schema.Name.equal (Chunk.table chunk).name ordered in
+      let count = if ordering then 60 else 30 in
+      let pending = ref (List.init count (fun i -> i + 1)) in
+      Batch_writer.fill writer (fun (columns : Column.any Iarray.t @ local) ->
+          match !pending with
+          | [] -> Ok Batch_writer.End
+          | id :: rest ->
+              pending := rest;
+              let int64 index (value : int64) =
+                let (Column.Any column) = Iarray.get columns index in
+                match Column.repr column with Int64 -> ignore (Column.add column value) | _ -> ()
+              and text index (value : string option) =
+                let (Column.Any column) = Iarray.get columns index in
+                match (Column.repr column, value) with
+                | Text, Some value -> ignore (Column.add column value)
+                | Text, None -> Column.add_null column [@nontail]
+                | _ -> ()
+              in
+              int64 0 (Int64.of_int id);
+              let () =
+                if ordering then (
+                  let user = 1 + (id mod 30) in
+                  int64 1 (Int64.of_int user);
+                  let mail = if id mod 7 = 0 then None else Some (email user) in
+                  text 2 mail)
+                else text 1 (Some (email id))
+              in
+              Ok Batch_writer.Row)
+
+    let objects _ _ = Ok []
+    let definition _ _ _ = Error (`Provider Never)
+    let close _ = ()
+    let sexp_of_position () = Sexplib0.Sexp.Atom "nowhere"
+    let source () = ""
+    let yojson_of_position () = `Null
+    let position_of_yojson _ = ()
+  end in
+  let module Sink = struct
+    type t = { rows : (Schema.Name.t * cell list list) list Portable.Atomic.t }
+    type part = { owner : t; table : Schema.Name.t; mutable kept : cell list list }
+    type renderer = unit
+    type rendered = { cells : cell list list @@ aliased many } [@@unboxed]
+    type error = Never [@@warning "-37"]
+
+    let sexp_of_error Never = Sexplib0.Sexp.Atom "never"
+    let format _ = Output_format.Sql
+    let database _ _ ~ddl:_ = Ok ()
+
+    let table _ ({ name; _ } : Schema.Table.t) ~ddl:_ ~parts:_ ~order =
+      Portable.Atomic.update declared ~pure_f:(fun declared -> (name, order) :: declared);
+      Ok ()
+
+    let add_part _ _ = Ok ()
+    let objects _ _ _ = Ok ()
+    let part owner ({ name; _ } : Schema.Table.t) ~index:_ = Ok { owner; table = name; kept = [] }
+    let renderer _ = ()
+    let render () (batch : Batch.sealed @ local) = Ok { cells = cells_of batch }
+
+    let append part { cells } =
+      part.kept <- part.kept @ cells;
+      Ok ()
+
+    let close part answer =
+      let kept = part.kept and table = part.table in
+      Portable.Atomic.update part.owner.rows ~pure_f:(fun rows -> (table, kept) :: rows);
+      answer
+        (Ok
+           {
+             Manifest.file = File_path.Part.of_string "part";
+             rows = List.length kept;
+             bytes = 0;
+             stored_bytes = 0;
+             checksum = Xxh3_64 0L;
+           })
+
+    let discard _ = ()
+    let finish _ ~source:_ ~tables:_ ~manifest:_ = Ok ()
+  end in
+  let module Dump = Dump.Make (Provider) (Sink) in
+  let sink = { Sink.rows = Portable.Atomic.make [] } in
+  let opts =
+    Support.get_ok
+      (Dump_opts.make
+         ~plan:(Support.get_ok (Plan_opts.make ~chunk_bytes:1))
+         ~readers:(Readers 2) ~renderers:(Renderers 2) ~cores:2 ~batch_bytes:64 ~order:Largest_chunks
+         ~declaring:Before_its_rows)
+  in
+  let rules =
+    List.map
+      (fun text -> match Mask.rule text with Ok rule -> rule | Error _ -> Alcotest.fail text)
+      [ "db.users.id=permute"; "db.users.email=permute" ]
+  in
+  let manifest =
+    match
+      Support.within 10. (fun () ->
+          Dump.run
+            {
+              conn = ();
+              mode = ();
+              level = Best_effort;
+              filter = Everything;
+              rows = All_rows;
+              objects = Without_objects;
+              masking = Mask.make key ~script:Mask_script.empty ~strict:[] rules;
+              opts;
+            }
+            sink)
+    with
+    | Error `Timeout -> Alcotest.fail "the dump hung"
+    | Ok (Error _) -> Alcotest.fail "the dump failed"
+    | Ok (Ok manifest) -> manifest
+  in
+  let rows table =
+    List.concat_map (fun (owner, rows) -> if Schema.Name.equal owner (name table) then rows else []) (Portable.Atomic.get sink.rows)
+  in
+  let users = rows "users" and orders = rows "orders" in
+  let ids = List.filter_map (function [ Big id; Text email ] -> Some (id, email) | _ -> None) users in
+  Alcotest.(check int) "every user" 30 (List.length ids);
+  let distinct values = List.length (List.sort_uniq compare values) = List.length values in
+  Alcotest.(check bool) "masked ids are distinct" true (distinct (List.map fst ids));
+  Alcotest.(check bool) "masked emails are distinct" true (distinct (List.map snd ids));
+  Alcotest.(check bool) "ids are masked" true (List.exists (fun (id, _) -> Int64.to_int id > 30) ids);
+  Alcotest.(check bool)
+    "ids stay in the default domain" true
+    (List.for_all (fun (id, _) -> Int64.compare id 1L >= 0 && Int64.compare id 9007199254740991L <= 0) ids);
+  Alcotest.(check bool)
+    "emails keep their form" true
+    (List.for_all2
+       (fun (_, masked) (_, original) ->
+         let form text = String.map (fun c -> if Char.equal c '@' || Char.equal c '.' then c else 'x') text in
+         String.equal (form masked) (form original) && not (String.equal masked original))
+       ids
+       (List.init 30 (fun i -> ((), email (i + 1)))));
+  let user_of_order = List.mapi (fun i (id, email) -> (i + 1, (id, email))) ids in
+  Alcotest.(check int) "every order" 60 (List.length orders);
+  List.iteri
+    (fun i row ->
+      let order = i + 1 in
+      let id, email = List.assoc (1 + (order mod 30)) user_of_order in
+      match row with
+      | [ Big own; Big user; mail ] ->
+          Alcotest.(check int) "an order keeps its own id" order (Int64.to_int own);
+          Alcotest.(check int64) "an order refers to its user's masked id" id user;
+          let expected = if order mod 7 = 0 then Null else Text email in
+          Alcotest.(check bool) "an order refers to its user's masked email" true (equal_cell expected mail)
+      | _ -> Alcotest.fail "an order of another shape")
+    orders;
+  Alcotest.(check (list (pair string string)))
+    "the manifest names the spread"
+    [ ("id", "permute"); ("email", "permute"); ("user_id", "permute (a reference)"); ("mail", "permute (a reference)") ]
+    (List.map (fun ({ column; action; _ } : Manifest.masked) -> ((column :> string), action)) manifest.masked);
+  Alcotest.(check (list (pair string string)))
+    "a table whose key is masked is declared so"
+    [ ("orders", "Key_order"); ("users", "Masked_key") ]
+    (List.sort compare
+       (List.map
+          (fun ((name : Schema.Name.t), order) ->
+            ((name.table :> string), Sexplib0.Sexp.to_string (Schema.sexp_of_order order)))
+          (Portable.Atomic.get declared)))
+
+let hidden_ranges () =
+  let table = Support.table [ ("id", Int64, Not_null); ("v", String, Nullable) ] in
+  let chunks = Support.get_ok (Chunk.of_bounds table [ [ Key.Signed 10L ] ]) in
+  let manifest masked =
+    Manifest.make ~level:(Any Best_effort) ~format:Sql ~position:`Null
+      ~threads:{ sessions = 1; readers = 1; peak = 1; renderers = 1 }
+      ~phases:
+        {
+          connected = Core.Time_ns.Span.zero;
+          planned = Core.Time_ns.Span.zero;
+          snapshot = Core.Time_ns.Span.zero;
+          first_part = None;
+          read = Core.Time_ns.Span.zero;
+          committed = Core.Time_ns.Span.zero;
+        }
+      ~schema:(Support.get_ok (Schema.make [ table ]))
+      ~masked
+      (List.map (fun chunk -> (chunk, Manifest.Pending)) chunks)
+  in
+  let ranges masked = List.map (fun ({ range; _ } : Manifest.entry) -> Option.is_some range) (manifest masked).chunks in
+  Alcotest.(check (list bool)) "ranges of a key kept" [ true; true ] (ranges []);
+  Alcotest.(check (list bool))
+    "another column masked" [ true; true ]
+    (ranges [ { Manifest.table = Support.name; column = Support.ident "v"; action = "shape" } ]);
+  Alcotest.(check (list bool))
+    "ranges of a masked key left out" [ false; false ]
+    (ranges [ { Manifest.table = Support.name; column = Support.ident "id"; action = "permute" } ])
+
+let scripted_references () =
+  let name table = { Schema.Name.database = Support.ident "db"; table = Support.ident table } in
+  let make table fields =
+    Support.get_ok
+      (Schema.Table.make ~name:(name table)
+         ~fields:(List.map (fun (column, ltype, nullability) -> { Schema.Field.name = Support.ident column; ltype; nullability }) fields)
+         ~generated:[] ~key:(Primary (Support.ident "id", [])) ~estimate:{ rows = 0; bytes = 0 })
+  in
+  let tables =
+    [
+      make "u" [ ("id", Int64, Not_null); ("n", String, Nullable) ];
+      make "o" [ ("id", Int64, Not_null); ("uid", Int64, Nullable); ("owner", Int64, Nullable) ];
+    ]
+  in
+  let told text =
+    match Mask_script.parse ~source:"s" ~load:(fun _ -> Error "no files") text with
+    | Error (`Mask_script error) -> "script: " ^ Mask_script.describe error
+    | Ok script -> (
+        match Mask.scripted script with
+        | Error _ -> "pattern"
+        | Ok rules -> (
+            match Mask.resolve (Mask.make key ~script ~strict:[] rules) ~relations:(fun () -> Ok Relations.none) tables with
+            | Error (`Mask error) -> Sexplib0.Sexp.to_string (Mask.sexp_of_error error)
+            | Ok masks ->
+                String.concat "; "
+                  (List.concat_map
+                     (fun mask -> List.map (fun ((column : Ident.t), action) -> (column :> string) ^ "=" ^ action) (Mask.Table.masked mask))
+                     masks)))
+  in
+  Alcotest.(check (list string))
+    "permute and references in a script"
+    [
+      "id=permute; uid=permute (a reference)";
+      "id=permute:1..5000000 (a reference); uid=permute:1..5000000; owner=permute:1..5000000 (a reference)";
+      "id=permute; uid=permute";
+      "(Split_reference(table(db u))(column id)(other(db o))(other_column uid))";
+      "(Split_reference(table(db u))(column id)(other(db o))(other_column uid))";
+      "(Split_reference(table(db o))(column uid)(other(db u))(other_column id))";
+      "script: s:1:1: references names two columns: \"DB.TABLE.COLUMN\" \"DB.TABLE.COLUMN\"";
+      "script: s:1:1: a permutation's LOW is above its HIGH";
+    ]
+    (List.map told
+       [
+         "(references \"db.o.uid\" \"db.u.id\") (permute \"db.u.id\")";
+         "(references \"db.o.uid\" \"db.u.id\") (references \"db.o.owner\" \"db.u.id\") (permute \"db.o.uid\" 1 5000000)";
+         "(references \"db.o.uid\" \"db.u.id\") (permute \"db.u.id\") (permute \"db.o.uid\")";
+         "(references \"db.o.uid\" \"db.u.id\") (permute \"db.u.id\") (keep \"db.o.uid\")";
+         "(references \"db.o.uid\" \"db.u.id\") (permute \"db.u.id\") (permute \"db.o.uid\" 1 2000000)";
+         "(references \"db.o.uid\" \"db.u.id\") (mask \"db.o.uid\" null)";
+         "(references \"db.o\" \"db.u.id\")";
+         "(permute \"db.u.id\" 9 1)";
+       ])
 
 let tests =
   [
     Alcotest.test_case "HMAC-SHA256 matches Python's hmac" `Quick hmac_oracle;
+    Alcotest.test_case "a permuted key spreads to its references through a dump" `Quick references_through_a_dump;
+    Alcotest.test_case "a manifest leaves out ranges of a masked key" `Quick hidden_ranges;
+    Alcotest.test_case "a script permutes and declares references" `Quick scripted_references;
+    Alcotest.test_case "a value outside a permutation's domain is refused" `Quick outside_domain;
+    Alcotest.test_case "NULL may replace a reference, not what it refers to" `Quick nulled_references;
     QCheck_alcotest.to_alcotest glob_matches_model;
     QCheck_alcotest.to_alcotest quoted_names_match_exactly;
     Alcotest.test_case "malformed patterns are refused" `Quick pattern_errors;

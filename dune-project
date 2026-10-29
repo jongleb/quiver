@@ -3,7 +3,7 @@
 
 (name quiver)
 
-(version 1.4.0)
+(version 1.5.0)
 
 (generate_opam_files true)
 
@@ -62,4 +62,5 @@
   (alcotest :with-test)
   (qcheck-core :with-test)
   (qcheck-alcotest :with-test)
+  (zarith :with-test)
   (ppx_expect :with-test)))

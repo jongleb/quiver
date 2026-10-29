@@ -78,7 +78,7 @@ module Make (P : Provider_intf.S) (S : Sink_intf.S) = struct
     let%bind schema, masks, chunks =
       match
         let%bind schema = P.introspect connections filter in
-        let%bind masks = Mask.resolve masking schema.tables in
+        let%bind masks = Mask.resolve masking ~relations:(fun () -> P.relations connections) schema.tables in
         let%bind { with_rows; _ } = Filter.split rows schema.tables in
         let%bind read = Schema.make with_rows in
         let%map chunks =
@@ -607,11 +607,24 @@ module Make (P : Provider_intf.S) (S : Sink_intf.S) = struct
               with
               | Withheld -> Await.Await.Ivar.fill_if_empty announcement Withheld
               | Announced ->
+                  let mask = Iarray.get masks table in
                   let table = Iarray.get tables table
                   and parts = Iarray.get parts table in
+                  let order : Schema.order =
+                    match table.key with
+                    | Primary (first, rest) | Unique { fields = first, rest; _ } ->
+                        if
+                          List.exists
+                            (fun ({ name; _ } : Schema.Field.t) ->
+                              List.exists (fun (column, _) -> Ident.equal column name) (Mask.Table.masked mask))
+                            (first :: rest)
+                        then Masked_key
+                        else Key_order
+                    | Indexed _ | No_key -> Key_order
+                  in
                   announce announcement
                     (let%bind ddl = ddl (Table table.name) in
-                     S.table sink table ~ddl ~parts))
+                     S.table sink table ~ddl ~parts ~order))
           | Chunk position -> (
               match
                 announced

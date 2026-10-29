@@ -390,6 +390,8 @@ written; a column takes the first rule naming it.
 
 | Action | What the column gets |
 |---|---|
+| `permute` | a keyed bijection (FF1 of NIST SP 800-38G): two values never give one, so keys stay keys. An integer goes to another from 1 to half its type's largest (`INT` up to 1 073 741 823, so new rows still fit), or to 2^53 − 1 for `BIGINT`; text keeps each character's kind, case and place (every letter and digit of `user.17@Example.com` changes, `@`, `.` and the case stay); binary keeps its length |
+| `permute:LOW..HIGH` | an integer to another from `LOW` to `HIGH`, at least a million of them |
 | `null` | NULL |
 | `text:VALUE` | this value: text, binary, an `ENUM` member or `SET` members |
 | `shape` | each letter and digit replaced by a keyed one of the same kind (Latin, Cyrillic, digit), the rest kept: `+7 (912) 345-67-89` → `+3 (481) 905-12-77`, `Иван Smith` → `Жуэр Qmpwa` |
@@ -399,13 +401,29 @@ written; a column takes the first rule naming it.
 | `expr:EXPRESSION` | an expression of quiver's masking language (below), evaluated here |
 | `keep` | the values as read: the column counts as decided for `--mask-strict` |
 
-- **Keyed.** `shape`, `email` and `hash` are HMAC-SHA256 under `--mask-secret`: the same value
-  masks the same way in every column and every run, so joins and foreign keys between masked
-  columns still hold. Without a secret, a random key of this run is used.
+- **Keyed.** `permute`, `shape`, `email` and `hash` are keyed by `--mask-secret`: the same value
+  masks the same way in every column and every run, so joins between masked columns still hold.
+  Without a secret, a random key of this run is used. Whoever holds the secret can undo
+  `permute`: keep it apart from the copies, one per environment.
+- **Keys and references.** A column of a primary or unique key takes only `permute` (or `keep`,
+  or `null` where it may be NULL): any other action can give two rows one key. quiver reads the
+  source's foreign keys, and a `permute` spreads to every column they tie to the one it masks —
+  children, grandchildren, self-references, parts of composite keys — unless a rule names that
+  column, so every reference still finds its row. Columns tied by foreign keys and masked
+  differently are an error before anything is read. References no foreign key declares go in a
+  mask script: `(references "shop.events.user_ref" "shop.users.id")`. With a masked key, a
+  tablespace copy loads the table through `LOAD DATA` (its rows no longer come in key order),
+  and `quiver.json` leaves out that table's chunk ranges, which would show the source's keys.
+
+```sh
+quiver copy … --mask 'shop.users.id=permute' --mask 'shop.users.email=permute' --mask-secret "$MASK_SECRET"
+# masked in shop.orders: user_id (permute (a reference)), email (permute (a reference))
+```
 - **Never longer.** `shape`, `email` and `hash` keep the number of characters and never add
   bytes, so a value still fits its column. NULL stays NULL but under `null` and `sql:`.
-- **Refused, not guessed.** A rule naming no column of the dump, a column of the key the table is
-  read by, `null` for a `NOT NULL` column, an action that gives no value of the column's type or
+- **Refused, not guessed.** A rule naming no column of the dump, a key column under an action
+  that is not a bijection, columns a foreign key ties masked differently, a permutation of fewer
+  than a million values, `null` for a `NOT NULL` column, an action that gives no value of the column's type or
   a `text:` outside an `ENUM` are errors before anything is read. So is a table whose `STORED`
   generated columns a tablespace copy would take from the source. A `sql:` expression that gives
   NULL for a `NOT NULL` column, or makes the source warn (a value cast with loss), fails the copy.
@@ -457,6 +475,9 @@ quiver mask --mask-script policy.scm '(phone value)' '+7 (912) 345-67-89'   # tr
   to take columns by name and by type: `text`, `binary`, `json`, `integer`, `decimal`, `float`,
   `date`, `datetime`, `timestamp`, `time`, `year`, `enum`, `set`, `geometry`. A column takes the
   first rule naming it, from `--mask` first, then the scripts in order.
+- **Keys.** `(permute SELECTOR)` or `(permute SELECTOR LOW HIGH)` is `--mask …=permute`;
+  `(references "DB.TABLE.COLUMN" "DB.TABLE.COLUMN")` ties a column to the one it refers to
+  where the schema has no foreign key, so a permutation spreads along it too.
 - **Decisions.** `(keep …)` copies columns as they are. `(strict "DB.TABLE" …)` (or
   `--mask-strict`) requires every column of those tables to be masked or kept: a column added to
   the schema later stops the copy with its name, before anything is read, instead of leaking.
@@ -645,6 +666,7 @@ quiver is young and moving fast.
 | Dump, load and copy; separate schema and rows | shipped |
 | Tablespaces built on the client (MySQL 8.4, Percona 8.4) | new in 1.3 |
 | Masking as rows are read; statements after the load | new in 1.4 |
+| Keys and references masked by a keyed permutation along foreign keys | new in 1.5 |
 | Unix sockets, `my.cnf`, every common login | shipped |
 | Agent, collector, relays and chains, mutual TLS 1.3 | shipped |
 | Online tuning of streams, compression, readers; chunks divided while read | shipped |

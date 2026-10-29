@@ -11,6 +11,7 @@ type t =
   | Tables  (** Base tables outside the system schemas, with estimates. *)
   | Columns
   | Indexes of Server.t
+  | Foreign_keys  (** Columns of foreign keys outside the system schemas, with the columns they refer to. *)
   | Key_bounds of {
       table : Quiver_core.Schema.Name.t;
       key : Quiver_core.Ident.t;

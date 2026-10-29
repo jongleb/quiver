@@ -23,6 +23,7 @@ type unsuitable : immutable_data =
   | Cfg of Quiver_innodb.Cfg.error
   | Layout of Quiver_innodb.Layout.error
   | Space of Quiver_innodb.Tablespace.error
+  | Masked_key  (** The key is masked, so rows do not come in its order. *)
 [@@deriving sexp_of ~portable]
 
 (** Who builds the secondary keys of a table built as a tablespace. *)

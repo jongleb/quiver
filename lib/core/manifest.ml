@@ -205,15 +205,15 @@ let make ~level ~format ~position ~threads ~phases ~schema ~masked chunks =
           match chunk with
           | Whole { name; _ } -> { table = name; key = []; range = None; state }
           | Range { table = { name; _ }; key; range } ->
-              {
-                table = name;
-                key =
-                  List.map
-                    (fun ({ name; _ } : Schema.Field.t) -> name)
-                    (fst key :: snd key);
-                range = Some range;
-                state;
-              })
+              let key = List.map (fun ({ name; _ } : Schema.Field.t) -> name) (fst key :: snd key) in
+              let hidden =
+                List.exists
+                  (fun ({ table; column; _ } : masked) ->
+                    Schema.Name.equal table name && List.exists (Ident.equal column) key)
+                  masked
+              in
+              let range = if hidden then None else Some range in
+              { table = name; key; range; state })
         chunks;
   }
 

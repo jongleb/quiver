@@ -79,3 +79,98 @@ let hex key text n =
       let byte = Char.code digest.[i / 2] in
       let nibble = if i mod 2 = 0 then byte lsr 4 else byte land 15 in
       digits.[nibble])
+
+type permutation = string
+
+let permutation key ~label =
+  Quiver_openssl.Sha.hmac_sha256 ~key ~prefix:(Int64.of_int (9 lsl 32)) ("permute/v1/" ^ label)
+
+let permute_integer key ~low ~high value =
+  Int64.add low (Quiver_openssl.Ff1.below ~key ~limit:(Int64.sub high low) (Int64.sub value low))
+
+type case = Lower | Upper
+type place = Fixed | Digit of int | Latin of { value : int; case : case } | Cyrillic of { value : int; case : case }
+
+let permute_text key text =
+  let length = String.length text in
+  let rec trailing pos = if pos > 0 && Char.equal text.[pos - 1] ' ' then trailing (pos - 1) else pos in
+  let ends = trailing length in
+  let cyrillic code ~first ~yo =
+    if code = yo then 6
+    else
+      let i = code - first in
+      if i <= 5 then i else i + 1
+  in
+  let place code =
+    if code >= Char.code '0' && code <= Char.code '9' then Digit (code - Char.code '0')
+    else if code >= Char.code 'a' && code <= Char.code 'z' then Latin { value = code - Char.code 'a'; case = Lower }
+    else if code >= Char.code 'A' && code <= Char.code 'Z' then Latin { value = code - Char.code 'A'; case = Upper }
+    else if (code >= 0x430 && code <= 0x44F) || code = 0x451 then
+      Cyrillic { value = cyrillic code ~first:0x430 ~yo:0x451; case = Lower }
+    else if (code >= 0x410 && code <= 0x42F) || code = 0x401 then
+      Cyrillic { value = cyrillic code ~first:0x410 ~yo:0x401; case = Upper }
+    else Fixed
+  in
+  let rec read pos acc =
+    if pos >= length then List.rev acc
+    else
+      let width, code = Utf8.decode text pos in
+      read (pos + width) ((pos, width, place code) :: acc)
+  in
+  let places = read 0 [] in
+  let pattern = Buffer.create (length + 8) in
+  Buffer.add_string pattern "text\000";
+  let digits = Buffer.create length and radixes = Buffer.create length in
+  List.iter
+    (fun (pos, width, place) ->
+      let changing tag radix value =
+        Buffer.add_char pattern '\000';
+        Buffer.add_char pattern tag;
+        Buffer.add_char radixes (Char.chr radix);
+        Buffer.add_char digits (Char.chr value)
+      in
+      match place with
+      | Digit value -> changing 'd' 10 value
+      | Latin { value; _ } -> changing 'l' 26 value
+      | Cyrillic { value; _ } -> changing 'c' 33 value
+      | Fixed when pos >= ends -> ()
+      | Fixed when width = 1 && Char.equal text.[pos] '\000' -> Buffer.add_string pattern "\000\000"
+      | Fixed -> Buffer.add_string pattern (String.sub text pos width))
+    places;
+  let tweak = Quiver_openssl.Sha.sha256 (Buffer.contents pattern) in
+  Option.map
+    (fun permuted ->
+      let out = Buffer.create length in
+      let cyrillic value ~first ~yo = if value = 6 then yo else if value < 6 then first + value else first + value - 1 in
+      let rec write k = function
+        | [] -> ()
+        | (pos, width, place) :: rest -> (
+            let next () = Char.code permuted.[k] in
+            match place with
+            | Fixed ->
+                Buffer.add_string out (String.sub text pos width);
+                write k rest
+            | Digit _ ->
+                Buffer.add_char out (Char.chr (Char.code '0' + next ()));
+                write (k + 1) rest
+            | Latin { case; _ } ->
+                let first = match case with Upper -> 'A' | Lower -> 'a' in
+                Buffer.add_char out (Char.chr (next () + Char.code first));
+                write (k + 1) rest
+            | Cyrillic { case; _ } ->
+                let code =
+                  match case with
+                  | Upper -> cyrillic (next ()) ~first:0x410 ~yo:0x401
+                  | Lower -> cyrillic (next ()) ~first:0x430 ~yo:0x451
+                in
+                Buffer.add_utf_8_uchar out (Uchar.of_int code);
+                write (k + 1) rest)
+      in
+      write 0 places;
+      Buffer.contents out)
+    (Quiver_openssl.Ff1.digits ~key ~tweak ~radixes:(Buffer.contents radixes) (Buffer.contents digits))
+
+let permute_bytes key value =
+  let length = String.length value in
+  if length > 1024 then None
+  else Quiver_openssl.Ff1.digits ~key ~tweak:"bytes" ~radixes:(String.make length '\000') value

@@ -829,7 +829,7 @@ let rows_read_before_masking () =
     | Ok shape, Ok scripted -> shape :: scripted
     | _ -> Alcotest.fail "rules"
   in
-  match Mask.resolve (Mask.make key ~script ~strict:[] rules) [ table ] with
+  match Mask.resolve (Mask.make key ~script ~strict:[] rules) ~relations:(fun () -> Ok Relations.none) [ table ] with
   | Ok [ mask ] ->
       Test_mask.with_batch [ Int64; String; String; String; Int32 ]
         [
@@ -868,7 +868,7 @@ let refused_against_tables () =
     match Mask.rule rule with
     | Error _ -> "parse"
     | Ok rule -> (
-        match Mask.resolve (Mask.make key ~script:Mask_script.empty ~strict:[] [ rule ]) [ table ] with
+        match Mask.resolve (Mask.make key ~script:Mask_script.empty ~strict:[] [ rule ]) ~relations:(fun () -> Ok Relations.none) [ table ] with
         | Ok _ -> "fine"
         | Error (`Mask (Scripted { error; _ })) -> Mask_script.describe error
         | Error (`Mask error) -> Sexplib0.Sexp.to_string (Mask.sexp_of_error error))
@@ -898,7 +898,7 @@ let refused_against_tables () =
     match Mask.rule "db.t.s=expr:(if (= value \"b\") null value)" with
     | Error _ -> "parse"
     | Ok rule -> (
-        match Mask.resolve (Mask.make key ~script:Mask_script.empty ~strict:[] [ rule ]) [ table ] with
+        match Mask.resolve (Mask.make key ~script:Mask_script.empty ~strict:[] [ rule ]) ~relations:(fun () -> Ok Relations.none) [ table ] with
         | Ok [ mask ] ->
             Test_mask.with_batch [ Int64; String; Date; Int32; Float64 ]
               [ [ Test_mask.Big 1L; Text "a"; Null; Null; Null ]; [ Big 2L; Text "b"; Null; Null; Null ] ]
@@ -940,7 +940,7 @@ let configuration () =
                 (Mask_script.strict script)
               @ strict
             in
-            match Mask.resolve (Mask.make key ~script ~strict rules) [ table ] with
+            match Mask.resolve (Mask.make key ~script ~strict rules) ~relations:(fun () -> Ok Relations.none) [ table ] with
             | Ok [ mask ] -> Ok (script, mask)
             | Ok _ -> Error "tables"
             | Error (`Mask (Scripted { error; _ })) -> Error (Mask_script.describe error)

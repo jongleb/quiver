@@ -197,6 +197,12 @@ let forms =
       "The columns SELECTOR takes get BODY's value; a column takes the first rule naming it, from --mask \
        first, then the scripts in order." );
     ("(keep SELECTOR)", "Its columns are copied as they are, and count as decided.");
+    ( "(permute SELECTOR [LOW HIGH])",
+      "A keyed bijection of its columns, as --mask DB.TABLE.COLUMN=permute: keys stay keys, and every column \
+       a foreign key ties to one of them follows unless a rule names it. LOW and HIGH bound the integers." );
+    ( "(references \"DB.TABLE.COLUMN\" \"DB.TABLE.COLUMN\")",
+      "The first column refers to the second though no foreign key says so: a permute of either spreads to \
+       the other, and masking them differently is an error." );
     ( "(strict \"DB.TABLE\" …)",
       "Every column of these tables must be masked or kept by a rule; otherwise nothing is read, and the \
        message names the columns." );

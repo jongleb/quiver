@@ -25,6 +25,7 @@
   quiver.docs
   quiver.net
   quiver.openssl
+  zarith
   threads.posix
   unix
   file_path

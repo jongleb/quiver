@@ -14,6 +14,12 @@ module Field : sig
   [@@deriving sexp ~portable, equal ~portable, yojson]
 end
 
+(** In which order a table's rows reach the sink. *)
+type order =
+  | Key_order  (** By the table's key within each part, if it has one. *)
+  | Masked_key  (** The key is masked: rows come in the order of the values they had. *)
+[@@deriving sexp ~portable]
+
 type error =
   | No_fields of Name.t
   | Duplicate_field of { table : Name.t; field : Ident.t }

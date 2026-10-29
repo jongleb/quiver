@@ -35,6 +35,7 @@ module type S = sig
     Schema.Table.t ->
     ddl:string ->
     parts:int ->
+    order:Schema.order ->
     (unit, [> `Sink of error ]) result
     @@ portable
 

@@ -108,6 +108,8 @@ val make :
   masked:masked list ->
   (Chunk.t * state) list ->
   t
+(** A chunk's range is left out when a column of its key is masked: it would show the values
+    the mask hides. *)
 
 (** Why a manifest cannot be read back. *)
 type error =

@@ -176,7 +176,7 @@ type expression =
 let reserved =
   [
     "if"; "cond"; "let"; "row"; "define"; "mask"; "else"; "value"; "null"; "true"; "false"; "where"; "keep";
-    "strict"; "after-load"; "words"; "table"; "column"; "type";
+    "strict"; "after-load"; "words"; "table"; "column"; "type"; "permute"; "references";
   ]
 
 let column_types =
@@ -471,7 +471,7 @@ and position_of_form = function
 
 type definition = { name : string; parameters : string list; body : expression }
 type selector = Named of string | Where of { table : string; column : string; types : string list }
-type target = Masked of expression | Kept
+type target = Masked of expression | Kept | Permuted of (int64 * int64) option
 type rule = { at : position; selector : selector; target : target }
 
 type t = {
@@ -480,9 +480,10 @@ type t = {
   strict : (position * string) list;
   after_load : (position * string * string) list;
   dictionaries : (string * string iarray) list;
+  references : (position * (string * string * string) * (string * string * string)) list;
 }
 
-let empty = { definitions = []; rules = []; strict = []; after_load = []; dictionaries = [] }
+let empty = { definitions = []; rules = []; strict = []; after_load = []; dictionaries = []; references = [] }
 
 let selector_of form =
   match form with
@@ -563,6 +564,29 @@ let parse ~source ?(within = empty) ~load text =
          | Items { at; items = [ Symbol { name = "keep"; _ }; selector ] } ->
              let%map selector = selector_of selector in
              { script with rules = script.rules @ [ { at; selector; target = Kept } ] }
+         | Items { at; items = [ Symbol { name = "permute"; _ }; selector ] } ->
+             let%map selector = selector_of selector in
+             { script with rules = script.rules @ [ { at; selector; target = Permuted None } ] }
+         | Items { at; items = [ Symbol { name = "permute"; _ }; selector; Number { value = low; _ }; Number { value = high; _ } ] }
+           ->
+             let%bind selector = selector_of selector in
+             if Int64.compare low high > 0 then Error (Syntax { at; reason = "a permutation's LOW is above its HIGH" })
+             else Ok { script with rules = script.rules @ [ { at; selector; target = Permuted (Some (low, high)) } ] }
+         | Items
+             {
+               at;
+               items =
+                 [ Symbol { name = "references"; _ }; (Quoted { text = child; _ } | Symbol { name = child; _ });
+                   (Quoted { text = parent; _ } | Symbol { name = parent; _ }) ];
+             } -> (
+             let column text =
+               match String.split_on_char '.' text with
+               | [ database; table; column ] when not (List.mem "" [ database; table; column ]) -> Some (database, table, column)
+               | _ -> None
+             in
+             match (column child, column parent) with
+             | Some child, Some parent -> Ok { script with references = script.references @ [ (at, child, parent) ] }
+             | _ -> Error (Syntax { at; reason = "references names two columns: \"DB.TABLE.COLUMN\" \"DB.TABLE.COLUMN\"" }))
          | Items { at; items = Symbol { name = "strict"; _ } :: (_ :: _ as tables) } ->
              let%map tables =
                Base.Result.all
@@ -592,7 +616,13 @@ let parse ~source ?(within = empty) ~load text =
                  match words with
                  | [] -> Error (Unloadable { at; path; reason = "no words in it" })
                  | _ :: _ -> Ok { script with dictionaries = script.dictionaries @ [ (name, Iarray.of_list words) ] }))
-         | Items { at; items = Symbol { name = ("define" | "mask" | "keep" | "strict" | "after-load" | "words") as name; _ } :: _ } ->
+         | Items
+             {
+               at;
+               items =
+                 Symbol { name = ("define" | "mask" | "keep" | "strict" | "after-load" | "words" | "permute" | "references") as name; _ }
+                 :: _;
+             } ->
              Error
                (Syntax
                   {
@@ -600,6 +630,7 @@ let parse ~source ?(within = empty) ~load text =
                     reason =
                       name
                       ^ " is one of (define (NAME PARAMETER …) BODY), (mask SELECTOR BODY), (keep SELECTOR), \
+                         (permute SELECTOR [LOW HIGH]), (references \"DB.TABLE.COLUMN\" \"DB.TABLE.COLUMN\"), \
                          (strict \"DB.TABLE\" …), (after-load \"DB.TABLE\" \"STATEMENT\"), (words NAME \"FILE\")";
                   })
          | Items { at; items = Symbol { name; _ } :: _ } -> Error (Misplaced { at; form = name })
@@ -617,6 +648,7 @@ let expression ~source text =
 let rules { rules; _ } = rules
 let strict { strict; _ } = strict
 let after_load { after_load; _ } = after_load
+let references { references; _ } = List.map (fun (_, child, parent) -> (child, parent)) references
 
 (** What running a compiled expression sees. *)
 type frame = { key : Keyed.t; current : value; row : value array; locals : value array }

@@ -2,9 +2,12 @@
 type t =
   | Configure_session of Server.t
       (** UTC time zone, empty [sql_mode], long network timeouts, [REPEATABLE
-          READ] and, on MySQL, fresh [information_schema] stats (§5.4). *)
+          READ] and, on MySQL, fresh [information_schema] stats (§5.4); on TiDB
+          reads from TiKV only and no time limit. *)
   | Flush_tables_with_read_lock
   | Start_consistent_snapshot
+  | Pin_snapshot of int64
+      (** TiDB: every later statement of the session reads at this TSO, the schema too. *)
   | Unlock_tables
   | Backup_stage_start  (** MariaDB only. *)
   | Backup_stage_block_commit  (** MariaDB only: blocks commits, not reads. *)

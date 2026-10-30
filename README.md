@@ -135,14 +135,17 @@ SQL literals.
 
 - **One snapshot.** `FLUSH TABLES WITH READ LOCK` or MariaDB `BACKUP STAGE`; every session opens
   its transaction in parallel under the lock, so the lock lasts one round trip. The binlog
-  position and GTID set are taken before it is released.
+  position and GTID set are taken before it is released. On TiDB there is no lock at all: every
+  connection reads at one TSO (`tidb_snapshot`), the schema too, and holds it from garbage
+  collection while it reads; the TSO goes to the manifest for a TiCDC changefeed to start from.
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/snapshot-dark.svg">
   <img src="assets/snapshot.svg" alt="The lock covers one round trip in which every session opens its snapshot and the binlog position and GTID set are read, instead of one round trip per session" width="100%">
 </picture>
 
 - **Even chunks.** Key ranges are bisected by the server's `EXPLAIN` estimates and small
-  neighbours are merged, so skewed tables split evenly. Data flows from the first second and the
+  neighbours are merged, so skewed tables split evenly. On TiDB a table splits at the first key
+  of each of its regions. Data flows from the first second and the
   DDL of small tables is taken along the way.
 - **Tables without a key.** A table with neither a primary key nor a unique one over `NOT NULL`
   columns is read in one pass, cheap for the server. `--keyless-read ranges` has every reader
@@ -262,6 +265,8 @@ quiver dump -B shop --data-table shop.orders -o ./shop             # every table
 quiver dump -B shop --no-data -o ./schema                          # schema and objects, no rows
 quiver dump -T shop.orders --objects none -o ./orders              # without views, triggers, routines, events
 quiver dump --snapshot backup-stage -o ./dump                      # MariaDB: block commits only
+quiver dump -h tidb.example -P 4000 -B shop -o ./shop              # TiDB 8.5: one TSO, no lock
+quiver copy -h tidb.example -P 4000 -B shop --to-host mysql.example # TiDB straight into MySQL
 
 quiver load -d ./shop -B shop_copy -t 8                            # or: myloader -d ./shop
 ```
@@ -684,6 +689,7 @@ quiver is young and moving fast.
 | Unix sockets, `my.cnf`, every common login | shipped |
 | Agent, collector, relays and chains, mutual TLS 1.3 | shipped |
 | Online tuning of streams, compression, readers; chunks divided while read | shipped |
+| TiDB 8.5 as a source: one TSO, chunks by regions, dump and copy into MySQL | in progress |
 | Resuming a network transfer from the same snapshot | next |
 | Postgres and other providers | after MySQL is done |
 

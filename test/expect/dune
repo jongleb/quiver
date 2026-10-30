@@ -8,7 +8,9 @@
   angstrom
   quiver.core
   quiver.sink
-  quiver.mysql)
+  quiver.mysql
+  yojson
+  sexplib0)
  (inline_tests
   (flags
    (-source-tree-root .)))

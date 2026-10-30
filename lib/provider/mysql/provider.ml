@@ -21,7 +21,7 @@ type conn_config = {
 }
 
 (** How the group of sessions is opened. *)
-type snapshot_mode = Ftwrl | Backup_stage | Trx_only
+type snapshot_mode = Auto | Ftwrl | Backup_stage | Trx_only
 [@@deriving sexp_of ~portable, to_string ~capitalize:"kebab-case" ~portable, enumerate]
 
 type error =
@@ -47,6 +47,7 @@ type error =
       text : string;
     }
   | Warned_expression of { table : Quiver_core.Schema.Name.t; warnings : string list }
+  | Unsupported_sequence of Quiver_core.Schema.Name.t
 [@@deriving sexp_of ~portable]
 
 type binlog_file = { base : string; index : int } [@@deriving sexp_of ~portable, yojson]
@@ -64,6 +65,7 @@ type position =
       lock_held : Core.Time_ns.Span.t;
     }
   | Unlocked
+  | Pinned of { tso : int64 }
 [@@deriving sexp_of ~portable]
 
 let yojson_of_position = function
@@ -79,6 +81,7 @@ let yojson_of_position = function
             ];
         ]
   | Unlocked -> `List [ `String "Unlocked" ]
+  | Pinned { tso } -> `List [ `String "Pinned"; `Assoc [ ("tso", yojson_of_int64 tso) ] ]
 
 let position_of_yojson = function
   | `List [ `String "Locked"; fields ] ->
@@ -94,6 +97,8 @@ let position_of_yojson = function
               fields;
         }
   | `List [ `String "Unlocked" ] -> Unlocked
+  | `List [ `String "Pinned"; fields ] ->
+      Pinned { tso = Quiver_core.Codec.field "tso" int64_of_yojson fields }
   | json ->
       Ppx_yojson_conv_lib.Yojson_conv.of_yojson_error "Provider.position" json
 
@@ -106,6 +111,7 @@ type session = {
 type _ supports =
   | With_ftwrl : Quiver_core.Consistency.snapshot supports
   | With_backup_stage : Quiver_core.Consistency.snapshot supports
+  | Usual : Quiver_core.Consistency.snapshot supports
   | Without_lock : Quiver_core.Consistency.best_effort supports
 
 open Base.Result.Let_syntax
@@ -163,6 +169,8 @@ type connections = {
   generated : generated;
   keyless_read : keyless_read;
   server : Server.t;
+  tso : int64 option;
+      (** TiDB: the TSO every connection reads at, the schema too. *)
   control : session Await.Capsule.Await.With_mutex.t;
       (** Takes the lock while the sessions open their snapshots. *)
   sessions : session Await.Capsule.Await.With_mutex.t iarray;
@@ -204,38 +212,69 @@ let connect config (wanted : Quiver_core.Provider_intf.sessions) =
           Quiver_core.Guarded.hold control (fun { conn; _ } ->
               Link.server (Conn.link conn))
         in
-        let suggested () =
+        let suggested hint ~per_thread =
           Quiver_core.Guarded.hold control (fun { conn; _ } ->
               Result.map
                 (fun rows ->
-                  match (server, rows) with
-                  | Mysql_8_4 _, [ [| Some threads |] ] ->
-                      Option.map (fun threads -> 2 * threads)
+                  match rows with
+                  | [ [| Some threads |] ] ->
+                      Option.map (fun threads -> per_thread * threads)
                         (int_of_string_opt threads)
-                  | ( (Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _),
-                      [ [| Some threads |] ] ) ->
-                      int_of_string_opt threads
                   | _ -> None)
-                (client_failure (Conn.rows conn (Read_threads server))))
+                (client_failure (Conn.rows conn (Read_threads hint))))
         in
         let kept =
+          let fitted suggestion =
+            Result.map
+              (fun suggestion ->
+                Option.fold ~none:most ~some:(Int.min most)
+                  (Base.Option.filter suggestion ~f:(fun threads -> threads > 0)))
+              suggestion
+          in
           match (wanted, server) with
-          | Exactly _, _ | At_most _, Mysql_8_0 _ -> Ok most
-          | At_most _, (Mysql_8_4 _ | Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _)
-            ->
-              Result.map
-                (fun suggestion ->
-                  Option.fold ~none:most ~some:(Int.min most)
-                    (Base.Option.filter suggestion ~f:(fun threads -> threads > 0)))
-                (suggested ())
+          | Exactly _, _ | At_most _, (Mysql_8_0 _ | Tidb_8_5 _) -> Ok most
+          | At_most _, Mysql_8_4 _ -> fitted (suggested `Innodb ~per_thread:2)
+          | At_most _, (Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _) ->
+              fitted (suggested `Thread_pool ~per_thread:1)
+        in
+        let pinned kept =
+          match server with
+          | Mysql_8_0 _ | Mysql_8_4 _ | Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _ ->
+              Ok None
+          | Tidb_8_5 _ ->
+              let%bind tso =
+                Quiver_core.Guarded.hold control (fun { conn; _ } ->
+                    let query = Query.Binlog_status server in
+                    let%bind rows = client_failure (Conn.rows conn query) in
+                    match rows with
+                    | [| _; Some tso; _; _; _ |] :: _ ->
+                        Option.to_result ~none:(Client (Unexpected_result query))
+                          (Base.Option.filter (Int64.of_string_opt tso) ~f:(fun tso ->
+                               Int64.compare tso 0L > 0))
+                    | _ -> Error (Client (Unexpected_result query)))
+              in
+              let%map () =
+                Base.Result.all_unit
+                  (Quiver_core.Concurrent.spread ~workers:(List.length kept + 1)
+                     (Iarray.of_list (control :: kept))
+                     (fun connection ->
+                       Quiver_core.Guarded.hold connection (fun { conn; _ } ->
+                           client_failure (Conn.execute conn (Pin_snapshot tso)))))
+              in
+              Some tso
         in
         match kept with
         | Error error ->
             List.iter hang_up (control :: sessions);
             Error (`Provider error)
-        | Ok kept ->
+        | Ok kept -> (
             let #(sessions, surplus) = Base.List.split_n sessions kept in
             List.iter hang_up surplus;
+            match pinned sessions with
+            | Error error ->
+                List.iter hang_up (control :: sessions);
+                Error (`Provider error)
+            | Ok tso ->
             let idle = Await.Await.Mpmc_queue.create () in
             List.iter
               (fun (connection : session Await.Capsule.Await.With_mutex.t) ->
@@ -247,10 +286,11 @@ let connect config (wanted : Quiver_core.Provider_intf.sessions) =
                 generated = config.generated;
                 keyless_read = config.keyless_read;
                 server;
+                tso;
                 control;
                 sessions = Iarray.of_list sessions;
                 idle;
-              })
+              }))
 
 let opened { sessions; _ } = Iarray.length sessions
 
@@ -275,10 +315,11 @@ let supports : type lvl.
     (lvl supports, [> `Consistency of Quiver_core.Consistency.error ]) result =
  fun mode level ->
   match (mode, level) with
+  | Auto, Snapshot -> Ok Usual
   | Ftwrl, Snapshot -> Ok With_ftwrl
   | Backup_stage, Snapshot -> Ok With_backup_stage
   | Trx_only, Best_effort -> Ok Without_lock
-  | (Ftwrl | Backup_stage), Best_effort ->
+  | (Auto | Ftwrl | Backup_stage), Best_effort ->
       Error (`Consistency (Unsupported (Any Best_effort)))
   | Trx_only, Snapshot -> Error (`Consistency (Unsupported (Any Snapshot)))
 
@@ -780,22 +821,41 @@ let plan connections (schema : Quiver_core.Schema.t)
                  | Primary key | Unique { fields = key; _ } -> Some key
                  | Indexed { field; _ } -> Some (field, [])
                in
-               match splittable with
-               | None -> whole
-               | Some _ when count <= 1 -> whole
-               | Some ((first, rest) as key) -> (
+               let sampled =
+                 match connections.server with
+                 | Tidb_8_5 _ -> `Regions
+                 | Mysql_8_0 _ | Mysql_8_4 _ | Mariadb_10_11 _ | Mariadb_11_4 _
+                 | Mariadb_11_8 _ ->
+                     `Estimates
+               in
+               match (splittable, sampled) with
+               | None, _ -> whole
+               | Some _, `Estimates when count <= 1 -> whole
+               | Some ((first, rest) as key), _ -> (
                    match
-                     Base.Option.all
+                     ( Base.Option.all
                        (List.map
                           (fun (field : Quiver_core.Schema.Field.t) ->
                             Option.map
                               (fun (_ : string -> Quiver_core.Key.value option) ->
                                 field)
                               (key_parser field.ltype))
-                          (first :: rest))
+                          (first :: rest)),
+                       sampled )
                    with
-                   | None | Some [] -> whole
-                   | Some (leading :: _ as parsed) -> (
+                   | (None | Some []), _ -> whole
+                   | Some parsed, `Regions -> (
+                       let query = Query.Region_starts { table = table.name; key } in
+                       let%bind rows = provider (fetch connections query) in
+                       let%bind found = Base.Result.all (List.map (tuple parsed query) rows) in
+                       match
+                         Base.List.remove_consecutive_duplicates
+                           ~equal:(List.equal Quiver_core.Key.equal_value)
+                           found
+                       with
+                       | [] | [ _ ] -> whole
+                       | _ :: bounds -> Quiver_core.Chunk.of_bounds table bounds)
+                   | Some (leading :: _ as parsed), `Estimates -> (
                        let query =
                          Query.Key_bounds
                            { table = table.name; key = first.name }
@@ -813,6 +873,7 @@ let plan connections (schema : Quiver_core.Schema.t)
                                | Mariadb_10_11 _ | Mariadb_11_4 _
                                | Mariadb_11_8 _ ->
                                    8
+                               | Tidb_8_5 _ -> 1
                              in
                              let weigh from below : (int, planning) result =
                                let query =
@@ -949,7 +1010,7 @@ let plan connections (schema : Quiver_core.Schema.t)
   List.concat chunks
 
 let snapshot (type lvl) (supports : lvl supports) connections =
-  let { server; control; sessions; _ } = connections in
+  let { server; control; sessions; tso; _ } = connections in
   let execute statement =
     provider
       (Quiver_core.Guarded.hold control (fun { conn; _ } ->
@@ -964,7 +1025,13 @@ let snapshot (type lvl) (supports : lvl supports) connections =
                  (client_failure (Conn.rows conn query))
              in
              let%bind status = rows (Binlog_status server) in
-             let%map gtids = rows (Gtid_executed server) in
+             let%map gtids =
+               match server with
+               | Mysql_8_0 _ | Mysql_8_4 _ -> rows (Gtid_executed `Mysql)
+               | Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _ ->
+                   rows (Gtid_executed `Mariadb)
+               | Tidb_8_5 _ -> Error (Gtid (Not_kept server))
+             in
              (status, gtids)))
     in
     match (status, gtids) with
@@ -994,31 +1061,37 @@ let snapshot (type lvl) (supports : lvl supports) connections =
                client_failure (Conn.execute conn Start_consistent_snapshot))))
   in
   let opened =
-    let%bind lock =
-      match (supports, server) with
-      | With_ftwrl, _ ->
+    let%bind way =
+      match (supports, tso) with
+      | With_ftwrl, Some _ ->
+          Error (`Provider (Unsupported_snapshot_mode { mode = Ftwrl; server }))
+      | With_backup_stage, Some _ ->
+          Error (`Provider (Unsupported_snapshot_mode { mode = Backup_stage; server }))
+      | (Usual | Without_lock), Some tso -> Ok (`Pinned tso)
+      | (With_ftwrl | Usual), None ->
           Ok
-            (Some
+            (`Locked
                ( Global_read_lock,
                  [ Statement.Flush_tables_with_read_lock ],
                  Statement.Unlock_tables ))
-      | With_backup_stage, (Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _)
-        ->
-          Ok
-            (Some
-               ( Backup_stage_block_commit,
-                 [ Statement.Backup_stage_start; Backup_stage_block_commit ],
-                 Statement.Backup_stage_end ))
-      | With_backup_stage, (Mysql_8_0 _ | Mysql_8_4 _) ->
-          Error
-            (`Provider (Unsupported_snapshot_mode { mode = Backup_stage; server }))
-      | Without_lock, _ -> Ok None
+      | With_backup_stage, None -> (
+          match server with
+          | Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _ ->
+              Ok
+                (`Locked
+                   ( Backup_stage_block_commit,
+                     [ Statement.Backup_stage_start; Backup_stage_block_commit ],
+                     Statement.Backup_stage_end ))
+          | Mysql_8_0 _ | Mysql_8_4 _ | Tidb_8_5 _ ->
+              Error (`Provider (Unsupported_snapshot_mode { mode = Backup_stage; server })))
+      | Without_lock, None -> Ok `Unlocked
     in
-    match lock with
-    | None ->
+    match way with
+    | `Pinned tso -> Ok (Pinned { tso })
+    | `Unlocked ->
         let%map () = provider (started ()) in
         Unlocked
-    | Some (lock, acquire, release) ->
+    | `Locked (lock, acquire, release) ->
         let%bind () =
           Base.List.fold_result acquire ~init:() ~f:(fun () statement ->
               execute statement)
@@ -1089,6 +1162,20 @@ let objects { conn; _ } database =
             (let%map name = Quiver_core.Ident.of_string name in
              (name, Quiver_core.Definition.Event))
       | _ -> None)
+  in
+  let%bind () =
+    match Link.server (Conn.link conn) with
+    | Mysql_8_0 _ | Mysql_8_4 _ | Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _ -> Ok ()
+    | Tidb_8_5 _ -> (
+        let%bind sequences =
+          names (Sequences database) (function
+            | [| Some name |] -> Some (Quiver_core.Ident.of_string name)
+            | _ -> None)
+        in
+        match sequences with
+        | [] -> Ok ()
+        | table :: _ ->
+            Error (`Provider (Unsupported_sequence { Quiver_core.Schema.Name.database; table })))
   in
   let views =
     List.filter_map
@@ -1307,6 +1394,11 @@ let source position =
   ^
   match position with
   | Unlocked -> "# quiver: sessions opened without a lock, no common position\n"
+  | Pinned { tso } ->
+      Printf.sprintf
+        "# TiDB TSO (tidb_snapshot, TiCDC --start-ts) = %Ld\n# quiver: read at %s\n" tso
+        (Core.Time_ns.to_string_utc
+           (Core.Time_ns.of_int_ns_since_epoch (Int64.to_int (Int64.shift_right tso 18) * 1_000_000)))
   | Locked { lock; binlog; lock_held } ->
       Option.fold ~none:""
         ~some:(fun { file = { base; index }; offset; gtid } ->

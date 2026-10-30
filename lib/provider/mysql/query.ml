@@ -13,14 +13,15 @@ type t =
       table : Quiver_core.Schema.Name.t;
       key : Quiver_core.Ident.t;
     }
-  | Read_threads of Server.t
+  | Read_threads of [ `Innodb | `Thread_pool ]
   | Binlog_status of Server.t
-  | Gtid_executed of Server.t
+  | Gtid_executed of [ `Mysql | `Mariadb ]
   | Show_create of Quiver_core.Ddl_target.t
   | View_columns of Quiver_core.Ident.t
   | Triggers of Quiver_core.Ident.t
   | Routines of Quiver_core.Ident.t
   | Events of Quiver_core.Ident.t
+  | Sequences of Quiver_core.Ident.t
   | Show_definition of {
       database : Quiver_core.Ident.t;
       name : Quiver_core.Ident.t;
@@ -57,13 +58,19 @@ type t =
       key : Quiver_core.Schema.Field.t * Quiver_core.Schema.Field.t list;
       candidates : Quiver_core.Key.t * Quiver_core.Key.t list;
     }
+  | Region_starts of {
+      table : Quiver_core.Schema.Name.t;
+      key : Quiver_core.Schema.Field.t * Quiver_core.Schema.Field.t list;
+    }
 [@@deriving sexp_of ~portable]
 
 
 let qualified { Quiver_core.Schema.Name.database; table } =
   [%string "%{Quiver_core.Ident.backquoted database}.%{Quiver_core.Ident.backquoted table}"]
 
-let system = "('mysql', 'sys', 'information_schema', 'performance_schema')"
+let outside_system =
+  "TABLE_SCHEMA NOT IN ('mysql', 'sys', 'information_schema', 'performance_schema') AND \
+   BINARY TABLE_SCHEMA NOT IN ('INFORMATION_SCHEMA', 'PERFORMANCE_SCHEMA', 'METRICS_SCHEMA')"
 
 let columns fields =
   String.concat ", "
@@ -119,50 +126,47 @@ let sql = function
       [%string
         "SELECT TABLE_SCHEMA, TABLE_NAME, IFNULL(TABLE_ROWS, 0), \
          IFNULL(DATA_LENGTH, 0) FROM information_schema.TABLES WHERE \
-         TABLE_TYPE = 'BASE TABLE' AND TABLE_SCHEMA NOT IN %{system} ORDER BY \
+         TABLE_TYPE = 'BASE TABLE' AND %{outside_system} ORDER BY \
          TABLE_SCHEMA, TABLE_NAME"]
   | Columns ->
       [%string
         "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, \
          IS_NULLABLE, NUMERIC_PRECISION, NUMERIC_SCALE, DATETIME_PRECISION, \
-         EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA NOT IN \
-         %{system} ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION"]
+         EXTRA FROM information_schema.COLUMNS WHERE %{outside_system} ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION"]
   | Indexes server ->
-      let usable =
+      let column, usable =
         match server with
-        | Mysql_8_0 _ | Mysql_8_4 _ -> "IS_VISIBLE = 'YES'"
-        | Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _ -> "IGNORED = 'NO'"
+        | Mysql_8_0 _ | Mysql_8_4 _ -> ("COLUMN_NAME", "IS_VISIBLE = 'YES'")
+        | Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _ ->
+            ("COLUMN_NAME", "IGNORED = 'NO'")
+        | Tidb_8_5 _ ->
+            ("IF(EXPRESSION IS NULL, COLUMN_NAME, NULL)", "IS_VISIBLE = 'YES'")
       in
       [%string
-        "SELECT TABLE_SCHEMA, TABLE_NAME, INDEX_NAME, COLUMN_NAME, NON_UNIQUE, \
+        "SELECT TABLE_SCHEMA, TABLE_NAME, INDEX_NAME, %{column}, NON_UNIQUE, \
          SUB_PART, IFNULL(CARDINALITY, 0), INDEX_TYPE = 'BTREE' AND %{usable} \
-         FROM information_schema.STATISTICS WHERE TABLE_SCHEMA NOT IN %{system} \
+         FROM information_schema.STATISTICS WHERE %{outside_system} \
          ORDER BY TABLE_SCHEMA, TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX"]
   | Foreign_keys ->
       [%string
         "SELECT TABLE_SCHEMA, TABLE_NAME, CONSTRAINT_NAME, COLUMN_NAME, \
          REFERENCED_TABLE_SCHEMA, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME \
          FROM information_schema.KEY_COLUMN_USAGE WHERE REFERENCED_TABLE_NAME IS NOT NULL \
-         AND TABLE_SCHEMA NOT IN %{system} \
+         AND %{outside_system} \
          ORDER BY TABLE_SCHEMA, TABLE_NAME, CONSTRAINT_NAME, ORDINAL_POSITION"]
   | Key_bounds { table; key } ->
       [%string "SELECT MIN(%{Quiver_core.Ident.backquoted key}), MAX(%{Quiver_core.Ident.backquoted key}) FROM %{qualified table}"]
-  | Read_threads server -> (
-      match server with
-      | Mysql_8_0 _ | Mysql_8_4 _ -> "SELECT @@innodb_read_io_threads"
-      | Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _ ->
-          "SELECT @@thread_pool_size")
+  | Read_threads `Innodb -> "SELECT @@innodb_read_io_threads"
+  | Read_threads `Thread_pool -> "SELECT @@thread_pool_size"
   | Binlog_status server -> (
       match server with
       | Mysql_8_0 _ -> "SHOW MASTER STATUS"
       | Mysql_8_4 _ -> "SHOW BINARY LOG STATUS"
       | Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _ ->
-          "SHOW BINLOG STATUS")
-  | Gtid_executed server -> (
-      match server with
-      | Mysql_8_0 _ | Mysql_8_4 _ -> "SELECT @@GLOBAL.gtid_executed"
-      | Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _ ->
-          "SELECT @@GLOBAL.gtid_binlog_pos")
+          "SHOW BINLOG STATUS"
+      | Tidb_8_5 _ -> "SHOW MASTER STATUS")
+  | Gtid_executed `Mysql -> "SELECT @@GLOBAL.gtid_executed"
+  | Gtid_executed `Mariadb -> "SELECT @@GLOBAL.gtid_binlog_pos"
   | Show_create (Database database) ->
       [%string "SHOW CREATE DATABASE %{Quiver_core.Ident.backquoted database}"]
   | Show_create (Table name) -> [%string "SHOW CREATE TABLE %{qualified name}"]
@@ -187,6 +191,10 @@ let sql = function
       [%string
         "SELECT EVENT_NAME FROM information_schema.EVENTS WHERE EVENT_SCHEMA = \
          %{text (database :> string)} ORDER BY EVENT_NAME"]
+  | Sequences database ->
+      [%string
+        "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = \
+         %{text (database :> string)} AND TABLE_TYPE = 'SEQUENCE' ORDER BY TABLE_NAME"]
   | Show_definition { database; name; kind } ->
       let kind =
         match kind with
@@ -298,6 +306,9 @@ let sql = function
         | conditions -> [%string {| WHERE %{String.concat " AND " conditions}|}]
       in
       [%string "EXPLAIN SELECT 1 FROM %{qualified table}%{where}"]
+  | Region_starts { table; key = first, rest } ->
+      let key = columns (first :: rest) in
+      [%string "SELECT %{key} FROM %{qualified table} TABLESAMPLE REGIONS() ORDER BY %{key}"]
   | Ordered_keys { table; key = first, rest; candidates = candidate, others } ->
       let fields = first :: rest in
       let tuple (bound : Quiver_core.Key.t) =

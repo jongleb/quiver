@@ -16,16 +16,17 @@ type t =
       table : Quiver_core.Schema.Name.t;
       key : Quiver_core.Ident.t;
     }
-  | Read_threads of Server.t
+  | Read_threads of [ `Innodb | `Thread_pool ]
       (** The server's sizing hint for parallel reads: InnoDB read I/O
           threads on MySQL, the thread pool's groups on MariaDB. *)
-  | Binlog_status of Server.t
-  | Gtid_executed of Server.t
+  | Binlog_status of Server.t  (** On TiDB, the TSO of a fresh transaction. *)
+  | Gtid_executed of [ `Mysql | `Mariadb ]
   | Show_create of Quiver_core.Ddl_target.t
   | View_columns of Quiver_core.Ident.t
   | Triggers of Quiver_core.Ident.t
   | Routines of Quiver_core.Ident.t
   | Events of Quiver_core.Ident.t
+  | Sequences of Quiver_core.Ident.t  (** The database's sequences (TiDB). *)
   | Show_definition of {
       database : Quiver_core.Ident.t;
       name : Quiver_core.Ident.t;
@@ -72,7 +73,12 @@ type t =
       table : Quiver_core.Schema.Name.t;
       key : Quiver_core.Schema.Field.t * Quiver_core.Schema.Field.t list;
       candidates : Quiver_core.Key.t * Quiver_core.Key.t list;
-    }  (** The existing [candidates], distinct and in the server's key order. *)
+    }
+  | Region_starts of {
+      table : Quiver_core.Schema.Name.t;
+      key : Quiver_core.Schema.Field.t * Quiver_core.Schema.Field.t list;
+    }
+      (** TiDB: the key of the first row of each region of the table, in key order. *)  (** The existing [candidates], distinct and in the server's key order. *)
 [@@deriving sexp_of ~portable]
 
 val sql : t -> string @@ portable

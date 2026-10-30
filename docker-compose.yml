@@ -89,6 +89,16 @@ services:
       <<: *mysql-healthcheck
       test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
 
+  # TiDB 8.5 LTS on unistore: one process with regions, TSO and tidb_snapshot, but no
+  # garbage collection (the IT step seeds its safe point) and not for consistency under
+  # writes. No password, no TLS. Pinned by digest: the tags are re-pushed.
+  tidb85:
+    image: pingcap/tidb:v8.5.8@sha256:df168c764bf2dfdb166dc37a5c3b0e210d29d5f3ab2d33317fd0fdf7b32037f5
+    command: ["--store=unistore", "--path="]
+    ports:
+      - "127.0.0.1:34085:4000"
+    mem_limit: 1g
+
   # Network faults for the chaos tests: quiver connects through a proxy whose
   # bandwidth, resets and silences the test sets over the HTTP API.
   toxiproxy:

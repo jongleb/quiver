@@ -2,6 +2,7 @@ type t =
   | Configure_session of Server.t
   | Flush_tables_with_read_lock
   | Start_consistent_snapshot
+  | Pin_snapshot of int64
   | Unlock_tables
   | Backup_stage_start
   | Backup_stage_block_commit
@@ -42,6 +43,9 @@ let sql = function
         | Mariadb_10_11 _ -> "tx_isolation = 'REPEATABLE-READ'"
         | Mariadb_11_4 _ | Mariadb_11_8 _ ->
             "transaction_isolation = 'REPEATABLE-READ'"
+        | Tidb_8_5 _ ->
+            "transaction_isolation = 'REPEATABLE-READ', \
+             tidb_isolation_read_engines = 'tikv,tidb', max_execution_time = 0"
       and day_in_seconds = 86_400 in
       [%string
         "SET SESSION time_zone = '+00:00', sql_mode = '', net_read_timeout = \
@@ -49,6 +53,7 @@ let sql = function
          %{isolation}"]
   | Flush_tables_with_read_lock -> "FLUSH TABLES WITH READ LOCK"
   | Start_consistent_snapshot -> "START TRANSACTION WITH CONSISTENT SNAPSHOT"
+  | Pin_snapshot tso -> [%string "SET SESSION tidb_snapshot = '%{tso#Int64}'"]
   | Unlock_tables -> "UNLOCK TABLES"
   | Backup_stage_start -> "BACKUP STAGE START"
   | Backup_stage_block_commit -> "BACKUP STAGE BLOCK_COMMIT"

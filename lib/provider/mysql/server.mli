@@ -7,6 +7,7 @@ type t = private
   | Mariadb_10_11 of int  (** MariaDB 10.11 LTS. *)
   | Mariadb_11_4 of int  (** MariaDB 11.4 LTS. *)
   | Mariadb_11_8 of int  (** MariaDB 11.8 LTS. *)
+  | Tidb_8_5 of int  (** TiDB 8.5 LTS, its own patch number (not the MySQL version it reports). *)
 [@@deriving sexp_of ~portable]
 
 val of_version_string : string -> (t, [> `Unsupported of string ]) result @@ portable

@@ -1,4 +1,4 @@
-type error = Malformed of string | Tag_unsupported of Server.t
+type error = Malformed of string | Tag_unsupported of Server.t | Not_kept of Server.t
 [@@deriving sexp_of ~portable]
 
 module Uuid = struct
@@ -135,6 +135,7 @@ let of_server_string (server : Server.t) raw =
   | Mysql_8_0 _ -> parse_mysql ~tags:(`Forbidden server) raw
   | Mysql_8_4 _ -> parse_mysql ~tags:`Allowed raw
   | Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _ -> parse_mariadb raw
+  | Tidb_8_5 _ -> Error (`Gtid (Not_kept server))
 
 let to_string = function
   | Mysql sets ->

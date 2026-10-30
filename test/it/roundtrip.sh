@@ -1,5 +1,5 @@
 #!/bin/sh
-# Usage: roundtrip.sh QUIVER LINK_CHECK DIFFERENTIAL COMPOSE_FILE FIXTURE BANK LOAD_STATEMENT SAKILA_SCHEMA SAKILA_DATA OUT NODE_CERT
+# Usage: roundtrip.sh QUIVER LINK_CHECK DIFFERENTIAL COMPOSE_FILE FIXTURE BANK LOAD_STATEMENT SAKILA_SCHEMA SAKILA_DATA OUT NODE_CERT TIDB_FIXTURE
 # For every test server: load FIXTURE, dump it, drop it, restore the dump,
 # and require identical, non-NULL CHECKSUM TABLE results and row counts.
 # QUIVER_IT_SERVERS="mysql84 mariadb118" limits the run to those services.
@@ -8,6 +8,7 @@ set -eu
 quiver=$1 link_check=$2 differential=$3 compose=$4 fixture=$5 bank=$6 load=$7 sakila_schema=$8 sakila_data=$9 out=${10}
 # Every node of quiver's protocol speaks mutual TLS with the test certificates.
 certs=$(cd "$(dirname "${11}")" && pwd)
+tidb_fixture=${12}
 wire="--wire-cert $certs/node.crt --wire-key $certs/node.key --wire-peers $certs/ca.crt"
 # myloader of mydumper v1.0.11, pinned: restores the mydumper layout quiver writes.
 myloader_image=mydumper/mydumper@sha256:7ac39f7dbcf381b3c560dc81e108e28f8aa82c0422fe97ffa7af75d296f5b494
@@ -554,6 +555,73 @@ consistent() {
   [ "$versions" = $((2 * transfers)) ] || fail "$snapshot: $versions versions for $transfers transfers"
   echo "$service $snapshot: consistent under writes ($transfers transfers)"
 }
+# TiDB as a source, into MySQL: its fixture dumped at one TSO and restored by quiver
+# load, then copied straight across; every table's rows equal, JSON by value (TiDB
+# prints a whole double without .0, MySQL reads it as an integer), the view works, and
+# ftwrl is refused. unistore keeps no GC safe point, which tidb_snapshot checks, so the
+# step seeds one. TiDB's root has no password. Selecting the TiDB service runs it; the
+# MySQL target must be up too.
+tidb() {
+  selected "$1" || return 0
+  service=$1 target=$2 port=$3 target_port=$4 tls=$5
+  sql() {
+    docker compose -p quiver -f "$compose" exec -T -e MYSQL_PWD=quiver "$target" \
+      mysql -uroot --default-character-set=utf8mb4 "$@"
+  }
+  source_sql() {
+    docker compose -p quiver -f "$compose" exec -T "$target" \
+      mysql -uroot -h "$service" -P 4000 --default-character-set=utf8mb4 "$@"
+  }
+  tries=0
+  until source_sql -e "SELECT 1" > /dev/null 2>&1; do
+    tries=$((tries + 1))
+    [ "$tries" -lt 60 ] || fail "TiDB did not start"
+    sleep 2
+  done
+  source_sql -e "INSERT INTO mysql.tidb VALUES ('tikv_gc_safe_point', '20000101-00:00:00.000 +0000', \
+    'unistore keeps none') ON DUPLICATE KEY UPDATE VARIABLE_VALUE = VALUES(VARIABLE_VALUE)"
+  source_sql < "$tidb_fixture"
+  sql -e "SET GLOBAL local_infile = 1"
+  same() {
+    [ "$(source_sql -N -e 'SELECT COUNT(*) FROM quiver_tidb.big')" = 50000 ] || fail "$1: TiDB does not answer"
+    [ "$(sql -N -e 'SELECT COUNT(*) FROM quiver_tidb.big')" = 50000 ] || fail "$1: big lost rows"
+    for table in "all_types:id, i8, u8, i16, i24, i32, u64, f, d, dec_, c, vc, tx, HEX(bin_), HEX(vb), HEX(bl), dt, dtm, ts, tm, y, e, s, HEX(b):id" \
+      "big:*:id" "composite:*:region, code" "nonclustered:*:id" "no_key:*:msg, at" "nothing:*:id"; do
+      name=${table%%:*} rest=${table#*:}
+      columns=${rest%%:*} order=${rest#*:}
+      query="SET time_zone = '+00:00'; SELECT $columns FROM quiver_tidb.$name ORDER BY $order"
+      [ "$(source_sql -N -e "$query" | cksum)" = "$(sql -N -e "$query" | cksum)" ] \
+        || fail "$1: rows of $name differ"
+    done
+    for id in 1 2 3; do
+      hex=$(source_sql -N -e "SELECT HEX(j) FROM quiver_tidb.all_types WHERE id = $id")
+      [ "$(sql -N -e "SELECT COUNT(*) FROM quiver_tidb.all_types WHERE id = $id AND \
+        j <=> CAST(CONVERT(UNHEX('$hex') USING utf8mb4) AS JSON)")" = 1 ] || fail "$1: JSON of row $id differs"
+    done
+    [ "$(sql -N -e 'SELECT COUNT(*) FROM quiver_tidb.recent')" = 10 ] || fail "$1: the view does not read"
+  }
+  dir="$out/$service-dump"
+  rm -rf "$dir"
+  "$quiver" dump --tls disabled -P "$port" -u root -B quiver_tidb -t 4 -o "$dir" > "$dir.log" 2>&1 \
+    || fail "dump: $(cat "$dir.log")"
+  grep -q '"Pinned"' "$dir/quiver.json" || fail "no TSO in the manifest"
+  [ "$(ls "$dir"/quiver_tidb.big.*.sql | wc -l)" -gt 1 ] || fail "big was not split by its regions"
+  [ "$(ls "$dir"/quiver_tidb.composite.*.sql | wc -l)" -gt 1 ] || fail "composite was not split by its regions"
+  sql -e "DROP DATABASE IF EXISTS quiver_tidb"
+  "$quiver" load --tls "$tls" -P "$target_port" -p quiver -d "$dir" -t 4 > "$dir.load.log" 2>&1 \
+    || fail "load: $(cat "$dir.load.log")"
+  same "dump and load"
+  sql -e "DROP DATABASE quiver_tidb"
+  "$quiver" copy --tls disabled -P "$port" -u root -B quiver_tidb -t 4 --to-tls "$tls" \
+    --to-port "$target_port" --to-password quiver > "$dir.copy.log" 2>&1 || fail "copy: $(cat "$dir.copy.log")"
+  same "copy"
+  if "$quiver" dump --snapshot ftwrl --tls disabled -P "$port" -u root -B quiver_tidb -o "$out/$service-ftwrl" \
+    2> "$out/$service-ftwrl.log"; then
+    fail "ftwrl was accepted"
+  fi
+  grep -q Unsupported_snapshot_mode "$out/$service-ftwrl.log" || fail "ftwrl failed with: $(cat "$out/$service-ftwrl.log")"
+  echo "$service: dumped at one TSO and copied into $target, rows equal; ftwrl refused"
+}
 # qcheck tables of every type with edge values, random keys and dump flags:
 # insert, dump, restore with the server's client, compare rows and checksums.
 # QUIVER_PBT_COUNT cases (50); QUIVER_PBT_SEED repeats a run.
@@ -620,6 +688,7 @@ chaos mariadb1011 33101 mariadb disabled
 chaos mariadb114 33114 mariadb verified
 chaos mariadb118 33118 mariadb verified
 consistent mysql80 33080 mysql cte_max_recursion_depth verified ftwrl
+tidb tidb85 mysql84 34085 33084 verified
 consistent mysql84 33084 mysql cte_max_recursion_depth verified ftwrl
 consistent mariadb1011 33101 mariadb max_recursive_iterations disabled backup-stage
 consistent mariadb118 33118 mariadb max_recursive_iterations verified backup-stage

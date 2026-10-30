@@ -28,7 +28,8 @@
    %{dep:sakila/sakila-schema.sql}
    %{dep:sakila/sakila-data.sql}
    %{env:TMPDIR=/tmp}/quiver-it
-   %{dep:../tls/node.crt})))
+   %{dep:../tls/node.crt}
+   %{dep:tidb.sql})))
 
 (executable
  (name differential)

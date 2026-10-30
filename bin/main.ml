@@ -72,7 +72,7 @@ let () =
     let module Dump = Quiver_core.Dump.Make (Quiver_mysql.Provider) (Sink) in
     let result =
       match mode with
-      | Ftwrl | Backup_stage ->
+      | Auto | Ftwrl | Backup_stage ->
           Dump.run
             { conn; mode; level = Snapshot; filter; rows; objects; masking; opts }
             sink
@@ -156,7 +156,9 @@ let () =
                   (Quiver_mysql.Provider.sexp_of_lock lock)
                   Core.Time_ns.Span.pp lock_held
             | Unlocked ->
-                Format.printf "no lock: each session has its own snapshot@.")
+                Format.printf "no lock: each session has its own snapshot@."
+            | Pinned { tso } ->
+                Format.printf "no lock: every session read at TSO %Ld@." tso)
           (Quiver_core.Codec.decode Quiver_mysql.Provider.position_of_yojson
              manifest.position);
         0
@@ -951,11 +953,14 @@ let () =
         & opt
             (choices Quiver_mysql.Provider.string_of_snapshot_mode
                Quiver_mysql.Provider.all_of_snapshot_mode)
-            Quiver_mysql.Provider.Ftwrl
+            Quiver_mysql.Provider.Auto
         & described [ "snapshot" ] ~docv:"MODE"
             ~doc:
-              "$(b,ftwrl) and $(b,backup-stage) (MariaDB) give one consistent \
-               snapshot; $(b,trx-only) takes no lock and is only best effort.")
+              "$(b,auto) takes the server's own consistent snapshot: $(b,ftwrl) on MySQL \
+               and MariaDB, the TSO on TiDB (no lock; the sessions hold it from garbage \
+               collection while they read). $(b,ftwrl) and $(b,backup-stage) (MariaDB) \
+               give one consistent snapshot; $(b,trx-only) takes no lock and is only best \
+               effort.")
     in
     let rule parse =
       Arg.conv

@@ -1,6 +1,7 @@
 type error =
   | Malformed of string  (** Not a GTID set in the server's syntax. *)
   | Tag_unsupported of Server.t  (** Tagged GTIDs exist from MySQL 8.4 on. *)
+  | Not_kept of Server.t  (** The server keeps no GTIDs: TiDB's position is a TSO. *)
 [@@deriving sexp_of ~portable]
 
 (** A server UUID in canonical lowercase form. *)

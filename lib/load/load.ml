@@ -112,7 +112,7 @@ let session (config : Quiver_mysql.Provider.conn_config) binlog uniqueness =
     match (uniqueness, Quiver_mysql.Link.server link) with
     | Checked_on_mariadb, (Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _) ->
         Quiver_mysql.Link.run_statement link Check_unique
-    | Unchecked, _ | Checked_on_mariadb, (Mysql_8_0 _ | Mysql_8_4 _) -> Ok ()
+    | Unchecked, _ | Checked_on_mariadb, (Mysql_8_0 _ | Mysql_8_4 _ | Tidb_8_5 _) -> Ok ()
   in
   let%map () =
     match binlog with
@@ -495,7 +495,7 @@ let run config ~dir target ~keys ~after ~binlog ~threads =
       match (sharing, Quiver_mysql.Link.server link) with
       | One_at_a_time, _ -> Alone
       | Together, (Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _) -> First_alone most
-      | Together, (Mysql_8_0 _ | Mysql_8_4 _) -> At_most most
+      | Together, (Mysql_8_0 _ | Mysql_8_4 _ | Tidb_8_5 _) -> At_most most
     in
     (cap, List.map (fun part -> { database; part; delivery; keys }) pending)
   in

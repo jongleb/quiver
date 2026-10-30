@@ -411,7 +411,7 @@ let create config target ~keys ~after ~binlog ~ingest ~sessions =
                  let%bind () =
                    match Quiver_mysql.Link.server link with
                    | Mysql_8_4 _ -> Ok ()
-                   | Mysql_8_0 _ | Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _ ->
+                   | Mysql_8_0 _ | Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _ | Tidb_8_5 _ ->
                        Error (Tablespaces_need Mysql_8_4)
                  in
                  let%bind () =
@@ -489,7 +489,7 @@ let create config target ~keys ~after ~binlog ~ingest ~sessions =
                Quiver_core.Guarded.hold control (fun link ->
                    match Quiver_mysql.Link.server link with
                    | Mysql_8_0 _ | Mysql_8_4 _ -> Quiver_sink.Csv.Rapidjson
-                   | Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _ -> Verbatim);
+                   | Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _ | Tidb_8_5 _ -> Verbatim);
              mode;
              built = Portable_lockfree_htbl.create (module Quiver_core.Schema.Name);
              builds = Portable.Atomic.make [];

@@ -16,6 +16,10 @@ let%expect_test "release lines" =
       "8.4.11";
       "9.1.0";
       "8.0.11-TiDB-v7.5.0";
+      "8.0.11-TiDB-v8.5.8";
+      "8.0.11-TiDB-v8.5.0-alpha";
+      "8.0.11-TiDB-v9.0.0-beta.1";
+      "8.0.11-TiDB-CLOUD.202609.1";
       "10.6.21-MariaDB";
       "10.11.19-MariaDB-ubu2204-log";
       "11.4.13-MariaDB-ubu2404-log";
@@ -34,6 +38,10 @@ let%expect_test "release lines" =
     8.4.11                               (Mysql_8_4 11)
     9.1.0                                unsupported
     8.0.11-TiDB-v7.5.0                   unsupported
+    8.0.11-TiDB-v8.5.8                   (Tidb_8_5 8)
+    8.0.11-TiDB-v8.5.0-alpha             (Tidb_8_5 0)
+    8.0.11-TiDB-v9.0.0-beta.1            unsupported
+    8.0.11-TiDB-CLOUD.202609.1           unsupported
     10.6.21-MariaDB                      unsupported
     10.11.19-MariaDB-ubu2204-log         (Mariadb_10_11 19)
     11.4.13-MariaDB-ubu2404-log          (Mariadb_11_4 13)

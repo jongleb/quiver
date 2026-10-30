@@ -29,10 +29,12 @@ type conn_config = {
 }
 (** Where and as whom to connect. *)
 
-(** How the group of sessions is opened: [Ftwrl] and [Backup_stage] (MariaDB
-    only, blocks commits but not writes) give one point in time; [Trx_only]
-    takes no lock and gives each session its own snapshot. *)
-type snapshot_mode = Ftwrl | Backup_stage | Trx_only
+(** How the group of sessions is opened: [Auto] is the server's own way to one point in
+    time, [Ftwrl] on MySQL and MariaDB and the TSO on TiDB; [Ftwrl] and [Backup_stage]
+    (MariaDB only, blocks commits but not writes) give one point in time; [Trx_only]
+    takes no lock and gives each session its own snapshot (on TiDB the TSO still holds
+    every session at one point). *)
+type snapshot_mode = Auto | Ftwrl | Backup_stage | Trx_only
 [@@deriving sexp_of ~portable, to_string ~portable, enumerate ~portable]
 
 type error =
@@ -65,6 +67,9 @@ type error =
   | Warned_expression of { table : Quiver_core.Schema.Name.t; warnings : string list }
       (** The source warned while evaluating a [--mask sql:] expression of the table:
           a value cast with loss, or out of the column's range. *)
+  | Unsupported_sequence of Quiver_core.Schema.Name.t
+      (** A TiDB sequence among the database's objects: quiver does not dump them yet,
+          and [--objects none] leaves every object out. *)
 [@@deriving sexp_of ~portable]
 
 type binlog_file = { base : string; index : int } [@@deriving sexp_of ~portable]
@@ -85,6 +90,8 @@ type position =
       lock_held : Core.Time_ns.Span.t;
     }  (** [binlog] is [None] when the binary log is disabled. *)
   | Unlocked  (** [Trx_only]: there is no common point. *)
+  | Pinned of { tso : int64 }
+      (** TiDB: every session read at this TSO, which a TiCDC changefeed starts from. *)
 
 include
   Quiver_core.Provider_intf.S

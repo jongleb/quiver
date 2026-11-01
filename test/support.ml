@@ -26,6 +26,7 @@ let table ?(key : string Quiver_core.Schema.Table.key = Primary ("id", []))
          | Primary fields -> Primary (pair fields)
          | Unique { index; fields } -> Unique { index; fields = pair fields }
          | Indexed { index; field } -> Indexed { index; field = ident field }
+         | Row_id field -> Row_id (ident field)
          | No_key -> No_key)
        ~estimate:{ rows = 0; bytes = 0 })
 

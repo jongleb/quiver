@@ -5,7 +5,7 @@ type collation = {
 [@@deriving sexp_of ~portable]
 
 type t =
-  | Tables
+  | Tables of Server.t
   | Columns
   | Indexes of Server.t
   | Foreign_keys
@@ -22,6 +22,8 @@ type t =
   | Routines of Quiver_core.Ident.t
   | Events of Quiver_core.Ident.t
   | Sequences of Quiver_core.Ident.t
+  | Show_create_sequence of Quiver_core.Schema.Name.t
+  | Sequence_next of { server : Server.t; sequence : Quiver_core.Schema.Name.t }
   | Show_definition of {
       database : Quiver_core.Ident.t;
       name : Quiver_core.Ident.t;
@@ -122,10 +124,15 @@ let where (chunk : Quiver_core.Chunk.t) =
       [%string " WHERE %{condition (Quiver_core.Predicate.of_chunk chunk)}"]
 
 let sql = function
-  | Tables ->
+  | Tables server ->
+      let handle =
+        match server with
+        | Tidb_8_5 _ -> "TIDB_PK_TYPE"
+        | Mysql_8_0 _ | Mysql_8_4 _ | Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _ -> "NULL"
+      in
       [%string
         "SELECT TABLE_SCHEMA, TABLE_NAME, IFNULL(TABLE_ROWS, 0), \
-         IFNULL(DATA_LENGTH, 0) FROM information_schema.TABLES WHERE \
+         IFNULL(DATA_LENGTH, 0), %{handle} FROM information_schema.TABLES WHERE \
          TABLE_TYPE = 'BASE TABLE' AND %{outside_system} ORDER BY \
          TABLE_SCHEMA, TABLE_NAME"]
   | Columns ->
@@ -195,6 +202,12 @@ let sql = function
       [%string
         "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = \
          %{text (database :> string)} AND TABLE_TYPE = 'SEQUENCE' ORDER BY TABLE_NAME"]
+  | Show_create_sequence name -> [%string "SHOW CREATE SEQUENCE %{qualified name}"]
+  | Sequence_next { server; sequence } -> (
+      match server with
+      | Tidb_8_5 _ -> [%string "SHOW TABLE %{qualified sequence} NEXT_ROW_ID"]
+      | Mysql_8_0 _ | Mysql_8_4 _ | Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _ ->
+          [%string "SELECT next_not_cached_value, increment FROM %{qualified sequence}"])
   | Show_definition { database; name; kind } ->
       let kind =
         match kind with
@@ -235,6 +248,7 @@ let sql = function
       let order =
         match table.key with
         | Primary (key, keys) -> " ORDER BY " ^ columns (key :: keys)
+        | Row_id key -> " ORDER BY " ^ columns [ key ]
         | Unique _ | Indexed _ | No_key -> ""
       in
       let selected_columns =
@@ -244,7 +258,7 @@ let sql = function
         match (chunk, table.key) with
         | Range _, Indexed { index; _ } ->
             [%string " FORCE INDEX (%{Quiver_core.Ident.backquoted index})"]
-        | (Whole _ | Range _), (Primary _ | Unique _ | Indexed _ | No_key) -> ""
+        | (Whole _ | Range _), (Primary _ | Unique _ | Indexed _ | Row_id _ | No_key) -> ""
       in
       [%string
         "SELECT %{selected_columns} FROM %{qualified table.name}%{through}%{where chunk}%{order}"]
@@ -263,7 +277,7 @@ let sql = function
       [%string
         "SELECT COLUMN_NAME, DATA_TYPE FROM information_schema.COLUMNS WHERE \
          TABLE_SCHEMA = %{text (database :> string)} AND TABLE_NAME = %{text \
-         (table :> string)} AND EXTRA NOT LIKE '%GENERATED%' ORDER BY \
+         (table :> string)} AND CONCAT(' ', EXTRA, ' ') NOT LIKE '% GENERATED %' ORDER BY \
          ORDINAL_POSITION"]
   | Durability -> "SELECT @@innodb_flush_log_at_trx_commit, @@sync_binlog, @@log_bin"
   | Autoinc_lock_mode -> "SELECT @@innodb_autoinc_lock_mode"

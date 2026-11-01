@@ -52,10 +52,19 @@ let schema t name text =
       t.dir /?. ~.[%string "%{name}.sql%{Compression.extension t.compression}"])
     t.compression text
 
-let database t database ~ddl =
-  schema t
-    [%string "%{file_name database}-schema-create"]
-    [%string "%{header}%{ddl};\n"]
+let database t database ~ddl ~sequences =
+  let%bind () =
+    schema t
+      [%string "%{file_name database}-schema-create"]
+      [%string "%{header}%{ddl};\n"]
+  in
+  Base.Result.all_unit
+    (List.map
+       (fun (sequence : Quiver_core.Sequence.t) ->
+         schema t
+           [%string "%{file_name database}.%{file_name sequence.name}-schema-sequence"]
+           (header ^ String.concat "" (List.map (fun statement -> statement ^ ";\n") (Quiver_core.Sequence.statements sequence))))
+       sequences)
 
 let table t ({ name = { database; table }; _ } : Quiver_core.Schema.Table.t)
     ~ddl =

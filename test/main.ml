@@ -2,6 +2,10 @@ let () =
   Alcotest.run "quiver"
     [
       ("chunk", Test_chunk.tests);
+      ("sequence", Test_sequence.tests);
+      ("collations", Test_collations.tests);
+      ("pieces", Test_pieces.tests);
+      ("qualifier", Test_qualifier.tests);
       ("batch", Test_batch.tests);
       ("batch model", Test_batch_model.tests);
       ("probe", Test_probe.tests);

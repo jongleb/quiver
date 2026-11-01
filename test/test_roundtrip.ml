@@ -620,7 +620,16 @@ let messages =
             (let* session = text and* streams = count and* chunks = count in
              let+ byte_order = oneof_list Quiver_net.Message.all_of_byte_order in
              Quiver_net.Message.Hello { session; byte_order; streams; chunks });
-            map2 (fun name ddl -> Quiver_net.Message.Database { name; ddl }) name text;
+            (let* database = name and* ddl = text in
+             let+ sequences =
+               list_small
+                 (let+ name
+                  and+ text
+                  and+ next = oneof [ map Int64.of_int int; oneof_list [ Int64.min_int; Int64.max_int ] ]
+                  and+ increment = map Int64.of_int (int_range (-5) 5) in
+                  Quiver_core.Sequence.make ~name ~text (Unused { next; increment }))
+             in
+             Quiver_net.Message.Database { name = database; ddl; sequences });
             (let* table = table and* ddl = text and* parts = count in
              let+ order = oneof_list [ Quiver_core.Schema.Key_order; Masked_key ] in
              Quiver_net.Message.Table { table; ddl; parts; order });

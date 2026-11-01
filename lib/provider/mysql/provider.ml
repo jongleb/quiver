@@ -47,7 +47,6 @@ type error =
       text : string;
     }
   | Warned_expression of { table : Quiver_core.Schema.Name.t; warnings : string list }
-  | Unsupported_sequence of Quiver_core.Schema.Name.t
 [@@deriving sexp_of ~portable]
 
 type binlog_file = { base : string; index : int } [@@deriving sexp_of ~portable, yojson]
@@ -399,7 +398,7 @@ let name database table =
 let introspect connections (filter : Quiver_core.Filter.t) =
   let tables, (columns, indexes) =
     Quiver_core.Concurrent.both
-      (fun () -> fetch connections Tables)
+      (fun () -> fetch connections (Tables connections.server))
       (fun () ->
         Quiver_core.Concurrent.both
           (fun () -> fetch connections Columns)
@@ -599,10 +598,15 @@ let introspect connections (filter : Quiver_core.Filter.t) =
     Base.Result.all
       (List.map
          (function
-           | [ Some database; Some table; Some rows; Some bytes ] ->
+           | [ Some database; Some table; Some rows; Some bytes; handle ] ->
                let%map name = name database table in
-               (name, number (Some rows), number (Some bytes))
-           | _ -> unexpected Tables)
+               let handle =
+                 match handle with
+                 | Some "NONCLUSTERED" -> `Row_id
+                 | Some _ | None -> `Key
+               in
+               (name, number (Some rows), number (Some bytes), handle)
+           | _ -> unexpected (Tables connections.server))
          tables)
   in
   let%bind () =
@@ -612,11 +616,11 @@ let introspect connections (filter : Quiver_core.Filter.t) =
         let present_databases =
           Idents.of_list
             (List.map
-               (fun ((name : Quiver_core.Schema.Name.t), _, _) ->
+               (fun ((name : Quiver_core.Schema.Name.t), _, _, _) ->
                  name.database)
                tables)
         and present_names =
-          Names.of_list (List.map (fun (name, _, _) -> name) tables)
+          Names.of_list (List.map (fun (name, _, _, _) -> name) tables)
         in
         Option.fold ~none:(Ok ())
           ~some:(fun rule -> Error (`Provider (Unmatched_filter rule)))
@@ -627,32 +631,36 @@ let introspect connections (filter : Quiver_core.Filter.t) =
                | Table name -> not (Names.mem name present_names))
              (first :: rest))
   in
+  let%bind row_id = Quiver_core.Ident.of_string "_tidb_rowid" in
   let%bind tables =
     Base.Result.all
       (List.map
-         (fun (name, rows, bytes) ->
+         (fun (name, rows, bytes, handle) ->
            let columns = Base.Hashtbl.find_multi fields_by_table name in
            let fields, generated =
              Base.List.partition_map columns ~f:(fun (field, _, kind) ->
                  match kind with `Written -> First field | `Generated -> Second field)
            in
            let key =
-             key connections.keyless_read
-               ~fields:(List.map (fun (field, _, _) -> field) columns)
-               ~keyable:
-                 (List.filter_map
-                    (fun ( ({ name; nullability; ltype } : Quiver_core.Schema.Field.t),
-                           literals,
-                           _ ) ->
-                      match (nullability, literals, key_parser ltype) with
-                      | Not_null, `Splittable, Some _ -> Some name
-                      | Nullable, _, _ | _, `Unsplittable, _ | _, _, None -> None)
-                    columns)
-               (Base.Hashtbl.find_multi indexes_by_table name)
+             match handle with
+             | `Row_id -> Quiver_core.Schema.Table.Row_id row_id
+             | `Key ->
+               key connections.keyless_read
+                 ~fields:(List.map (fun (field, _, _) -> field) columns)
+                 ~keyable:
+                   (List.filter_map
+                      (fun ( ({ name; nullability; ltype } : Quiver_core.Schema.Field.t),
+                             literals,
+                             _ ) ->
+                        match (nullability, literals, key_parser ltype) with
+                        | Not_null, `Splittable, Some _ -> Some name
+                        | Nullable, _, _ | _, `Unsplittable, _ | _, _, None -> None)
+                      columns)
+                 (Base.Hashtbl.find_multi indexes_by_table name)
            in
            Quiver_core.Schema.Table.make ~name ~fields ~generated ~key
              ~estimate:{ rows; bytes })
-         (List.filter (fun (name, _, _) -> admitted name) tables))
+         (List.filter (fun (name, _, _, _) -> admitted name) tables))
   in
   Quiver_core.Schema.make tables
 
@@ -819,7 +827,7 @@ let plan connections (schema : Quiver_core.Schema.t)
                  match table.key with
                  | No_key -> None
                  | Primary key | Unique { fields = key; _ } -> Some key
-                 | Indexed { field; _ } -> Some (field, [])
+                 | Indexed { field; _ } | Row_id field -> Some (field, [])
                in
                let sampled =
                  match connections.server with
@@ -1119,6 +1127,45 @@ let ddl { conn; _ } (target : Quiver_core.Ddl_target.t) =
   | [ [| _; Some ddl |] ] | [ [| _; Some ddl; _; _ |] ] -> Ok ddl
   | _ -> unexpected query
 
+let sequences { conn; _ } database =
+  let server = Link.server (Conn.link conn) in
+  let int64 query text = Option.fold (Int64.of_string_opt text) ~none:(unexpected query) ~some:Result.ok in
+  let sequence name =
+    let%bind name = Quiver_core.Ident.of_string name in
+    let sequence = { Quiver_core.Schema.Name.database; table = name } in
+    let shown = Query.Show_create_sequence sequence and counted = Query.Sequence_next { server; sequence } in
+    let%bind created = client (Conn.rows conn shown) and state = client (Conn.rows conn counted) in
+    let%bind text = match created with [ [| _; Some text |] ] -> Ok text | _ -> unexpected shown in
+    let%map counter =
+      match (server, state) with
+      | (Mysql_8_0 _ | Mysql_8_4 _ | Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _), [ [| Some next; Some increment |] ] ->
+          let%bind next = int64 counted next in
+          let%map increment = int64 counted increment in
+          Quiver_core.Sequence.Unused { next; increment }
+      | Tidb_8_5 _, rows ->
+          Option.fold ~none:(unexpected counted)
+            ~some:(fun above -> Ok (Quiver_core.Sequence.Above above))
+            (List.find_map
+               (function
+                 | [| _; _; _; Some above; Some "SEQUENCE" |] -> Int64.of_string_opt ("0u" ^ above)
+                 | _ -> None)
+               rows)
+      | (Mysql_8_0 _ | Mysql_8_4 _ | Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _), _ -> unexpected counted
+    in
+    Quiver_core.Sequence.make ~name ~text counter
+  in
+  match server with
+  | Mysql_8_0 _ | Mysql_8_4 _ -> Ok []
+  | Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _ | Tidb_8_5 _ ->
+      let listed = Query.Sequences database in
+      let%bind rows = client (Conn.rows conn listed) in
+      Base.Result.all
+        (List.map
+           (function
+             | [| Some name |] -> sequence name
+             | _ -> unexpected listed)
+           rows)
+
 let objects { conn; _ } database =
   let names query decode =
     let%bind rows = client (Conn.rows conn query) in
@@ -1162,20 +1209,6 @@ let objects { conn; _ } database =
             (let%map name = Quiver_core.Ident.of_string name in
              (name, Quiver_core.Definition.Event))
       | _ -> None)
-  in
-  let%bind () =
-    match Link.server (Conn.link conn) with
-    | Mysql_8_0 _ | Mysql_8_4 _ | Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _ -> Ok ()
-    | Tidb_8_5 _ -> (
-        let%bind sequences =
-          names (Sequences database) (function
-            | [| Some name |] -> Some (Quiver_core.Ident.of_string name)
-            | _ -> None)
-        in
-        match sequences with
-        | [] -> Ok ()
-        | table :: _ ->
-            Error (`Provider (Unsupported_sequence { Quiver_core.Schema.Name.database; table })))
   in
   let views =
     List.filter_map

@@ -11,8 +11,17 @@ type t = Everything | Only of rule * rule list
     schema. *)
 type rows = All_rows | No_rows | Rows_of of rule * rule list
 
-(** Whether a dump takes its databases' views, triggers, routines and events. *)
-type objects = With_objects | Without_objects
+(** A kind of a database's objects. *)
+type kind = Views | Triggers | Routines  (** Procedures and functions. *) | Events
+[@@deriving sexp_of]
+
+(** Which kinds of its databases' objects a dump takes. *)
+type objects = Without_objects | With_objects of (kind * kind list) [@@deriving sexp_of]
+
+val every_kind : kind * kind list
+
+val taken : objects -> (Ident.t * Definition.kind) list -> (Ident.t * Definition.kind) list
+(** Those of a database's catalog the dump takes, in order. *)
 
 type error = Unmatched_rows of rule  (** Names no table of the dump. *)
 [@@deriving sexp_of]

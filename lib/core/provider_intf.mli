@@ -87,6 +87,13 @@ module type S = sig
     session -> Ddl_target.t -> (string, [> `Provider of error ]) result
     @@ portable
 
+  val sequences :
+    session ->
+    Ident.t ->
+    (Sequence.t list, [> `Provider of error | `Ident of Ident.error ]) result
+    @@ portable
+  (** The database's sequences, their values as of now: at least what the snapshot used. *)
+
   val key_span :
     session ->
     Chunk.t ->

@@ -52,7 +52,7 @@ let accept listening protection ~reconnect =
         Error (`Collector (Foreign_byte_order byte_order))
     | Hello { session; streams; chunks; _ } ->
         Ok { control; id = session; streams; chunks; protection; reconnect }
-    | Database _ | Table _ | Grown _ | Objects _ | Begin _ | End _ | Abort _ | Finish _
+    | Database _ | Table _ | Grown _ | Accepts _ | Objects _ | Begin _ | End _ | Abort _ | Finish _
     | Heartbeat _ | Leave ->
         out_of_place "before hello"
   in
@@ -242,7 +242,7 @@ let relay listening (session : session) (downstream : downstream) =
                 | Ok message -> (
                     (match message with
                     | Leave -> Portable.Atomic.set left `Left
-                    | Hello _ | Database _ | Table _ | Grown _ | Objects _ | Begin _ | End _
+                    | Hello _ | Database _ | Table _ | Grown _ | Accepts _ | Objects _ | Begin _ | End _
                     | Abort _ | Finish _ | Heartbeat _ ->
                         ());
                     match Channel.send into (Message.sexp_of_control message) with
@@ -807,14 +807,14 @@ module Make (S : Quiver_core.Sink_intf.S) = struct
             | Error _, `Finished -> Ok ()
             | (Error _ as error), `Unfinished -> error)
         | Ok
-            ( Hello _ | Database _ | Table _ | Grown _ | Objects _ | Begin _ | End _
+            ( Hello _ | Database _ | Table _ | Grown _ | Accepts _ | Objects _ | Begin _ | End _
             | Abort _ | Finish _ )
           when stage = `Concluded ->
             out_of_place "a message after finish"
         | Ok message ->
         (match message with
         | Hello _ | Heartbeat _ | Leave -> ()
-        | Database _ | Table _ | Grown _ | Objects _ | Begin _ | End _ | Abort _ | Finish _
+        | Database _ | Table _ | Grown _ | Accepts _ | Objects _ | Begin _ | End _ | Abort _ | Finish _
           ->
             Portable.Atomic.incr messages);
         let answered local =
@@ -832,8 +832,8 @@ module Make (S : Quiver_core.Sink_intf.S) = struct
         in
         match message with
         | Hello _ -> out_of_place "a second hello"
-        | Database { name; ddl } ->
-            let%bind () = answered (fun () -> S.database sink name ~ddl) in
+        | Database { name; ddl; sequences } ->
+            let%bind () = answered (fun () -> S.database sink name ~ddl ~sequences) in
             next stage channel
         | Table { table; ddl; parts; order } ->
             let%bind () =
@@ -848,6 +848,9 @@ module Make (S : Quiver_core.Sink_intf.S) = struct
             | Some table ->
                 let%bind () = answered (fun () -> S.add_part sink table) in
                 next stage channel)
+        | Accepts { database; entries } ->
+            let%bind () = answered (fun () -> S.accepts sink database entries) in
+            next stage channel
         | Objects { database; definitions } ->
             let%bind () =
               answered (fun () -> S.objects sink database definitions)

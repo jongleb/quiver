@@ -15,9 +15,10 @@ module Sleeper = struct
 
   let sleep milliseconds = Thread.delay (float_of_int milliseconds /. 1000.)
   let format _ = Output_format.Sql
-  let database _ _ ~ddl:_ = Ok ()
+  let database _ _ ~ddl:_ ~sequences:_ = Ok ()
   let table _ _ ~ddl:_ ~parts:_ ~order:_ = Ok ()
   let add_part _ _ = Ok ()
+  let accepts _ _ _ = Ok ()
   let objects _ _ _ = Ok ()
   let part delays _ ~index:_ = Ok { delays }
   let renderer { delays } = { taking = delays }

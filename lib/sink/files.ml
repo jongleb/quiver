@@ -50,9 +50,11 @@ module Make (F : Format) = struct
   let sink result = Result.map_error (fun (`Output error) -> `Sink (Output error)) result
   let create layout settings = { layout; settings }
   let format t = F.format t.settings
-  let database t database ~ddl = sink (Layout.database t.layout database ~ddl)
+  let database t database ~ddl ~sequences = sink (Layout.database t.layout database ~ddl ~sequences)
   let table t table ~ddl ~parts:_ ~order:_ = sink (Layout.table t.layout table ~ddl)
   let add_part _ _ = Ok ()
+
+  let accepts _ _ _ = Ok ()
 
   let objects t database definitions =
     Result.map_error

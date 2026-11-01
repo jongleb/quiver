@@ -65,7 +65,8 @@ let integer_key chunk =
   | Range { key = field, []; _ }
   | Whole
       {
-        key = Primary (field, []) | Unique { fields = field, []; _ } | Indexed { field; _ };
+        key =
+          Primary (field, []) | Unique { fields = field, []; _ } | Indexed { field; _ } | Row_id field;
         _;
       } ->
       integer field
@@ -125,7 +126,7 @@ let of_bounds (table : Schema.Table.t) values =
     match table.key with
     | No_key -> None
     | Primary key | Unique { fields = key; _ } -> Some key
-    | Indexed { field; _ } -> Some (field, [])
+    | Indexed { field; _ } | Row_id field -> Some (field, [])
   in
   match key with
   | None -> Error (`Chunk (Unsplittable_key table.name))

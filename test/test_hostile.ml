@@ -21,9 +21,10 @@ module Anything = struct
   type rendered = unit
 
   let format () = Output_format.Sql
-  let database () _ ~ddl:_ = Ok ()
+  let database () _ ~ddl:_ ~sequences:_ = Ok ()
   let table () _ ~ddl:_ ~parts:_ ~order:_ = Ok ()
   let add_part () _ = Ok ()
+  let accepts () _ _ = Ok ()
   let objects () _ _ = Ok ()
   let part () _ ~index:_ = Ok ()
   let renderer () = ()
@@ -107,7 +108,7 @@ let controls =
           n;
         pure
           (Quiver_net.Message.sexp_of_control
-             (Database { name = ident "db"; ddl = "" }));
+             (Database { name = ident "db"; ddl = ""; sequences = [] }));
         map2
           (fun chunk n ->
             Quiver_net.Message.sexp_of_control
@@ -398,7 +399,7 @@ let hostile_collector =
         | Ok agent -> (
             match
               Atomic.set stage "declaring the database";
-              ignore (Quiver_net.Remote.database agent (ident "db") ~ddl:"");
+              ignore (Quiver_net.Remote.database agent (ident "db") ~ddl:"" ~sequences:[]);
               Atomic.set stage "declaring the table";
               ignore (Quiver_net.Remote.table agent (table 0) ~ddl:"" ~parts ~order:Key_order);
               for index = 0 to parts - 1 do
@@ -496,7 +497,7 @@ let vanishing_hop =
           Result.get_ok
             (Quiver_net.Remote.create plaintext (peer collecting) (Support.settings ~streams ~chunks:1 ()))
         in
-        ignore (Quiver_net.Remote.database agent (ident "db") ~ddl:"");
+        ignore (Quiver_net.Remote.database agent (ident "db") ~ddl:"" ~sequences:[]);
         let finished =
           Quiver_net.Remote.finish agent ~source:"" ~tables:[] ~manifest:`Null
         in

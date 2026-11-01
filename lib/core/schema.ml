@@ -38,6 +38,7 @@ module Table = struct
     | Primary of ('f * 'f list)
     | Unique of { index : Ident.t; fields : 'f * 'f list }
     | Indexed of { index : Ident.t; field : 'f }
+    | Row_id of 'f
     | No_key
   [@@deriving sexp ~portable, yojson]
 
@@ -72,9 +73,10 @@ module Table = struct
       and rest = Base.Result.all (List.map one rest) in
       (first, rest)
     in
+    let hidden = match key with Row_id hidden -> [ hidden ] | Primary _ | Unique _ | Indexed _ | No_key -> [] in
     let duplicate =
       Base.List.find_a_dup ~compare:Ident.compare
-        (List.map (fun { Field.name; _ } -> name) (fields @ generated))
+        (hidden @ List.map (fun { Field.name; _ } -> name) (fields @ generated))
     in
     match (fields, duplicate) with
     | [], _ -> Error (`Schema (No_fields name))
@@ -94,6 +96,7 @@ module Table = struct
              | Indexed { index; field } ->
                  let%map field, _ = resolve (field, []) in
                  Indexed { index; field }
+             | Row_id name -> Ok (Row_id { Field.name; ltype = Int64; nullability = Not_null })
            in
            { name; fields = (first, rest); generated; key; estimate })
 
@@ -107,6 +110,7 @@ module Table = struct
       | Primary fields -> Primary (names fields)
       | Unique { index; fields } -> Unique { index; fields = names fields }
       | Indexed { index; field } -> Indexed { index; field = field.Field.name }
+      | Row_id field -> Row_id field.Field.name
     in
     make ~name ~fields:(first :: rest) ~generated ~key ~estimate
 

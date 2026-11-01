@@ -828,7 +828,7 @@ let resolve { key; script; rules; strict } ~relations tables =
                match table.key with
                | Primary (first, rest) | Unique { fields = first, rest; _ } ->
                    [ List.map (fun (field : Schema.Field.t) -> field.name) (first :: rest) ]
-               | Indexed _ | No_key -> []
+               | Indexed _ | Row_id _ | No_key -> []
              in
              read
              @ List.filter_map

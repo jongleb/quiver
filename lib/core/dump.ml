@@ -110,6 +110,44 @@ module Make (P : Provider_intf.S) (S : Sink_intf.S) = struct
                 schema.tables))
       and tables = Iarray.of_list schema.tables
       and chunks = Array.of_list chunks in
+      let%bind listed =
+        let checked =
+          match objects with
+          | Without_objects -> Ok (Iarray.init (Iarray.length databases) (fun _ -> []))
+          | With_objects _ ->
+              let shared = Iarray.of_array sessions in
+              let workers = Int.max 1 (Int.min (Iarray.length shared) (Iarray.length databases)) in
+              let%bind found =
+                Base.Result.all
+                  (List.map snd
+                     (List.sort
+                        (fun (a, _) (b, _) -> Int.compare a b)
+                        (List.concat
+                           (Concurrent.each workers (fun worker ->
+                                Guarded.hold (Iarray.get shared worker) (fun session ->
+                                    List.filter_map
+                                      (fun database ->
+                                        if database mod workers <> worker then None
+                                        else
+                                          Some
+                                            ( database,
+                                              Result.map (Filter.taken objects)
+                                                (P.objects session (Iarray.get databases database)
+                                                  : ((Ident.t * Definition.kind) list, error) result) ))
+                                      (List.init (Iarray.length databases) Fun.id)))))))
+              in
+              let%map () =
+                Base.Result.all_unit
+                  (List.mapi
+                     (fun database entries ->
+                       (S.accepts sink (Iarray.get databases database) entries : (unit, error) result))
+                     found)
+              in
+              Iarray.of_list found
+        in
+        Result.iter_error (fun _ -> Array.iter close sessions) checked;
+        checked
+      in
       let database_index = Base.Hashtbl.create (module Ident)
       and table_index = Base.Hashtbl.create (module Schema.Name) in
       Iarray.iteri
@@ -185,7 +223,7 @@ module Make (P : Provider_intf.S) (S : Sink_intf.S) = struct
         in
         let catalogs =
           match objects with
-          | With_objects ->
+          | With_objects _ ->
               List.init (Iarray.length databases) (fun database -> Catalog database)
           | Without_objects -> []
         in
@@ -264,8 +302,8 @@ module Make (P : Provider_intf.S) (S : Sink_intf.S) = struct
       in
       let () =
         match objects with
-        | With_objects when Iarray.length databases > 0 -> ()
-        | With_objects | Without_objects -> nothing_catalogued ()
+        | With_objects _ when Iarray.length databases > 0 -> ()
+        | With_objects _ | Without_objects -> nothing_catalogued ()
       in
       let (fail @ portable) error =
         ignore
@@ -557,19 +595,13 @@ module Make (P : Provider_intf.S) (S : Sink_intf.S) = struct
           | Error error -> fail error
         in
         let catalog database =
-          let name = Iarray.get databases database in
           let () =
             match announced (Iarray.get database_announcements database) with
             | Withheld -> ()
             | Announced -> (
-                match
-                  Guarded.hold session (fun session ->
-                      (P.objects session name
-                        : ((Ident.t * Definition.kind) list, error) result))
-                with
-                | Error error -> fail error
-                | Ok [] -> objects database []
-                | Ok entries ->
+                match Iarray.get listed database with
+                | [] -> objects database []
+                | entries ->
                     Portable.Atomic.set (Iarray.get remaining database)
                       (List.length entries);
                     Portable.Atomic_array.set catalogs database entries)
@@ -597,7 +629,11 @@ module Make (P : Provider_intf.S) (S : Sink_intf.S) = struct
               announce
                 (Iarray.get database_announcements database)
                 (let%bind ddl = ddl (Database name) in
-                 S.database sink name ~ddl)
+                 let%bind sequences =
+                   Guarded.hold session (fun session ->
+                       (P.sequences session name : (Sequence.t list, error) result))
+                 in
+                 S.database sink name ~ddl ~sequences)
           | Table table -> (
               let announcement = Iarray.get table_announcements table in
               match
@@ -620,7 +656,7 @@ module Make (P : Provider_intf.S) (S : Sink_intf.S) = struct
                             (first :: rest)
                         then Masked_key
                         else Key_order
-                    | Indexed _ | No_key -> Key_order
+                    | Indexed _ | Row_id _ | No_key -> Key_order
                   in
                   announce announcement
                     (let%bind ddl = ddl (Table table.name) in

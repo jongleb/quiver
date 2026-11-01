@@ -12,6 +12,9 @@ type error =
   | Missing of File_path.Part.t
   | Rejected of { file : File_path.Part.t; statement : string; cause : cause }
   | Several_databases of Quiver_core.Ident.t list
+  | No_sequences of File_path.Part.t
+  | Unsupported_objects of File_path.Part.t
+  | Renaming of Qualifier.error
   | Non_positive_threads of int
   | Unstarted of Quiver_core.Concurrent.error
   | Rejected_after_load of { table : Quiver_core.Schema.Name.t; statement : string; cause : cause }
@@ -39,7 +42,11 @@ type resume = Fresh | Resuming
 (** How a data file reaches the server. *)
 type delivery =
   | As_statements
-  | As_local_data of { statement : string; enums : Quiver_core.Ident.t list }
+  | As_local_data of {
+      statement : string;
+      enums : Quiver_core.Ident.t list;
+      dialect : Quiver_core.Output_format.dialect;
+    }
       (** With this [LOAD DATA LOCAL] statement into a table with these
           [ENUM] columns. *)
 
@@ -85,9 +92,12 @@ type increments = Interleaved | Table_locked
 type sharing = Together | One_at_a_time
 
 let increments link =
-  Result.map
-    (function [ [| Some "2" |] ] -> Interleaved | _ -> Table_locked)
-    (Quiver_mysql.Link.run_query link Autoinc_lock_mode)
+  match Quiver_mysql.Link.server link with
+  | Tidb_8_5 _ -> Ok Interleaved
+  | Mysql_8_0 _ | Mysql_8_4 _ | Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _ ->
+      Result.map
+        (function [ [| Some "2" |] ] -> Interleaved | _ -> Table_locked)
+        (Quiver_mysql.Link.run_query link Autoinc_lock_mode)
 
 let sharing link increments table =
   match increments with
@@ -122,6 +132,9 @@ let session (config : Quiver_mysql.Provider.conn_config) binlog uniqueness =
   link
 
 let advice link binlog =
+  match Quiver_mysql.Link.server link with
+  | Tidb_8_5 _ -> []
+  | Mysql_8_0 _ | Mysql_8_4 _ | Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _ -> (
   match Quiver_mysql.Link.run_query link Durability with
   | Ok [ [| flush; sync; logged |] ] ->
       let on value = Option.equal String.equal value (Some "1") in
@@ -132,7 +145,7 @@ let advice link binlog =
         | Write_binlog | Skip_binlog -> []
       in
       List.filter_map Fun.id (Base.Option.some_if (on flush) Quiver_core.Advice.Durable_commits :: binlogged)
-  | Ok _ | Error _ -> []
+  | Ok _ | Error _ -> [])
 
 let sessions config binlog uniqueness ~count ~control ~close =
   let loaders, control =
@@ -172,6 +185,14 @@ let retried ~cause run =
   in
   attempt 0 None
 
+let unknown_collation (cause : cause) =
+  match cause with
+  | `Link (Quiver_mysql.Link.Refused { code = 1273; message; _ }) -> (
+      match String.split_on_char '\'' message with
+      | _ :: collation :: _ -> Some collation
+      | [] | [ _ ] -> None)
+  | `Link _ | `Wire _ | `Transport _ -> None
+
 let renamed target database =
   match target with Same_names -> database | Into renamed -> renamed
 
@@ -184,7 +205,11 @@ let create_database target database statement =
     (Base.String.chop_prefix statement
        ~prefix:("CREATE DATABASE " ^ Quiver_core.Ident.backquoted database))
 
-let run config ~dir target ~keys ~after ~binlog ~threads =
+let tidb_transaction_bytes = 16 * 1024 * 1024
+
+type writing = { keys : keys; after : After_load.rule list; binlog : binlog; collations : Collations.t }
+
+let run config ~dir target { keys; after; binlog; collations } ~threads =
   let read file consume =
     match
       In_channel.open_bin
@@ -305,6 +330,18 @@ let run config ~dir target ~keys ~after ~binlog ~threads =
     | exception Sys_error message ->
         Error (`Load (Unreadable { file = File_path.Part.of_string "."; message }))
   in
+  let sequences database =
+    let prefix = Quiver_sink.Layout.file_name database ^ "." in
+    List.filter_map
+      (fun entry ->
+        Option.bind (Base.String.chop_prefix entry ~prefix) (fun rest ->
+            Option.map
+              (fun _ -> File_path.Part.of_string entry)
+              (List.find_map
+                 (fun suffix -> Base.String.chop_suffix rest ~suffix)
+                 [ "-schema-sequence.sql"; "-schema-sequence.sql.zst" ])))
+      entries
+  in
   let%bind objects =
     Base.Result.all
       (List.map
@@ -334,6 +371,46 @@ let run config ~dir target ~keys ~after ~binlog ~threads =
                (function [] -> None | files -> Some (Run { database; files }))
                [ views; optional (prefix ^ "-schema-triggers"); optional (prefix ^ "-schema-post") ] ))
          databases)
+  in
+  let%bind qualifier =
+    match (target, databases) with
+    | Same_names, _ | Into _, [] -> Ok None
+    | Into into, database :: _ ->
+        let files =
+          sequences database
+          @ List.concat_map
+              (fun (stubs, runs) ->
+                List.concat_map (function Run { files; _ } -> files | Create _ | Fill _ | Update _ | Stop -> []) (stubs @ runs))
+              objects
+        in
+        let created = ref [] in
+        let%bind () =
+          Base.Result.all_unit
+            (List.map
+               (fun file ->
+                 let%map (_ : Quiver_core.Checksum.t) =
+                   read file (fun text ->
+                       Statements.iter text (fun statement ->
+                           Ok (Option.iter (fun name -> created := name :: !created) (Sql_text.created statement))))
+                 in
+                 ())
+               files)
+        in
+        let%bind names =
+          Base.Result.all
+            (List.map Quiver_core.Ident.of_string !created
+            @ List.filter_map
+                (fun ((table : Quiver_core.Schema.Name.t), _) ->
+                  if Quiver_core.Ident.equal table.database database then Some (Ok table.table) else None)
+                tables)
+        in
+        Result.map_error
+          (fun (`Qualifier error) -> `Load (Renaming error))
+          (Result.map Option.some (Qualifier.make ~from:database ~into ~names))
+  in
+  let translate statement =
+    let collated = Collations.rewrite collations statement in
+    Option.fold qualifier ~none:collated ~some:(fun qualifier -> Qualifier.rewrite qualifier collated)
   in
   let%bind (control, loaded, increments), links =
     sessions config binlog Unchecked ~count:threads
@@ -374,12 +451,37 @@ let run config ~dir target ~keys ~after ~binlog ~threads =
   let%bind () =
     match
       let%bind () =
+        let routines =
+          List.concat_map
+            (fun database ->
+              let prefix = Quiver_sink.Layout.file_name database in
+              List.filter_map
+                (fun suffix -> Result.to_option (schema_file (prefix ^ suffix)))
+                [ "-schema-triggers"; "-schema-post" ])
+            databases
+        in
+        match (Quiver_mysql.Link.server control, List.concat_map sequences databases, routines) with
+        | (Mysql_8_0 _ | Mysql_8_4 _), file :: _, _ -> Error (`Load (No_sequences file))
+        | Tidb_8_5 _, _, file :: _ -> Error (`Load (Unsupported_objects file))
+        | (Mysql_8_0 _ | Mysql_8_4 _), [], _ | (Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _), _, _ | Tidb_8_5 _, _, [] ->
+            Ok ()
+      in
+      let%bind () =
         match resume with Fresh -> record control "(started)" | Resuming -> Ok ()
       in
       Base.List.fold_result databases ~init:() ~f:(fun () database ->
           let%bind file = schema_file (Quiver_sink.Layout.file_name database ^ "-schema-create") in
-          let%map _ = statements ddl control file (create_database target database) in
-          ())
+          let%bind _ =
+            statements ddl control file (fun statement ->
+                create_database target database (Collations.rewrite collations statement))
+          in
+          match sequences database with
+          | [] -> Ok ()
+          | files ->
+              let%bind () = Quiver_mysql.Link.run_statement control (Use (renamed target database)) in
+              Base.List.fold_result files ~init:() ~f:(fun () file ->
+                  let%map _ = statements ddl control file translate in
+                  ()))
     with
     | Ok () -> Ok ()
     | Error error ->
@@ -415,7 +517,8 @@ let run config ~dir target ~keys ~after ~binlog ~threads =
     let deferred = ref [] in
     let%bind _ =
       retried ~cause (fun () ->
-          statements ddl link file (fun statement ->
+          statements ddl link file (fun read ->
+              let statement = translate read in
               match keys with
               | With_table -> statement
               | After_data -> (
@@ -461,6 +564,7 @@ let run config ~dir target ~keys ~after ~binlog ~threads =
           in
           As_local_data
             {
+              dialect;
               statement = Quiver_mysql.Statement.sql (Load_local { table; dialect; columns });
               enums =
                 List.filter_map
@@ -501,7 +605,7 @@ let run config ~dir target ~keys ~after ~binlog ~threads =
   in
   let fill link { database; part = { file; checksum; rows; _ }; delivery; keys } =
     let%bind () = Quiver_mysql.Link.run_statement link (Use (renamed target database)) in
-    let%bind () =
+    let whole () =
       retried ~cause (fun () ->
           let%bind () = Quiver_mysql.Link.run_statement link Begin in
           let loaded =
@@ -509,7 +613,7 @@ let run config ~dir target ~keys ~after ~binlog ~threads =
               match delivery with
               | As_statements ->
                   statements Quiver_mysql.Link.execute link file Fun.id
-              | As_local_data { statement; enums } ->
+              | As_local_data { statement; enums; _ } ->
                   read file (fun data ->
                       rejected file statement
                         (Quiver_mysql.Link.load_local link statement ~rows ~enums data))
@@ -521,6 +625,76 @@ let run config ~dir target ~keys ~after ~binlog ~threads =
           in
           Result.iter_error (fun _ -> ignore (Quiver_mysql.Link.run_statement link Rollback)) loaded;
           loaded)
+    in
+    let pieced bytes =
+      let name = File_path.Part.to_string file in
+      let mark count = name ^ "@" ^ string_of_int count in
+      let earlier =
+        Base.Set.fold committed ~init:0 ~f:(fun most loaded ->
+            Option.fold
+              (Option.bind (Base.String.chop_prefix loaded ~prefix:(name ^ "@")) int_of_string_opt)
+              ~none:most ~some:(Int.max most))
+      in
+      let%bind found =
+        read file (fun source ->
+            let buffer = Bytes.create 65536 in
+            let rec drain () =
+              match source buffer ~pos:0 ~len:(Bytes.length buffer) with
+              | Ok 0 -> Ok ()
+              | Ok _ -> drain ()
+              | Error _ as error -> error
+            in
+            drain ())
+      in
+      let committed_now = ref earlier in
+      let commit count =
+        let%bind () = record link (mark count) in
+        let%bind () = Quiver_mysql.Link.run_statement link Commit in
+        committed_now := count;
+        Quiver_mysql.Link.run_statement link Begin
+      in
+      let%bind () =
+        if Quiver_core.Checksum.equal found checksum then
+          retried ~cause (fun () ->
+              let%bind () = Quiver_mysql.Link.run_statement link Begin in
+              let loaded =
+                match delivery with
+                | As_statements ->
+                    Pieces.statements ~bytes ~skip:!committed_now
+                      (fun each ->
+                        let%map (_ : Quiver_core.Checksum.t) = read file (fun text -> Statements.iter text each) in
+                        ())
+                      ~run:(fun statement -> rejected file statement (Quiver_mysql.Link.execute link statement))
+                      ~commit
+                | As_local_data { statement; enums; dialect } ->
+                    let%bind (_ : Quiver_core.Checksum.t) =
+                      read file (fun source ->
+                          Pieces.cut dialect ~bytes ~skip:!committed_now source (fun { data; rows } ->
+                              let pos = ref 0 in
+                              let%bind () =
+                                rejected file statement
+                                  (Quiver_mysql.Link.load_local link statement ~rows ~enums
+                                     (fun buffer ~pos:at ~len ->
+                                       let length = Int.min len (String.length data - !pos) in
+                                       Bytes.blit_string data !pos buffer at length;
+                                       pos := !pos + length;
+                                       Ok length))
+                              in
+                              commit (!committed_now + rows)))
+                    in
+                    Ok ()
+              in
+              Result.iter_error (fun _ -> ignore (Quiver_mysql.Link.run_statement link Rollback)) loaded;
+              loaded)
+        else Error (`Load (Corrupt file))
+      in
+      let%bind () = record link name in
+      Quiver_mysql.Link.run_statement link Commit
+    in
+    let%bind () =
+      match Quiver_mysql.Link.server link with
+      | Mysql_8_0 _ | Mysql_8_4 _ | Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _ -> whole ()
+      | Tidb_8_5 _ -> pieced tidb_transaction_bytes
     in
     match Portable.Atomic.fetch_and_add keys.remaining (-1) with
     | 1 -> add_keys link keys
@@ -582,7 +756,7 @@ let run config ~dir target ~keys ~after ~binlog ~threads =
                   let%bind () = Quiver_mysql.Link.run_statement link (Use (renamed target database)) in
                   let%map () =
                     Base.List.fold_result files ~init:() ~f:(fun () file ->
-                        let%map _ = statements ddl link file Fun.id in
+                        let%map _ = statements ddl link file translate in
                         ())
                   in
                   Ran)

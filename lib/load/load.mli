@@ -20,6 +20,11 @@ type error =
       (** The server failed a statement; [statement] is cut short. *)
   | Several_databases of Quiver_core.Ident.t list
       (** [Into] asks for one target, the dump holds these. *)
+  | No_sequences of File_path.Part.t
+      (** The target is MySQL, which has no sequences, and the dump has this one. *)
+  | Unsupported_objects of File_path.Part.t
+      (** The target is TiDB, which has no triggers, routines or events, and the dump has these. *)
+  | Renaming of Qualifier.error  (** The database cannot take another name in its definitions. *)
   | Non_positive_threads of int
   | Unstarted of Quiver_core.Concurrent.error  (** No loading thread could start. *)
   | Rejected_after_load of { table : Quiver_core.Schema.Name.t; statement : string; cause : cause }
@@ -28,6 +33,9 @@ type error =
   | Unreadable_columns of Quiver_core.Schema.Name.t
       (** The server's description of a loaded table's columns. *)
 [@@deriving sexp_of ~portable]
+
+val unknown_collation : cause -> string option @@ portable
+(** The collation a server named unknown (error 1273). *)
 
 (** Where the dumped databases go. *)
 type target =
@@ -116,13 +124,22 @@ type summary = {
 }
 (** Data files loaded now, their rows and uncompressed bytes. *)
 
+val tidb_transaction_bytes : int
+(** Data one transaction takes on TiDB, which holds a transaction in its memory. *)
+
+(** How the target takes what it is given. *)
+type writing = {
+  keys : keys;
+  after : After_load.rule list;
+  binlog : binlog;
+  collations : Collations.t;  (** Rewritten in every definition. *)
+}
+
 val run :
   Quiver_mysql.Provider.conn_config ->
   dir:File_path.t ->
   target ->
-  keys:keys ->
-  after:After_load.rule list ->
-  binlog:binlog ->
+  writing ->
   threads:int ->
   ( summary,
     [> `Load of error

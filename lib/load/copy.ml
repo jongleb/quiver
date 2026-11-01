@@ -7,6 +7,9 @@ type error =
   | Unreachable of Load.cause
   | Rejected of { statement : string; cause : Load.cause }
   | Several_databases of Quiver_core.Ident.t list
+  | No_sequences of Quiver_core.Schema.Name.t
+  | Renaming of Qualifier.error
+  | Unsupported_object of { database : Quiver_core.Ident.t; name : Quiver_core.Ident.t; kind : Quiver_core.Definition.kind }
   | Unrepresentable_date of {
       table : Quiver_core.Schema.Name.t @@ aliased;
       column : Quiver_core.Ident.t @@ aliased;
@@ -152,10 +155,17 @@ type declaration = {
   declared : (unit, error) result Await.Await.Ivar.t;
 }
 
+(** How much of a part one transaction on the target takes. *)
+type transactions =
+  | Per_part
+  | Every of int  (** Bytes of text, then a commit: TiDB holds a transaction in its memory. *)
+
 type t = {
   target : Load.target;
+  transactions : transactions;
   keys : Load.keys;
   after : After_load.rule list;
+  collations : Collations.t;
   control : Quiver_mysql.Link.t Await.Capsule.Await.With_mutex.t;
   loaders : Quiver_mysql.Link.t Await.Capsule.Await.With_mutex.t iarray;
   idle : int Await.Await.Mpmc_queue.t;  (** Loaders no part holds. *)
@@ -168,6 +178,8 @@ type t = {
       (** Foreign keys of each table, added once all the data is in: adding one
           waits for its parent's open loads. *)
   databases : Quiver_core.Ident.t list Portable.Atomic.t;
+  named : Quiver_core.Ident.t list Portable.Atomic.t;
+      (** The database's sequences, tables and objects so far, which its definitions qualify. *)
   objects :
     (Quiver_core.Ident.t * Quiver_sink.Layout.script list) list
     Portable.Atomic.t;
@@ -207,6 +219,8 @@ type loading = {
   hash : Quiver_sink.Xxh3.t;
   mutable rows : int;
   mutable bytes : int;
+  mutable statement_rows : int;  (** Of the open [LOAD DATA]. *)
+  mutable statement_bytes : int;
   mutable apart : (string * int) list;  (** [INSERT]s to run after the data, last first. *)
 }
 
@@ -384,7 +398,14 @@ let ended t = function
                (Imported
                   { preparing = state.preparing; queued; checking; importing; keys = Quiver_core.Stopwatch.elapsed keying })))
 
-let create config target ~keys ~after ~binlog ~ingest ~sessions =
+let unknown_collation = function
+  | Unreachable cause | Rejected { cause; _ } -> Load.unknown_collation cause
+  | Several_databases _ | No_sequences _ | Renaming _ | Unsupported_object _ | Unrepresentable_date _
+  | Unsplittable_definition _ | Tablespaces_need _ | Built _ | Lost_rows _ | Mismatched_render
+  | After_load _ ->
+      None
+
+let create config target ({ keys; after; binlog; collations } : Load.writing) ~ingest ~sessions =
   Result.map_error
     (fun error -> `Sink error)
     (let%bind control, loaders =
@@ -473,8 +494,14 @@ let create config target ~keys ~after ~binlog ~ingest ~sessions =
          let t =
            {
              target;
+             transactions =
+               Quiver_core.Guarded.hold control (fun link ->
+                   match Quiver_mysql.Link.server link with
+                   | Mysql_8_0 _ | Mysql_8_4 _ | Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _ -> Per_part
+                   | Tidb_8_5 _ -> Every Load.tidb_transaction_bytes);
              keys;
              after;
+             collations;
              control;
              loaders = Iarray.of_list loaders;
              idle;
@@ -482,6 +509,7 @@ let create config target ~keys ~after ~binlog ~ingest ~sessions =
              building = Portable.Atomic.make [];
              foreign = Portable.Atomic.make [];
              databases = Portable.Atomic.make [];
+             named = Portable.Atomic.make [];
              objects = Portable.Atomic.make [];
              scratch = Quiver_core.Buffer_pool.create ();
              advice = Quiver_core.Guarded.hold control (fun link -> Load.advice link binlog);
@@ -548,7 +576,19 @@ let advice t = t.advice
 let finishing t = Portable.Atomic.get t.finishing
 let format _ = Quiver_core.Output_format.Csv dialect
 
-let database t database ~ddl =
+let name_all t names = Portable.Atomic.update t.named ~pure_f:(fun named -> names @ named)
+
+let qualified t (database : Quiver_core.Ident.t) text =
+  match t.target with
+  | Same_names -> Ok text
+  | Into into ->
+      Result.map_error
+        (fun (`Qualifier error) -> Renaming error)
+        (Result.map
+           (fun qualifier -> Qualifier.rewrite qualifier text)
+           (Qualifier.make ~from:database ~into ~names:(Portable.Atomic.get t.named)))
+
+let database t database ~ddl ~sequences =
   Result.map_error
     (fun error -> `Sink error)
     (let%bind () =
@@ -563,12 +603,44 @@ let database t database ~ddl =
      in
      let target = t.target in
      Quiver_core.Guarded.hold t.control (fun control ->
-         run control (Load.create_database target database ddl)))
+         let%bind () =
+           match (Quiver_mysql.Link.server control, sequences) with
+           | (Mysql_8_0 _ | Mysql_8_4 _), ({ name; _ } : Quiver_core.Sequence.t) :: _ ->
+               Error (No_sequences { database; table = name })
+           | (Mysql_8_0 _ | Mysql_8_4 _), [] | (Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _ | Tidb_8_5 _), _ ->
+               Ok ()
+         in
+         let%bind () =
+           run control (Load.create_database target database (Collations.rewrite t.collations ddl))
+         in
+         name_all t (List.map (fun ({ name; _ } : Quiver_core.Sequence.t) -> name) sequences);
+         match sequences with
+         | [] -> Ok ()
+         | _ :: _ ->
+             let%bind () = execute control (Use (Load.renamed target database)) in
+             Base.List.fold_result
+               (List.concat_map Quiver_core.Sequence.statements sequences)
+               ~init:() ~f:(fun () statement -> run control statement)))
+
+let accepts t database entries =
+  match Quiver_core.Guarded.hold t.control (fun control -> Quiver_mysql.Link.server control) with
+  | Mysql_8_0 _ | Mysql_8_4 _ | Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _ -> Ok ()
+  | Tidb_8_5 _ ->
+      Option.fold ~none:(Ok ())
+        ~some:(fun (name, kind) -> Error (`Sink (Unsupported_object { database; name; kind })))
+        (List.find_opt
+           (fun (_, (kind : Quiver_core.Definition.kind)) ->
+             match kind with View _ -> false | Trigger _ | Procedure | Function | Event -> true)
+           entries)
 
 let table t ({ name; _ } as table : Quiver_core.Schema.Table.t) ~ddl ~parts ~order =
   let declared = Await.Await.Ivar.create () in
   ignore (Portable_lockfree_htbl.set t.declared ~key:name ~data:declared);
   Portable.Atomic.update t.declaring ~pure_f:(fun declaring -> declared :: declaring);
+  name_all t [ name.table ];
+  match qualified t name.database (Collations.rewrite t.collations ddl) with
+  | Error error -> Error (`Sink error)
+  | Ok ddl ->
   let declaration = { table; ddl; parts; order; declared } in
   match Quiver_core.Pool.submit t.preparing ~priority:table.estimate.bytes declaration with
   | Queued -> Ok ()
@@ -577,6 +649,17 @@ let table t ({ name; _ } as table : Quiver_core.Schema.Table.t) ~ddl ~parts ~ord
       Result.map_error (fun error -> `Sink error) (Await.Await.Ivar.read Quiver_core.Blocking.await declared)
 
 let objects t database definitions =
+  name_all t (List.map (fun ({ name; _ } : Quiver_core.Definition.t) -> name) definitions);
+  let%bind definitions =
+    Result.map_error
+      (fun error -> `Sink error)
+      (Base.Result.all
+         (List.map
+            (fun (definition : Quiver_core.Definition.t) ->
+              let%map text = qualified t database definition.text in
+              Collations.definition t.collations { definition with text })
+            definitions))
+  in
   Result.map_error
     (fun (`Unsplittable name) -> `Sink (Unsplittable_definition name))
     (let%map scripts = Quiver_sink.Layout.scripts database definitions in
@@ -683,6 +766,8 @@ let loading t
              hash = Quiver_sink.Xxh3.create ();
              rows = 0;
              bytes = 0;
+             statement_rows = 0;
+             statement_bytes = 0;
              apart = [];
            })
 
@@ -819,10 +904,24 @@ let render (renderer : renderer) (batch : Quiver_core.Batch.sealed @ local) =
       rendered
 
 let append_loading (part : loading) text rows =
-  let statement = part.job.statement in
+  let statement = part.job.statement and enums = part.job.enums in
+  let statement_rows = part.statement_rows + rows
+  and statement_bytes = part.statement_bytes + String.length text in
+  let full =
+    match part.owner.transactions with
+    | Every bytes when statement_bytes >= bytes -> `Full
+    | Every _ | Per_part -> `Room
+  in
   match
     Quiver_core.Guarded.hold (Iarray.get part.owner.loaders part.loader) (fun link ->
-        rejected statement (Quiver_mysql.Link.send_data link text))
+        let%bind () = rejected statement (Quiver_mysql.Link.send_data link text) in
+        match full with
+        | `Room -> Ok ()
+        | `Full ->
+            let%bind () = rejected statement (Quiver_mysql.Link.complete link ~rows:statement_rows ~enums) in
+            let%bind () = execute link Commit in
+            let%bind () = execute link Begin in
+            rejected statement (Quiver_mysql.Link.upload link statement))
   with
   | Error error -> Error (`Sink error)
   | Ok () ->
@@ -831,6 +930,15 @@ let append_loading (part : loading) text rows =
         ~len:(String.length text);
       part.rows <- part.rows + rows;
       part.bytes <- part.bytes + String.length text;
+      let () =
+        match full with
+        | `Room ->
+            part.statement_rows <- statement_rows;
+            part.statement_bytes <- statement_bytes
+        | `Full ->
+            part.statement_rows <- 0;
+            part.statement_bytes <- 0
+      in
       Ok ()
 
 let append part rendered =
@@ -863,7 +971,7 @@ let append part rendered =
   | Loading _, Records _ | Building _, Text _ -> Error (`Sink Mismatched_render)
 
 let close_loading (part : loading) answer =
-  let t = part.owner and statement = part.job.statement and rows = part.rows
+  let t = part.owner and statement = part.job.statement and rows = part.statement_rows
   and enums = part.job.enums and apart = List.rev part.apart in
   let outcome =
     Quiver_core.Guarded.hold (Iarray.get t.loaders part.loader) (fun link ->
@@ -971,7 +1079,7 @@ let close part answer =
   | Building building -> close_building building answer
 
 let discard_loading (part : loading) =
-  let statement = part.job.statement and rows = part.rows
+  let statement = part.job.statement and rows = part.statement_rows
   and enums = part.job.enums in
   Quiver_core.Guarded.hold (Iarray.get part.owner.loaders part.loader) (fun link ->
       ignore (rejected statement (Quiver_mysql.Link.complete link ~rows ~enums));

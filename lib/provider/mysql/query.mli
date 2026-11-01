@@ -8,7 +8,9 @@ type collation = {
 (** A read the provider sends to the server. Constructors whose SQL differs
     between release lines carry the {!Server.t} they are rendered for. *)
 type t =
-  | Tables  (** Base tables outside the system schemas, with estimates. *)
+  | Tables of Server.t
+      (** Base tables outside the system schemas, with estimates and, on TiDB, whether rows are
+          numbered by [_tidb_rowid]. *)
   | Columns
   | Indexes of Server.t
   | Foreign_keys  (** Columns of foreign keys outside the system schemas, with the columns they refer to. *)
@@ -26,7 +28,11 @@ type t =
   | Triggers of Quiver_core.Ident.t
   | Routines of Quiver_core.Ident.t
   | Events of Quiver_core.Ident.t
-  | Sequences of Quiver_core.Ident.t  (** The database's sequences (TiDB). *)
+  | Sequences of Quiver_core.Ident.t  (** The database's sequences (MariaDB, TiDB). *)
+  | Show_create_sequence of Quiver_core.Schema.Name.t
+  | Sequence_next of { server : Server.t; sequence : Quiver_core.Schema.Name.t }
+      (** Where the sequence stands: MariaDB's first value neither handed out nor cached and
+          the increment, TiDB's one more than the last value handed out or cached. *)
   | Show_definition of {
       database : Quiver_core.Ident.t;
       name : Quiver_core.Ident.t;

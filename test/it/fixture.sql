@@ -82,7 +82,17 @@ INSERT INTO date_key
   WITH RECURSIVE seq (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 30000)
   SELECT DATE_ADD('1900-01-01', INTERVAL n DAY), CONCAT('day ', n) FROM seq;
 
+-- Defaults of the current time: MySQL's EXTRA says DEFAULT_GENERATED, and quiver load once
+-- took such a column for a generated one and left it out of LOAD DATA.
+CREATE TABLE stamped (
+  id INT NOT NULL PRIMARY KEY,
+  made TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  seen DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3),
+  note VARCHAR(10)
+);
+INSERT INTO stamped VALUES (1, '2001-02-03 04:05:06', '2002-03-04 05:06:07.891', 'a'), (2, '2011-12-13 14:15:16', NULL, NULL);
+
 -- No rows: its chunk is empty in every format, compressed or not.
 CREATE TABLE nothing (id INT NOT NULL PRIMARY KEY, v VARCHAR(10));
 
-ANALYZE TABLE all_types, big, no_key, uniq, str_key, latin_key, bin_key, composite, date_key, nothing;
+ANALYZE TABLE all_types, big, no_key, uniq, str_key, latin_key, bin_key, composite, date_key, stamped, nothing;

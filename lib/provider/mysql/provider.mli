@@ -67,9 +67,6 @@ type error =
   | Warned_expression of { table : Quiver_core.Schema.Name.t; warnings : string list }
       (** The source warned while evaluating a [--mask sql:] expression of the table:
           a value cast with loss, or out of the column's range. *)
-  | Unsupported_sequence of Quiver_core.Schema.Name.t
-      (** A TiDB sequence among the database's objects: quiver does not dump them yet,
-          and [--objects none] leaves every object out. *)
 [@@deriving sexp_of ~portable]
 
 type binlog_file = { base : string; index : int } [@@deriving sexp_of ~portable]

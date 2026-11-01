@@ -18,6 +18,7 @@ type unsuitable =
   | Layout of Quiver_innodb.Layout.error
   | Space of Quiver_innodb.Tablespace.error
   | Masked_key
+  | Row_order
 [@@deriving sexp_of ~portable]
 
 type builder = Quiver | Server [@@deriving sexp_of ~portable]
@@ -101,6 +102,15 @@ let prepare link ~datadir ~collations ~(into : Quiver_core.Schema.Name.t) (table
                   match Quiver_innodb.Layout.of_cfg parsed ~collations dumped with
                   | Error (`Layout error) -> drop (Layout error)
                   | Ok layout -> (
+                      let numbered =
+                        match (table.key, layout.fields) with
+                        | Row_id _, { storage = Row_id; _ } :: _ | (Primary _ | Unique _ | Indexed _ | No_key), _ ->
+                            `Fits
+                        | Row_id _, _ -> `Reordered
+                      in
+                      match numbered with
+                      | `Reordered -> drop Row_order
+                      | `Fits ->
                       let laid =
                         List.map
                           (fun (index : Quiver_innodb.Cfg.Index.t) ->

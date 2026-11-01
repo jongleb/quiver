@@ -42,6 +42,12 @@ type error =
       (** The target failed a statement; [statement] is cut short. *)
   | Several_databases of Quiver_core.Ident.t list
       (** [Into] asks for one target, the dump reached these. *)
+  | No_sequences of Quiver_core.Schema.Name.t
+      (** The target is MySQL, which has no sequences, and the source has this one. *)
+  | Renaming of Qualifier.error  (** The database cannot take another name in its definitions. *)
+  | Unsupported_object of { database : Quiver_core.Ident.t; name : Quiver_core.Ident.t; kind : Quiver_core.Definition.kind }
+      (** The target is TiDB, which has no triggers, routines or events, and the source has this
+          one; [--objects none] leaves every object out. *)
   | Unrepresentable_date of {
       table : Quiver_core.Schema.Name.t @@ aliased;
       column : Quiver_core.Ident.t @@ aliased;
@@ -57,12 +63,13 @@ type error =
   | After_load of After_load.error
 [@@deriving sexp_of ~portable]
 
+val unknown_collation : error -> string option @@ portable
+(** The collation the target named unknown (error 1273). *)
+
 val create :
   Quiver_mysql.Provider.conn_config ->
   Load.target ->
-  keys:Load.keys ->
-  after:After_load.rule list ->
-  binlog:Load.binlog ->
+  Load.writing ->
   ingest:ingest ->
   sessions:int ->
   (t, [> `Sink of error ]) result

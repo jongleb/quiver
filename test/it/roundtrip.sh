@@ -12,7 +12,7 @@ tidb_fixture=${12}
 wire="--wire-cert $certs/node.crt --wire-key $certs/node.key --wire-peers $certs/ca.crt"
 # myloader of mydumper v1.0.11, pinned: restores the mydumper layout quiver writes.
 myloader_image=mydumper/mydumper@sha256:7ac39f7dbcf381b3c560dc81e108e28f8aa82c0422fe97ffa7af75d296f5b494
-tables="quiver_it.all_types, quiver_it.big, quiver_it.no_key, quiver_it.uniq, quiver_it.str_key, quiver_it.latin_key, quiver_it.bin_key, quiver_it.composite, quiver_it.date_key, quiver_it.nothing"
+tables="quiver_it.all_types, quiver_it.big, quiver_it.no_key, quiver_it.uniq, quiver_it.str_key, quiver_it.latin_key, quiver_it.bin_key, quiver_it.composite, quiver_it.date_key, quiver_it.stamped, quiver_it.nothing"
 fail() { echo "$service: $*" >&2; exit 1; }
 # Runs a command in the background and kills it after $1 seconds, so a node of
 # quiver's protocol that hangs fails the step instead of the whole run; its
@@ -162,7 +162,7 @@ roundtrip() {
   sql -e "DROP DATABASE quiver_it"
   case $format in
     sql)
-      for table in all_types big no_key uniq str_key latin_key bin_key composite date_key nothing; do
+      for table in all_types big no_key uniq str_key latin_key bin_key composite date_key stamped nothing; do
         ls "$dir/quiver_it.$table.00000.sql" >/dev/null || fail "no data file for $table"
       done
       for table in big str_key latin_key bin_key composite date_key; do
@@ -175,7 +175,7 @@ roundtrip() {
         || fail "quiver load: $(cat "$dir.load.log")" ;;
     csv-mysql-load-data)
       restore "$dir" quiver_it cat sql
-      for table in all_types big no_key uniq str_key latin_key bin_key composite date_key nothing; do
+      for table in all_types big no_key uniq str_key latin_key bin_key composite date_key stamped nothing; do
         statement=$( (echo "SET @t = '$table', @dialect = 'mysql-load-data';"; cat "$load") | sql -N --raw)
         # An empty stdin would leave docker exec waiting; skip tables without rows.
         if [ "$(cat "$dir"/quiver_it."$table".*.csv | wc -c)" -gt 0 ]; then
@@ -607,6 +607,8 @@ tidb() {
   grep -q '"Pinned"' "$dir/quiver.json" || fail "no TSO in the manifest"
   [ "$(ls "$dir"/quiver_tidb.big.*.sql | wc -l)" -gt 1 ] || fail "big was not split by its regions"
   [ "$(ls "$dir"/quiver_tidb.composite.*.sql | wc -l)" -gt 1 ] || fail "composite was not split by its regions"
+  [ "$(ls "$dir"/quiver_tidb.no_key.*.sql | wc -l)" -gt 1 ] || fail "no_key was not split by _tidb_rowid"
+  [ "$(ls "$dir"/quiver_tidb.nonclustered.*.sql | wc -l)" -gt 1 ] || fail "nonclustered was not split by _tidb_rowid"
   sql -e "DROP DATABASE IF EXISTS quiver_tidb"
   "$quiver" load --tls "$tls" -P "$target_port" -p quiver -d "$dir" -t 4 > "$dir.load.log" 2>&1 \
     || fail "load: $(cat "$dir.load.log")"
@@ -620,7 +622,150 @@ tidb() {
     fail "ftwrl was accepted"
   fi
   grep -q Unsupported_snapshot_mode "$out/$service-ftwrl.log" || fail "ftwrl failed with: $(cat "$out/$service-ftwrl.log")"
-  echo "$service: dumped at one TSO and copied into $target, rows equal; ftwrl refused"
+  if "$quiver" copy --tls disabled -P "$port" -u root -B quiver_tidb_seq --to-tls "$tls" \
+    --to-port "$target_port" --to-password quiver > "$dir.sequences.log" 2>&1; then
+    fail "sequences were copied into MySQL"
+  fi
+  grep -q No_sequences "$dir.sequences.log" || fail "sequences into MySQL: $(cat "$dir.sequences.log")"
+  [ -z "$(sql -N -e "SHOW DATABASES LIKE 'quiver_tidb_seq'")" ] || fail "a database was made for sequences MySQL refused"
+  sequences="$out/$service-sequences"
+  rm -rf "$sequences"
+  "$quiver" dump --tls disabled -P "$port" -u root -B quiver_tidb_seq -o "$sequences" > "$sequences.log" 2>&1 \
+    || fail "dump of sequences: $(cat "$sequences.log")"
+  [ "$(ls "$sequences"/quiver_tidb_seq.*-schema-sequence.sql | wc -l)" -eq 5 ] || fail "sequences were not dumped"
+  source_sql -e "DROP DATABASE quiver_tidb_seq"
+  "$quiver" load --tls disabled -P "$port" -u root -d "$sequences" > "$sequences.load.log" 2>&1 \
+    || fail "load of sequences: $(cat "$sequences.load.log")"
+  [ "$(source_sql -N -e 'SELECT NEXTVAL(used), NEXTVAL(fresh), NEXTVAL(around), NEXTVAL(down)' quiver_tidb_seq | tr '\t' ' ')" \
+    = "1001 7 2 -11" ] || fail "sequences restored at other values"
+  if source_sql -e 'SELECT NEXTVAL(spent)' quiver_tidb_seq > /dev/null 2>&1; then fail "a spent sequence came back"; fi
+  [ "$(source_sql -N -e 'INSERT INTO counted (v) VALUES (4); SELECT MAX(id) FROM counted' quiver_tidb_seq)" = 1002 ] \
+    || fail "a default from a sequence"
+  echo "$service: dumped at one TSO and copied into $target, rows equal; ftwrl refused; sequences restored, refused by MySQL"
+}
+# MySQL into TiDB, which holds a transaction in its memory: a keyed table, a keyless one read
+# as one part well over a transaction, and text with line breaks, quotes and backslashes go
+# through copy and through dump and load in sql and both csv dialects, a load killed midway
+# resumes without a duplicate, and sequences loaded under another database name follow it.
+into_tidb() {
+  selected "$1" || return 0
+  service=$1 source=$2 port=$3 source_port=$4
+  my() { docker compose -p quiver -f "$compose" exec -T -e MYSQL_PWD=quiver "$source" mysql -uroot "$@"; }
+  ti() { docker compose -p quiver -f "$compose" exec -T "$source" mysql -uroot -h "$service" -P 4000 "$@"; }
+  my -e "SET GLOBAL local_infile = ON; DROP DATABASE IF EXISTS into_tidb; CREATE DATABASE into_tidb; USE into_tidb;
+    SET SESSION cte_max_recursion_depth = 3000000;
+    CREATE TABLE keyed (id BIGINT PRIMARY KEY, a INT NOT NULL, b VARCHAR(100), KEY (a));
+    INSERT INTO keyed WITH RECURSIVE n (i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 500000)
+      SELECT i, i % 997, CONCAT(REPEAT('x', i % 80), i) FROM n;
+    CREATE TABLE keyless (a INT, b VARCHAR(100));
+    INSERT INTO keyless SELECT a, b FROM keyed; INSERT INTO keyless SELECT a, b FROM keyed;
+    CREATE TABLE tricky (a INT, s VARCHAR(200));
+    INSERT INTO tricky WITH RECURSIVE n (i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 300000)
+      SELECT i, CONCAT('line\r\nnext \"q\", ', REPEAT('\\\\', i % 3), 'end', i) FROM n;"
+  same() {
+    for table in keyed keyless tricky; do
+      query="SELECT a, HEX(b) FROM into_tidb.$table"
+      [ "$table" = tricky ] && query="SELECT a, HEX(s) FROM into_tidb.$table"
+      [ "$(my -N -e "$query" | sort | cksum)" = "$(ti -N -e "$query" | sort | cksum)" ] || fail "$1: rows of $table differ"
+    done
+  }
+  ti -e "DROP DATABASE IF EXISTS into_tidb; DROP DATABASE IF EXISTS quiver_load"
+  dir="$out/$service-into"
+  rm -rf "$dir" "$dir-rfc4180" "$dir-mysql-load-data"
+  "$quiver" copy --tls disabled -P "$source_port" -p quiver -B into_tidb -t 4 --to-tls disabled --to-port "$port" \
+    > "$dir.copy.log" 2>&1 || fail "copy: $(cat "$dir.copy.log")"
+  same "copy"
+  "$quiver" dump --tls disabled -P "$source_port" -p quiver -B into_tidb -t 4 -o "$dir" > "$dir.log" 2>&1 \
+    || fail "dump: $(cat "$dir.log")"
+  for dialect in rfc4180 mysql-load-data; do
+    "$quiver" dump --tls disabled -P "$source_port" -p quiver -B into_tidb -t 4 --format csv --csv-dialect "$dialect" \
+      -o "$dir-$dialect" > "$dir-$dialect.log" 2>&1 || fail "dump csv: $(cat "$dir-$dialect.log")"
+  done
+  for files in "$dir" "$dir-rfc4180" "$dir-mysql-load-data"; do
+    ti -e "DROP DATABASE into_tidb"
+    "$quiver" load --tls disabled -P "$port" -u root -d "$files" -t 2 > "$files.load.log" 2>&1 \
+      || fail "load: $(cat "$files.load.log")"
+    same "load of $files"
+  done
+  ti -e "DROP DATABASE into_tidb"
+  "$quiver" load --tls disabled -P "$port" -u root -d "$dir" -t 2 > "$dir.killed.log" 2>&1 &
+  killed=$!
+  sleep 4
+  kill -9 "$killed" 2> /dev/null
+  wait "$killed" 2> /dev/null
+  "$quiver" load --tls disabled -P "$port" -u root -d "$dir" -t 2 > "$dir.resumed.log" 2>&1 \
+    || fail "resumed load: $(cat "$dir.resumed.log")"
+  same "a load killed and resumed"
+  sequences="$out/tidb85-sequences"
+  if [ -d "$sequences" ]; then
+    ti -e "DROP DATABASE IF EXISTS quiver_tidb_moved"
+    "$quiver" load --tls disabled -P "$port" -u root -d "$sequences" -B quiver_tidb_moved > "$sequences.moved.log" 2>&1 \
+      || fail "load under another name: $(cat "$sequences.moved.log")"
+    ti -N -e "SHOW CREATE TABLE quiver_tidb_moved.counted" | grep -q 'quiver_tidb_moved`.`used' \
+      || fail "a default still names the old database: $(ti -N -e "SHOW CREATE TABLE quiver_tidb_moved.counted")"
+    ti -e "DROP DATABASE quiver_tidb_moved"
+  fi
+  ti -e "DROP DATABASE into_tidb"
+  my -e "DROP DATABASE into_tidb"
+  echo "$service: MySQL copied and loaded into TiDB in pieces, a killed load resumed, rows equal; sequences under another name"
+}
+# MariaDB into TiDB: sakila, whose triggers and routines TiDB lacks, is refused before
+# anything is made; without objects and with MariaDB's utf8mb4_uca1400_ai_ci created as
+# utf8mb4_0900_ai_ci, copy and dump, load in sql and csv give every table's rows. Selecting
+# the TiDB service runs it; the MariaDB source must be up too.
+cross() {
+  selected "$1" || return 0
+  service=$1 source=$2 port=$3 source_port=$4
+  maria() { docker compose -p quiver -f "$compose" exec -T -e MYSQL_PWD=quiver "$source" mariadb -uroot "$@"; }
+  ti() { docker compose -p quiver -f "$compose" exec -T "$source" mariadb -uroot -h "$service" -P 4000 "$@"; }
+  maria -e "DROP DATABASE IF EXISTS sakila"
+  maria < "$sakila_schema"
+  maria < "$sakila_data"
+  ti -e "DROP DATABASE IF EXISTS sakila"
+  same() {
+    for table in $(maria -N -e "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = 'sakila' AND TABLE_TYPE = 'BASE TABLE'"); do
+      columns=$(maria -N -e "SELECT GROUP_CONCAT(IF(DATA_TYPE IN ('geometry', 'point', 'blob'), CONCAT('HEX(\`', COLUMN_NAME, '\`)'), CONCAT('\`', COLUMN_NAME, '\`')) ORDER BY ORDINAL_POSITION) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = 'sakila' AND TABLE_NAME = '$table'")
+      query="SET time_zone = '+00:00'; SELECT $columns FROM sakila.\`$table\`"
+      [ "$(maria -N -e "$query" | sort | cksum)" = "$(ti -N -e "$query" | sort | cksum)" ] || fail "$1: rows of $table differ"
+    done
+  }
+  dir="$out/$service-cross"
+  rm -rf "$dir" "$dir-csv"
+  mapping="--collation utf8mb4_uca1400_ai_ci=utf8mb4_0900_ai_ci"
+  if "$quiver" copy --tls disabled -P "$source_port" -p quiver -B sakila --to-tls disabled --to-port "$port" \
+    $mapping > "$dir.refused.log" 2>&1; then
+    fail "triggers were copied into TiDB"
+  fi
+  grep -q Unsupported_object "$dir.refused.log" || fail "objects into TiDB: $(cat "$dir.refused.log")"
+  [ -z "$(ti -N -e "SHOW DATABASES LIKE 'sakila'")" ] || fail "a database was made for objects TiDB refused"
+  if "$quiver" copy --tls disabled -P "$source_port" -p quiver -B sakila --objects none --to-tls disabled \
+    --to-port "$port" > "$dir.unmapped.log" 2>&1; then
+    fail "MariaDB's collation was taken by TiDB"
+  fi
+  grep -q "^hint: the target has no collation utf8mb4_uca1400_ai_ci" "$dir.unmapped.log" \
+    || fail "no hint for the collation: $(cat "$dir.unmapped.log")"
+  ti -e "DROP DATABASE IF EXISTS sakila"
+  "$quiver" copy --tls disabled -P "$source_port" -p quiver -B sakila --objects views -t 4 --to-tls disabled \
+    --to-port "$port" $mapping > "$dir.copy.log" 2>&1 || fail "copy: $(cat "$dir.copy.log")"
+  [ "$(ti -N -e "SELECT COUNT(*) FROM information_schema.VIEWS WHERE TABLE_SCHEMA = 'sakila'")" = 7 ] \
+    || fail "the views were not copied"
+  [ "$(ti -N -e "SELECT COUNT(*) FROM sakila.customer_list")" = 599 ] || fail "a view does not read"
+  [ "$(ti -N -e "SELECT DEFAULT_COLLATION_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = 'sakila'")" \
+    = utf8mb4_0900_ai_ci ] || fail "the collation was not mapped"
+  same "copy"
+  "$quiver" dump --tls disabled -P "$source_port" -p quiver -B sakila --objects none -t 4 -o "$dir" > "$dir.log" 2>&1 \
+    || fail "dump: $(cat "$dir.log")"
+  "$quiver" dump --tls disabled -P "$source_port" -p quiver -B sakila --objects none -t 4 --format csv \
+    --csv-dialect mysql-load-data -o "$dir-csv" > "$dir-csv.log" 2>&1 || fail "dump csv: $(cat "$dir-csv.log")"
+  for files in "$dir" "$dir-csv"; do
+    ti -e "DROP DATABASE sakila"
+    "$quiver" load --tls disabled -P "$port" -u root -d "$files" -t 4 $mapping > "$files.load.log" 2>&1 \
+      || fail "load: $(cat "$files.load.log")"
+    same "load of $files"
+  done
+  ti -e "DROP DATABASE sakila"
+  maria -e "DROP DATABASE sakila"
+  echo "$service: sakila from $source refused for its triggers and, with a hint, its collation; copied with its views and loaded with the collation mapped, rows equal"
 }
 # qcheck tables of every type with edge values, random keys and dump flags:
 # insert, dump, restore with the server's client, compare rows and checksums.
@@ -689,6 +834,8 @@ chaos mariadb114 33114 mariadb verified
 chaos mariadb118 33118 mariadb verified
 consistent mysql80 33080 mysql cte_max_recursion_depth verified ftwrl
 tidb tidb85 mysql84 34085 33084 verified
+cross tidb85 mariadb118 34085 33118
+into_tidb tidb85 mysql84 34085 33084
 consistent mysql84 33084 mysql cte_max_recursion_depth verified ftwrl
 consistent mariadb1011 33101 mariadb max_recursive_iterations disabled backup-stage
 consistent mariadb118 33118 mariadb max_recursive_iterations verified backup-stage

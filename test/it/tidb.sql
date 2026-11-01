@@ -1,5 +1,6 @@
 -- TiDB source for the tidb IT step: every type TiDB shares with MySQL, the kinds of
--- key quiver chunks by, regions split so tables read in several parts, and a view.
+-- key quiver chunks by, regions split so tables read in several parts, and a view; and
+-- a database of sequences in every state, one a table's default.
 SET SESSION cte_max_recursion_depth = 100000;
 DROP DATABASE IF EXISTS quiver_tidb;
 CREATE DATABASE quiver_tidb;
@@ -44,12 +45,28 @@ CREATE TABLE nonclustered (id INT PRIMARY KEY NONCLUSTERED, parent BIGINT NOT NU
 INSERT INTO nonclustered
   WITH RECURSIVE n (i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 10000)
   SELECT i, 10001 - i, IF(i % 3 = 0, NULL, CONCAT('n', i)) FROM n;
+SPLIT TABLE nonclustered BETWEEN (0) AND (10000) REGIONS 4;
 
 CREATE TABLE no_key (msg VARCHAR(30), at TIMESTAMP(6) NULL);
 INSERT INTO no_key
   WITH RECURSIVE n (i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 10000)
   SELECT CONCAT('log ', i % 5000), '2025-05-05 05:05:05' + INTERVAL i MICROSECOND FROM n;
+SPLIT TABLE no_key BETWEEN (0) AND (10000) REGIONS 4;
 
 CREATE TABLE nothing (id INT PRIMARY KEY);
 
 CREATE VIEW recent AS SELECT id, name FROM big WHERE id > 49990;
+
+DROP DATABASE IF EXISTS quiver_tidb_seq;
+CREATE DATABASE quiver_tidb_seq;
+USE quiver_tidb_seq;
+CREATE SEQUENCE used;
+CREATE SEQUENCE fresh START WITH 7;
+CREATE SEQUENCE spent MAXVALUE 3 NOCACHE;
+CREATE SEQUENCE around MAXVALUE 3 CYCLE NOCACHE;
+CREATE SEQUENCE down START WITH -5 INCREMENT BY -2 MINVALUE -100 MAXVALUE -5 CACHE 3;
+CREATE TABLE counted (id INT NOT NULL DEFAULT NEXT VALUE FOR used, v INT, PRIMARY KEY (id));
+INSERT INTO counted (v) VALUES (1), (2), (3);
+SELECT NEXTVAL(spent), NEXTVAL(spent), NEXTVAL(spent);
+SELECT NEXTVAL(around), NEXTVAL(around), NEXTVAL(around), NEXTVAL(around);
+SELECT NEXTVAL(down), NEXTVAL(down);

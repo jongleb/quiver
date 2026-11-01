@@ -890,8 +890,9 @@ let () =
                     (query
                        "SELECT COLUMN_NAME, DATA_TYPE FROM \
                         information_schema.COLUMNS WHERE TABLE_SCHEMA = \
-                        'quiver_pbt_back' AND TABLE_NAME = 't' AND EXTRA NOT \
-                        LIKE '%GENERATED%' ORDER BY ORDINAL_POSITION")
+                        'quiver_pbt_back' AND TABLE_NAME = 't' AND CONCAT(' ', \
+                        EXTRA, ' ') NOT LIKE '% GENERATED %' ORDER BY \
+                        ORDINAL_POSITION")
                 in
                 let statement =
                   Printf.sprintf

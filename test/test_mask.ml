@@ -1005,6 +1005,7 @@ let dump_through rules ~null_source =
       Ok (Array.init n (fun session -> Await.Capsule.Await.With_mutex.create (fun () -> session)), ())
 
     let ddl _ _ = Ok ""
+    let sequences _ _ = Ok []
     let key_span _ _ = Ok None
 
     let read_chunk _ _ mask writer =
@@ -1066,9 +1067,10 @@ let dump_through rules ~null_source =
 
     let sexp_of_error Never = Sexplib0.Sexp.Atom "never"
     let format _ = Output_format.Sql
-    let database _ _ ~ddl:_ = Ok ()
+    let database _ _ ~ddl:_ ~sequences:_ = Ok ()
     let table _ _ ~ddl:_ ~parts:_ ~order:_ = Ok ()
     let add_part _ _ = Ok ()
+    let accepts _ _ _ = Ok ()
     let objects _ _ _ = Ok ()
     let part owner _ ~index:_ = Ok { owner; kept = [] }
     let renderer _ = ()
@@ -1295,6 +1297,7 @@ let references_through_a_dump () =
       Ok (Array.init n (fun session -> Await.Capsule.Await.With_mutex.create (fun () -> session)), ())
 
     let ddl _ _ = Ok ""
+    let sequences _ _ = Ok []
     let key_span _ _ = Ok None
 
     let read_chunk _ chunk _ writer =
@@ -1344,13 +1347,14 @@ let references_through_a_dump () =
 
     let sexp_of_error Never = Sexplib0.Sexp.Atom "never"
     let format _ = Output_format.Sql
-    let database _ _ ~ddl:_ = Ok ()
+    let database _ _ ~ddl:_ ~sequences:_ = Ok ()
 
     let table _ ({ name; _ } : Schema.Table.t) ~ddl:_ ~parts:_ ~order =
       Portable.Atomic.update declared ~pure_f:(fun declared -> (name, order) :: declared);
       Ok ()
 
     let add_part _ _ = Ok ()
+    let accepts _ _ _ = Ok ()
     let objects _ _ _ = Ok ()
     let part owner ({ name; _ } : Schema.Table.t) ~index:_ = Ok { owner; table = name; kept = [] }
     let renderer _ = ()

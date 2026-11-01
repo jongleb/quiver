@@ -9,6 +9,7 @@ type fault =
   | Append of int
   | Close of int
   | Table_ddl of int  (** The provider fails to show this table's DDL. *)
+  | Objects of int  (** The sink refuses the objects of this database. *)
 [@@deriving sexp_of]
 
 (** Which tables give their rows. *)
@@ -19,9 +20,6 @@ type rows =
   | Database of int  (** The tables of this database. *)
   | Missing  (** A table the dump does not have. *)
 [@@deriving sexp_of]
-
-(** Whether the dump takes the databases' objects. *)
-type objects = With_objects | Without_objects [@@deriving sexp_of]
 
 (** How many sessions the dump reads on. *)
 type reading =
@@ -48,7 +46,7 @@ type scenario = {
   databases : int;  (** Table [n] is in database [n mod databases]. *)
   objects : int list;  (** Per database, how many objects it has. *)
   rows : rows;
-  taking : objects;
+  taking : Filter.objects;
   reading : reading;
   rendering : rendering;
   batch_bytes : int;
@@ -89,6 +87,7 @@ module Recorder = struct
         (** Batches of each closed part. *)
     mutable finished : int;
     mutable databases : Ident.t list;
+    mutable sequences : (Ident.t * Ident.t list) list;  (** Declared with each database. *)
     mutable tables : (Schema.Name.t * int) list;  (** With their parts. *)
     mutable grown : Schema.Name.t list;  (** A part more, once each. *)
     mutable objects : (Ident.t * Ident.t list) list;
@@ -124,8 +123,11 @@ module Recorder = struct
     Guarded.hold t.log f
 
   let format _ = Output_format.Sql
-  let database t database ~ddl:_ =
-    logged t (fun log -> log.databases <- database :: log.databases);
+  let database t database ~ddl:_ ~sequences =
+    logged t (fun log ->
+        log.databases <- database :: log.databases;
+        log.sequences <-
+          (database, List.map (fun ({ name; _ } : Sequence.t) -> name) sequences) :: log.sequences);
     Ok ()
 
   let table t ({ name; _ } : Schema.Table.t) ~ddl:_ ~parts ~order:_ =
@@ -135,6 +137,11 @@ module Recorder = struct
         | false -> log.unannounced <- log.unannounced + 1);
         log.tables <- (name, parts) :: log.tables);
     Ok ()
+
+  let accepts t (database : Ident.t) _ =
+    match t.fault with
+    | Objects n when String.equal (database :> string) ("db" ^ string_of_int n) -> Error (`Sink Injected)
+    | Objects _ | Clean | Read _ | Render _ | Append _ | Close _ | Table_ddl _ -> Ok ()
 
   let objects t database (definitions : Definition.t list) =
     let names = List.map (fun ({ name; _ } : Definition.t) -> name) definitions in
@@ -208,7 +215,7 @@ module Recorder = struct
     | Close chunk when chunk = part.chunk ->
         Await.Await.Mpmc_queue.push owner.commits
           (Answer (fun () -> answer (Error Injected)))
-    | Clean | Read _ | Render _ | Append _ | Close _ | Table_ddl _ ->
+    | Clean | Read _ | Render _ | Append _ | Close _ | Table_ddl _ | Objects _ ->
         let rows = List.rev part.rows and batches = part.batches in
         Await.Await.Mpmc_queue.push owner.commits
           (Answer
@@ -248,7 +255,7 @@ let scenario =
     in
     let chunk = int_range 0 (chunks - 1) in
     let* databases = int_range 1 3 in
-    let* objects = list_size (pure databases) (int_range 0 4) in
+    let* objects = list_size (pure databases) (int_range 0 7) in
     let* rows =
       oneof_weighted
         [
@@ -264,7 +271,17 @@ let scenario =
           (1, map (fun database -> Database database) (int_range 0 2));
           (1, pure Missing);
         ]
-    and* taking = oneof_list [ With_objects; Without_objects ] in
+    and* taking =
+      oneof
+        [
+          pure Filter.Without_objects;
+          pure (Filter.With_objects Filter.every_kind);
+          map2
+            (fun first rest -> Filter.With_objects (first, rest))
+            (oneof_list [ Filter.Views; Triggers; Routines; Events ])
+            (list_size (int_range 0 2) (oneof_list [ Filter.Views; Triggers; Routines; Events ]));
+        ]
+    in
     let* reading =
       oneof
         [
@@ -291,6 +308,7 @@ let scenario =
             map
               (fun table -> Table_ddl table)
               (int_range 0 (List.length tables - 1)) );
+          (1, map (fun database -> Objects database) (int_range 0 (databases - 1)));
         ]
     in
     {
@@ -370,12 +388,22 @@ let holds
       let database_names = List.init databases database in
       let catalogs =
         List.map
-          (fun count -> List.init count (fun n -> ident ("o" ^ string_of_int n)))
+          (fun count ->
+            List.init count (fun n ->
+                let kind : Definition.kind =
+                  match n mod 5 with
+                  | 0 -> Procedure
+                  | 1 -> View { columns = (ident "c", []) }
+                  | 2 -> Trigger { table = ident "t0" }
+                  | 3 -> Event
+                  | _ -> Function
+                in
+                (ident ("o" ^ string_of_int n), kind)))
           objects
       and failing_ddl =
         match fault with
         | Table_ddl failing -> Some (ident ("t" ^ string_of_int failing))
-        | Clean | Read _ | Render _ | Append _ | Close _ -> None
+        | Clean | Read _ | Render _ | Append _ | Close _ | Objects _ -> None
       and context =
         {
           Definition.charset = ident "utf8mb4";
@@ -386,7 +414,11 @@ let holds
       in
       let catalog database =
         Option.value ~default:[] (List.nth_opt catalogs database)
+      and sequence_names =
+        List.init databases (fun database ->
+            List.init (database mod 3) (fun n -> ident ("q" ^ string_of_int n)))
       in
+      let sequences_of database = Option.value ~default:[] (List.nth_opt sequence_names database) in
       let planned =
         List.concat
           (List.map2
@@ -462,7 +494,7 @@ let holds
       let unreadable =
         match fault with
         | Read { chunk; row } -> row_of chunk row
-        | Clean | Render _ | Append _ | Close _ | Table_ddl _ -> None
+        | Clean | Render _ | Append _ | Close _ | Table_ddl _ | Objects _ -> None
       and doomed =
         match fault with
         | Render chunk | Append chunk ->
@@ -470,7 +502,7 @@ let holds
                 Option.map
                   (fun row -> ((Chunk.table planned).name, row))
                   (row_of chunk 0))
-        | Clean | Read _ | Close _ | Table_ddl _ -> None
+        | Clean | Read _ | Close _ | Table_ddl _ | Objects _ -> None
       in
       let turns = Support.get_ok (Guarded.create (fun () -> Ok ())) in
       let module Provider = struct
@@ -518,6 +550,13 @@ let holds
               Error (`Provider Failed_read)
           | _ -> Ok ""
 
+        let sequences _ database =
+          Ok
+            (List.map
+               (fun name -> Sequence.make ~name ~text:"" (Unused { next = 1L; increment = 1L }))
+               (sequences_of
+                  (Option.value ~default:0 (List.find_index (Ident.equal database) database_names))))
+
         let key_span _ chunk =
           Ok
             (Option.bind (Chunk.integer_key chunk) (fun _ ->
@@ -554,12 +593,7 @@ let holds
                   Ok Row)
 
         let objects _ database =
-          Ok
-            (List.map
-               (fun name -> (name, Definition.Procedure))
-               (catalog
-                  (Option.value ~default:0
-                     (List.find_index (Ident.equal database) database_names))))
+          Ok (catalog (Option.value ~default:0 (List.find_index (Ident.equal database) database_names)))
 
         let definition _ database (name, kind) =
           Ok { Definition.database; name; kind; context; text = "" }
@@ -585,6 +619,7 @@ let holds
                   appended = [];
                   finished = 0;
                   databases = [];
+                  sequences = [];
                   tables = [];
                   grown = [];
                   objects = [];
@@ -631,10 +666,7 @@ let holds
                 level = Best_effort;
                 filter = Everything;
                 rows = filter_rows;
-                objects =
-                  (match taking with
-                  | With_objects -> Filter.With_objects
-                  | Without_objects -> Without_objects);
+                objects = taking;
                 masking = Mask.none;
                 opts;
               }
@@ -650,6 +682,7 @@ let holds
         Recorder.logged recorder
           (fun { databases; tables; objects; unannounced; _ } ->
             (databases, tables, objects, unannounced))
+      and announced_sequences = Recorder.logged recorder (fun { sequences; _ } -> sequences)
       in
       match outcome with
       | Error `Timeout -> false
@@ -731,13 +764,30 @@ let holds
             | (Render chunk | Append chunk) when rows_of chunk <> [] -> `Fails
             | Close chunk when List.mem_assoc chunk numbered -> `Fails
             | Table_ddl _ -> `Fails
+            | Objects _ -> `Clean
             | Read _ | Render _ | Append _ | Close _ -> `Clean
           in
           let used = List.sort_uniq Int.compare (List.init (List.length tables) (fun n -> n mod databases)) in
+          let triggered, refused =
+            match (fault, taking) with
+            | Objects database, With_objects _ when List.mem database used -> (`Fails, `Refused)
+            | Objects _, (With_objects _ | Without_objects) | (Clean | Read _ | Render _ | Append _ | Close _ | Table_ddl _), _ ->
+                (triggered, `Accepted)
+          in
           unannounced = 0
+          && (match refused with
+             | `Refused -> announced_databases = [] && opened = []
+             | `Accepted -> true)
           && List.sort compare opened = List.sort compare ended
           && List.length announced_databases
              = List.length (List.sort_uniq Ident.compare announced_databases)
+          && List.for_all
+               (fun (database, names) ->
+                 Option.fold
+                   (List.find_index (Ident.equal database) database_names)
+                   ~none:false
+                   ~some:(fun n -> List.equal Ident.equal names (sequences_of n)))
+               announced_sequences
           && List.length announced_tables
              = List.length (List.sort_uniq compare (List.map fst announced_tables))
           && List.for_all
@@ -749,12 +799,17 @@ let holds
                         chunks))
                announced_tables
           && (match taking with
-             | With_objects -> true
+             | With_objects _ -> true
              | Without_objects -> announced_objects = [])
           && List.for_all
                (fun (database, names) ->
                  match List.find_index (Ident.equal database) database_names with
-                 | Some n -> List.equal Ident.equal names (catalog n)
+                 | Some n ->
+                     let kinds : Filter.kind list =
+                       match taking with Without_objects -> [] | With_objects (first, rest) -> first :: rest
+                     and model : Filter.kind list = [ Routines; Views; Triggers; Events; Routines ] in
+                     List.equal Ident.equal names
+                       (List.filteri (fun at _ -> List.mem (List.nth model (at mod 5)) kinds) (List.map fst (catalog n)))
                  | None -> false)
                announced_objects
           && List.length announced_objects
@@ -786,7 +841,7 @@ let holds
                  = List.map database used
               && List.length announced_objects
                  = (match taking with
-                   | With_objects -> List.length used
+                   | With_objects _ -> List.length used
                    | Without_objects -> 0)
               && List.for_all
                    (fun (t : Schema.Table.t) ->
@@ -846,7 +901,7 @@ let paced pace =
       databases = 1;
       objects = [ 0 ];
       rows = Every;
-      taking = Without_objects;
+      taking = Filter.Without_objects;
       reading = Fitting { cores = 8; suggests = None };
       rendering = Spare;
       batch_bytes = 4096;
@@ -870,7 +925,7 @@ let tests =
                databases = 1;
                objects = [ 0 ];
                rows = Every;
-               taking = Without_objects;
+               taking = Filter.Without_objects;
                reading = Readers 4;
                rendering = Spare;
                batch_bytes = 4096;

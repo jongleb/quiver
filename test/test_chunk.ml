@@ -265,6 +265,73 @@ let indexed_cover =
       && List.for_all through (Chunk.whole table :: Option.to_list closed @ chunks)
       && Option.is_some (Chunk.integer_key (Chunk.whole table)))
 
+let row_id_cover =
+  QCheck2.Test.make ~count:300
+    ~name:
+      "a table read by its hidden row number: every row falls in exactly one chunk, closed and \
+       divided ones too, and chunks are read in its order without selecting it"
+    ~print:(fun (bounds, rows, at) ->
+      Printf.sprintf "bounds=%s rows=%s at=%Ld"
+        (String.concat "," (List.map Int64.to_string bounds))
+        (String.concat "," (List.map Int64.to_string rows))
+        at)
+    QCheck2.Gen.(
+      let row_id =
+        oneof_weighted
+          [
+            (4, map Int64.of_int (int_range (-3) 40));
+            ( 2,
+              map2
+                (fun shard counter -> Int64.add (Int64.shift_left (Int64.of_int shard) 59) (Int64.of_int counter))
+                (int_range 0 15) (int_range 0 5) );
+            (1, oneof_list [ Int64.min_int; Int64.max_int; Int64.pred Int64.max_int ]);
+          ]
+      in
+      let+ bounds = list_size (int_range 0 8) row_id
+      and+ rows = list_size (int_range 1 60) row_id
+      and+ at = row_id in
+      (List.sort_uniq Int64.compare bounds, List.sort_uniq Int64.compare rows, at))
+    (fun (bounds, rows, at) ->
+      let table =
+        Support.table ~key:(Row_id "_tidb_rowid")
+          [ ("v", Ltype.Int64, Schema.Field.Nullable); ("w", Ltype.String, Schema.Field.Not_null) ]
+      in
+      let rec holds k (predicate : Predicate.t) =
+        match predicate with
+        | Always -> true
+        | Compare { field = { name; _ }; value = Signed v; comparison }
+          when String.equal (name :> string) "_tidb_rowid" -> (
+            match comparison with
+            | Less -> Int64.compare k v < 0
+            | Equal -> Int64.equal k v
+            | Greater -> Int64.compare k v > 0
+            | At_least -> Int64.compare k v >= 0)
+        | Compare _ -> false
+        | All (first, rest) -> List.for_all (holds k) (first :: rest)
+        | Any (first, rest) -> List.exists (holds k) (first :: rest)
+      in
+      let once chunks k = List.length (List.filter (fun chunk -> holds k (Predicate.of_chunk chunk)) chunks) = 1 in
+      let chunks = Support.get_ok (Chunk.of_bounds table (List.map (fun v -> [ Key.Signed v ]) bounds)) in
+      let lowest = List.fold_left min Int64.max_int rows and highest = List.fold_left max Int64.min_int rows in
+      let closed = Chunk.closed (Chunk.whole table) (Key.Signed lowest) (Key.Signed highest) in
+      let divided = Option.bind closed (fun closed -> Chunk.divide closed at) in
+      let read chunk =
+        let text = Quiver_mysql.Query.sql (Chunk { chunk; sources = [] }) in
+        Base.String.is_suffix text ~suffix:" ORDER BY `_tidb_rowid`"
+        && Base.String.is_prefix text ~prefix:"SELECT `v`, `w` FROM"
+        && not (Base.String.is_substring text ~substring:"FORCE INDEX")
+      in
+      let whole_key =
+        Option.map
+          (fun ({ name; ltype; nullability } : Schema.Field.t) -> ((name :> string), ltype, nullability))
+          (Chunk.integer_key (Chunk.whole table))
+      in
+      List.for_all (once chunks) rows
+      && (Int64.equal highest Int64.max_int || Option.fold closed ~none:false ~some:(fun closed -> List.for_all (once [ closed ]) rows))
+      && Option.fold divided ~none:true ~some:(fun (low, high) -> List.for_all (once [ low; high ]) rows)
+      && List.for_all read ((Chunk.whole table :: Option.to_list closed) @ chunks)
+      && Stdlib.( = ) whole_key (Some ("_tidb_rowid", Ltype.Int64, Schema.Field.Not_null)))
+
 let chosen_key =
   QCheck2.Test.make ~count:500
     ~name:
@@ -373,7 +440,7 @@ let chosen_key =
               && Ident.equal (id (Option.get (List.hd columns))) field
               && (let r, c, _ = rank entry and r', c', _ = best in r = r' && c = c'))
             indexed
-      | None, (Primary _ | Unique _ | No_key) -> false)
+      | None, (Primary _ | Unique _ | Row_id _ | No_key) -> false)
 
 let tests =
   [
@@ -400,6 +467,29 @@ let tests =
          });
     QCheck_alcotest.to_alcotest tuple_cover;
     QCheck_alcotest.to_alcotest indexed_cover;
+    QCheck_alcotest.to_alcotest row_id_cover;
+    Alcotest.test_case "a hidden row number is no field, and named as one is a duplicate" `Quick (fun () ->
+        let field (name, ltype, nullability) = { Schema.Field.name = Support.ident name; ltype; nullability } in
+        let made key =
+          Schema.Table.make ~name:Support.name
+            ~fields:[ field ("a", Ltype.String, Schema.Field.Nullable) ]
+            ~generated:[ field ("g", Ltype.Int32, Schema.Field.Nullable) ]
+            ~key:(Row_id (Support.ident key))
+            ~estimate:{ rows = 0; bytes = 0 }
+        in
+        let () =
+          match (made "a", made "g") with
+          | Error (`Schema (Schema.Duplicate_field { field = a; _ })), Error (`Schema (Schema.Duplicate_field { field = g; _ }))
+            when String.equal (a :> string) "a" && String.equal (g :> string) "g" -> ()
+          | _ -> Alcotest.fail "a row number named as a column was taken"
+        in
+        let table = Support.get_ok (made "_tidb_rowid") in
+        let sexp = Schema.Table.sexp_of_t table in
+        Alcotest.(check (list string)) "columns" [ "a"; "g" ]
+          (List.map (fun ({ name; _ } : Schema.Field.t) -> (name :> string)) (Schema.Table.columns table));
+        Alcotest.(check bool) "sexp" true (Sexplib0.Sexp.equal sexp (Schema.Table.sexp_of_t (Schema.Table.t_of_sexp sexp)));
+        Alcotest.(check bool) "json" true
+          (Sexplib0.Sexp.equal sexp (Schema.Table.sexp_of_t (Schema.Table.t_of_yojson (Schema.Table.yojson_of_t table)))));
     QCheck_alcotest.to_alcotest chosen_key;
     QCheck_alcotest.to_alcotest
       (exact_cover

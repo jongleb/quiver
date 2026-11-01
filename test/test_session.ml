@@ -16,13 +16,14 @@ type wire = Plain | Mutual_tls [@@deriving sexp_of]
 type refused =
   | Ddl_of of int  (** Creating it. *)
   | Parts_of of int  (** Closing each of its parts. *)
+  | Objects  (** Taking the database's objects, asked before anything is made. *)
 [@@deriving sexp_of]
 
 (** Which collector of a chain refuses, if any. *)
 type refusal = Nobody | First of refused | Last of refused [@@deriving sexp_of]
 
 (** What a recorder refuses. *)
-type refusing = Creating of Schema.Name.t | Closing of Schema.Name.t
+type refusing = Creating of Schema.Name.t | Closing of Schema.Name.t | Accepting
 
 (** How the agent ends a part. *)
 type ending =
@@ -131,15 +132,20 @@ module Recorder = struct
     Option.map Yojson.Safe.from_string (logged t (fun log -> log.finished))
 
   let format _ = Output_format.Sql
-  let database _ _ ~ddl:_ = Ok ()
+  let database _ _ ~ddl:_ ~sequences:_ = Ok ()
 
   let table t ({ name; _ } : Schema.Table.t) ~ddl:_ ~parts:_ ~order:_ =
     match t.refuse with
     | Some (Creating refused) when Schema.Name.equal refused name ->
         Error (`Sink (Refused_table name))
-    | Some (Creating _ | Closing _) | None ->
+    | Some (Creating _ | Closing _ | Accepting) | None ->
         logged t (fun log -> log.tables <- name :: log.tables);
         Ok ()
+
+  let accepts t _ _ =
+    match t.refuse with
+    | Some Accepting -> Error (`Sink Unknown_part)
+    | Some (Creating _ | Closing _) | None -> Ok ()
 
   let objects _ _ _ = Ok ()
 
@@ -169,7 +175,7 @@ module Recorder = struct
     match part.owner.refuse with
     | Some (Closing refused) when Schema.Name.equal refused name ->
         answer (Error (Refused_table name))
-    | Some (Creating _ | Closing _) | None ->
+    | Some (Creating _ | Closing _ | Accepting) | None ->
     logged part.owner (fun log ->
         log.closed <- ((name, index), rows) :: log.closed);
     answer
@@ -217,7 +223,7 @@ let scenario =
     let* refusal =
       let refused =
         let* n = int_range 0 (List.length tables - 1) in
-        oneof_list [ Ddl_of n; Parts_of n ]
+        oneof_list [ Ddl_of n; Parts_of n; Objects ]
       in
       oneof_weighted
         [
@@ -467,6 +473,7 @@ let property
   let refusing = function
     | Ddl_of n -> Some (Creating (List.nth schema n).Schema.Table.name)
     | Parts_of n -> Some (Closing (List.nth schema n).Schema.Table.name)
+    | Objects -> Some Accepting
   in
   let first =
     Recorder.create
@@ -591,7 +598,8 @@ let property
       (Quiver_net.Message.sexp_of_columns (Quiver_net.Remote.columns agent))
       Sexplib0.Sexp.pp_hum
       (Quiver_net.Message.sexp_of_columns asked);
-  ignore (Quiver_net.Remote.database agent (ident "db") ~ddl:"");
+  ignore (Quiver_net.Remote.accepts agent (ident "db") [ (ident "v", Definition.View { columns = (ident "c", []) }) ]);
+  ignore (Quiver_net.Remote.database agent (ident "db") ~ddl:"" ~sequences:[]);
   List.iteri
     (fun n parts ->
       ignore
@@ -814,6 +822,16 @@ let property
                     | Some (Error _) | None -> true
                     | Some (Ok _) -> false))
               (List.nth tables n))
+  | (First Objects | Last Objects), _ ->
+      let refuser =
+        match refusal with Last _ -> last | Nobody | First _ -> first
+      in
+      Result.is_error finished
+      && List.for_all
+           (fun ((recorder : Recorder.t), _) ->
+             Option.is_none (Recorder.finished recorder))
+           results
+      && Recorder.tables refuser = []
   | (First (Ddl_of refused_at) | Last (Ddl_of refused_at)), _ ->
       let refuser =
         match refusal with Last _ -> last | Nobody | First _ -> first

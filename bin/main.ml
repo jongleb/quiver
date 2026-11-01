@@ -22,8 +22,8 @@ type reading = {
 
 type 'r consumer = {
   consume :
-    ('s : value mod contended portable).
-    (module Quiver_core.Sink_intf.S with type t = 's) -> 's -> 'r;
+    ('s : value mod contended portable) ('e : value mod contended portable).
+    (module Quiver_core.Sink_intf.S with type t = 's and type error = 'e) -> 's -> 'r;
 }
 (** What runs with a sink of any kind. *)
 
@@ -43,6 +43,13 @@ let () =
   and failed sexp =
     Format.eprintf "quiver: %a@." Sexplib0.Sexp.pp_hum sexp;
     1
+  and hinted = function
+    | None -> ()
+    | Some collation ->
+        Format.eprintf
+          "hint: the target has no collation %s; --collation %s=OTHER creates what uses it in \
+           another collation of its character set, such as utf8mb4_0900_ai_ci on MySQL and TiDB@."
+          collation collation
   and ident_of_string text =
     Result.map_error
       (fun (`Ident error) ->
@@ -66,9 +73,9 @@ let () =
     | path -> Ok path
     | exception failure -> Error (`Msg (Printexc.to_string failure))
   in
-  let read (type (sink : value mod contended portable))
-      (module Sink : Quiver_core.Sink_intf.S with type t = sink) (sink : sink)
-      { conn; mode; filter; rows; objects; masking; opts; _ } ~report ~sink:written =
+  let read (type (sink : value mod contended portable) (failure : value mod contended portable))
+      (module Sink : Quiver_core.Sink_intf.S with type t = sink and type error = failure) (sink : sink)
+      { conn; mode; filter; rows; objects; masking; opts; _ } ~report ~sink:written ~(missing_collation : failure -> string option) =
     let module Dump = Quiver_core.Dump.Make (Quiver_mysql.Provider) (Sink) in
     let result =
       match mode with
@@ -208,7 +215,10 @@ let () =
              "masking %a.%s: a value lies outside the permutation's %Ld..%Ld; give the rule \
               permute:LOW..HIGH holding every value"
              Quiver_core.Schema.Name.pp table (column :> string) low high)
-    | Error error -> failed (Dump.sexp_of_error error)
+    | Error error ->
+        let code = failed (Dump.sexp_of_error error) in
+        let () = match error with `Sink error -> hinted (missing_collation error) | _ -> () in
+        code
   in
   let files output { consume } =
     let setup =
@@ -246,7 +256,7 @@ let () =
           {
             consume =
               (fun sink_module sink ->
-                read sink_module sink reading ~sink:"the files"
+                read sink_module sink reading ~sink:"the files" ~missing_collation:(fun _ -> None)
                   ~report:(fun ~entries:_ ~rows ~chunks ->
                     Format.printf "dumped %d rows in %d chunks into %a@." rows
                       chunks File_path.pp output.dir));
@@ -503,7 +513,7 @@ let () =
                     (module Quiver_net.Remote)
                     sink
                     { reading with conn = { reading.conn with generated } }
-                    ~sink:"the network"
+                    ~sink:"the network" ~missing_collation:(fun _ -> None)
                     ~report:(fun ~entries:_ ~rows ~chunks ->
                       Format.printf
                         "sent %d rows in %d chunks to %s in %a, %d streams at \
@@ -532,8 +542,7 @@ let () =
         | Some _ | None -> ()));
     config
   in
-  let collect protection reconnect listen forward output to_server into keys
-      after binlog ingest =
+  let collect protection reconnect listen forward output to_server into writing ingest =
     match
       match output with
       | Some output -> Ok (`Files output)
@@ -564,9 +573,9 @@ let () =
             | Error (`Collector error) -> failed (Quiver_net.Collector.sexp_of_error error)
             | Ok (listening, session, downstream) -> (
                 let started = Quiver_core.Stopwatch.start () in
-                let collected columns (type (s : value mod contended portable))
-                    (module S : Quiver_core.Sink_intf.S with type t = s)
-                    (sink : s) =
+                let collected columns (type (s : value mod contended portable) (e : value mod contended portable))
+                    (module S : Quiver_core.Sink_intf.S with type t = s and type error = e)
+                    (sink : s) ~(missing_collation : e -> string option) =
                   let module Collector = Quiver_net.Collector.Make (S) in
                   match
                     Collector.run ?forward:downstream listening session sink ~columns
@@ -577,7 +586,10 @@ let () =
                       0
                   | Error (`Collector error) ->
                       failed (Quiver_net.Collector.sexp_of_error error)
-                  | Error (`Sink error) -> failed (S.sexp_of_error error)
+                  | Error (`Sink error) ->
+                      let code = failed (S.sexp_of_error error) in
+                      hinted (missing_collation error);
+                      code
                   | Error (`Mask error) -> failed (Quiver_core.Mask.sexp_of_error error)
                 in
                 match destination with
@@ -585,13 +597,13 @@ let () =
                     files output
                       {
                         consume =
-                          (fun (type (s : value mod contended portable))
-                               (module S : Quiver_core.Sink_intf.S with type t = s) (sink : s) ->
-                            collected Written (module S) sink);
+                          (fun (type (s : value mod contended portable) (e : value mod contended portable))
+                               (module S : Quiver_core.Sink_intf.S with type t = s and type error = e) (sink : s) ->
+                            collected Written (module S) sink ~missing_collation:(fun _ -> None));
                       }
                 | `Server to_server -> (
                     match
-                      Quiver_load.Copy.create to_server (target into) ~keys ~after ~binlog ~ingest
+                      Quiver_load.Copy.create to_server (target into) writing ~ingest
                         ~sessions:(Quiver_net.Collector.chunks session)
                     with
                     | Error (`Sink error) -> failed (Quiver_load.Copy.sexp_of_error error)
@@ -599,13 +611,15 @@ let () =
                         let columns : Quiver_net.Message.columns =
                           match ingest with Load_data -> Written | Tablespaces _ -> Stored_too
                         in
-                        let code = collected columns (module Quiver_load.Copy) sink in
+                        let code =
+                          collected columns (module Quiver_load.Copy) sink ~missing_collation:Quiver_load.Copy.unknown_collation
+                        in
                         Quiver_load.Copy.shutdown sink;
                         tablespaces sink [];
                         advise (Quiver_load.Copy.advice sink);
                         code)))
   in
-  let copy reading to_server into keys after binlog ingest target_threads =
+  let copy reading to_server into (writing : Quiver_load.Load.writing) ingest target_threads =
     let generated : Quiver_mysql.Provider.generated =
       match ingest with Quiver_load.Copy.Load_data -> Left_out | Tablespaces _ -> Read
     in
@@ -613,7 +627,9 @@ let () =
         (
             let started = Quiver_core.Stopwatch.start () in
             match
-              Quiver_load.Copy.create to_server (target into) ~keys ~after:(after @ reading.scripted_after) ~binlog ~ingest
+              Quiver_load.Copy.create to_server (target into)
+                { writing with after = writing.after @ reading.scripted_after }
+                ~ingest
                 ~sessions:
                   (Option.value target_threads ~default:(Quiver_core.Dump_opts.most_readers reading.opts))
             with
@@ -624,7 +640,7 @@ let () =
                     (module Quiver_load.Copy)
                     sink
                     { reading with conn = { reading.conn with generated } }
-                    ~sink:"the target"
+                    ~sink:"the target" ~missing_collation:Quiver_load.Copy.unknown_collation
                     ~report:(fun ~entries ~rows ~chunks ->
                       Format.printf "copied %d rows in %d chunks in %a@." rows
                         chunks Core.Time_ns.Span.pp
@@ -635,12 +651,12 @@ let () =
                 advise (Quiver_load.Copy.advice sink);
                 code))
   in
-  let load conn dir into keys after binlog threads =
+  let load conn dir into writing threads =
     (
         let started = Quiver_core.Stopwatch.start () in
         match
           Quiver_load.Load.run
-            conn ~dir:(File_path.of_string dir) (target into) ~keys ~after ~binlog ~threads
+            conn ~dir:(File_path.of_string dir) (target into) writing ~threads
         with
         | Ok { files; rows; bytes; skipped; advice } ->
             Format.printf "loaded %d rows (%d bytes) from %d files in %a@." rows
@@ -654,6 +670,11 @@ let () =
             advise advice;
             0
         | Error error ->
+            let () =
+              match error with
+              | `Load (Quiver_load.Load.Rejected { cause; _ }) -> hinted (Quiver_load.Load.unknown_collation cause)
+              | _ -> ()
+            in
             failed
               ([%sexp_of:
                  [ `Load of Quiver_load.Load.error
@@ -1031,19 +1052,33 @@ let () =
                     "Take rows only of $(docv), repeatable; the other tables of \
                      the dump give only their schema.")))
     and objects =
+      let kinds : (string * Quiver_core.Filter.kind) list =
+        [ ("views", Views); ("triggers", Triggers); ("routines", Routines); ("events", Events) ]
+      in
+      let parse text : (Quiver_core.Filter.objects, [ `Msg of string ]) result =
+        match (text, String.split_on_char ',' text) with
+        | "all", _ -> Ok (With_objects Quiver_core.Filter.every_kind)
+        | "none", _ -> Ok Without_objects
+        | _, names -> (
+            match Base.Option.all (List.map (fun name -> List.assoc_opt name kinds) names) with
+            | Some (first :: rest) -> Ok (With_objects (first, rest))
+            | Some [] | None ->
+                Error (`Msg ("expected all, none or a list of " ^ String.concat ", " (List.map fst kinds))))
+      in
+      let print ppf (objects : Quiver_core.Filter.objects) =
+        let named kind = Option.fold ~none:"" ~some:fst (List.find_opt (fun (_, k) -> k = kind) kinds) in
+        match objects with
+        | Without_objects -> Format.pp_print_string ppf "none"
+        | With_objects (first, rest) -> Format.pp_print_string ppf (String.concat "," (List.map named (first :: rest)))
+      in
       Arg.(
         value
-        & opt
-            (enum
-               [
-                 ("all", Quiver_core.Filter.With_objects);
-                 ("none", Without_objects);
-               ])
-            With_objects
+        & opt (conv (parse, print)) (Quiver_core.Filter.With_objects Quiver_core.Filter.every_kind)
         & described [ "objects" ] ~docv:"WHICH"
             ~doc:
-              "$(b,all) takes the dumped databases' views, triggers, routines \
-               and events; $(b,none) takes none of them.")
+              "$(b,all) takes the dumped databases' views, triggers, routines (procedures and \
+               functions) and events; $(b,none) takes none of them; a list such as \
+               $(b,views,routines) takes those kinds only, for a target that lacks the others.")
     in
     let masking =
       let mask_rule =
@@ -1405,6 +1440,30 @@ let () =
              for the server, but replicas never see the data; needs the right \
              to set sql_log_bin); $(b,write) logs it as usual.")
   in
+  let writing =
+    let open Cmdliner in
+    let collations =
+      Term.term_result'
+        Term.(
+          const (fun rules ->
+              Result.map_error
+                (fun (`Collations error) ->
+                  Sexplib0.Sexp.to_string_hum (Quiver_load.Collations.sexp_of_error error))
+                (Quiver_load.Collations.of_rules rules))
+          $ Arg.(
+              value & opt_all string []
+              & described [ "collation" ] ~docv:"FROM=TO"
+                  ~doc:
+                    "Create what the source made in collation $(i,FROM) in $(i,TO) of the same \
+                     character set, repeatable: for a target that lacks $(i,FROM), such as TiDB \
+                     with MariaDB's utf8mb4_uca1400_ai_ci. The bytes stay as read; text then \
+                     compares and sorts by $(i,TO), so a unique key may refuse values $(i,FROM) \
+                     told apart."))
+    in
+    Term.(
+      const (fun keys after binlog collations -> { Quiver_load.Load.keys; after; binlog; collations })
+      $ keys $ after_load $ binlog $ collations)
+  in
   let load_cmd =
     let open Cmdliner in
     let dir =
@@ -1426,7 +1485,7 @@ let () =
     in
     Cmd.v
       (Cmd.info "load" ~doc:"Load a quiver dump into MySQL or MariaDB")
-      Term.(const load $ server `Source $ dir $ into $ keys $ after_load $ binlog $ threads)
+      Term.(const load $ server `Source $ dir $ into $ writing $ threads)
   in
   let copy_cmd =
     let open Cmdliner in
@@ -1443,7 +1502,7 @@ let () =
            "Copy MySQL or MariaDB into another server, with no files: each \
             reading session's chunks stream into a loading session of its own")
       Term.(
-        const copy $ reading $ server `Target $ into $ keys $ after_load $ binlog $ ingest
+        const copy $ reading $ server `Target $ into $ writing $ ingest
         $ Arg.(
             value
             & opt (some int) None
@@ -1669,10 +1728,9 @@ let () =
             $(b,--to-) options)")
       Term.(
         const
-          (fun protection reconnect listen forward dir output target into keys after
-               binlog ingest ->
-            collect protection reconnect listen forward (Option.map output dir)
-              target into keys after binlog ingest)
+          (fun protection reconnect listen forward dir output target into writing ingest ->
+            collect protection reconnect listen forward (Option.map output dir) target into writing
+              ingest)
         $ wire $ reconnect $ listen
         $ Arg.(
             value
@@ -1684,7 +1742,7 @@ let () =
                    counts once every target committed it.")
         $ Arg.value
             (outputdir ~doc:"Write files here instead of loading into a server.")
-        $ output $ conn `Target $ into $ keys $ after_load $ binlog $ ingest)
+        $ output $ conn `Target $ into $ writing $ ingest)
   in
   let mask_cmd =
     let open Cmdliner in

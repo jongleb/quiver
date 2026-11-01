@@ -27,8 +27,13 @@ module type S = sig
   val format : t -> Output_format.t @@ portable
 
   val database :
-    t -> Ident.t -> ddl:string -> (unit, [> `Sink of error ]) result
+    t ->
+    Ident.t ->
+    ddl:string ->
+    sequences:Sequence.t list ->
+    (unit, [> `Sink of error ]) result
     @@ portable
+  (** The database and its sequences, before any of its tables. *)
 
   val table :
     t ->
@@ -43,6 +48,12 @@ module type S = sig
     t -> Schema.Table.t -> (unit, [> `Sink of error ]) result @@ portable
   (** The table gets one part more than [table] announced: called while
       another of its parts is open, so before its last part closes. *)
+
+  val accepts :
+    t -> Ident.t -> (Ident.t * Definition.kind) list -> (unit, [> `Sink of error ]) result
+    @@ portable
+  (** Whether the output can take the database's objects, asked of every database before
+      anything is declared. *)
 
   val objects :
     t -> Ident.t -> Definition.t list -> (unit, [> `Sink of error ]) result

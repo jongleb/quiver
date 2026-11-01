@@ -24,6 +24,7 @@ type unsuitable : immutable_data =
   | Layout of Quiver_innodb.Layout.error
   | Space of Quiver_innodb.Tablespace.error
   | Masked_key  (** The key is masked, so rows do not come in its order. *)
+  | Row_order  (** Rows come by the source's hidden row number, not by the primary key. *)
 [@@deriving sexp_of ~portable]
 
 (** Who builds the secondary keys of a table built as a tablespace. *)

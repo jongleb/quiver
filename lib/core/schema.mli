@@ -39,6 +39,9 @@ module Table : sig
     | Indexed of { index : Ident.t; field : 'f }
         (** The NOT NULL first field of another index, used when there is neither key above:
             rows are read through the index by ranges of the field's values, which rows share. *)
+    | Row_id of 'f
+        (** The server's hidden signed 64-bit number of each row, not among the fields (TiDB's
+            [_tidb_rowid]): rows are read by its ranges in the order the server stores them. *)
     | No_key
   [@@deriving sexp ~portable, yojson]
 

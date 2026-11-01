@@ -14,7 +14,9 @@ val database :
   t ->
   Quiver_core.Ident.t ->
   ddl:string ->
+  sequences:Quiver_core.Sequence.t list ->
   (unit, [> `Output of Output.error ]) result @@ portable
+(** [<db>-schema-create], then [<db>.<sequence>-schema-sequence] for each sequence. *)
 
 val table :
   t ->

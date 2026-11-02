@@ -651,12 +651,12 @@ let () =
                 advise (Quiver_load.Copy.advice sink);
                 code))
   in
-  let load conn dir into writing threads =
+  let load conn dir into writing objects threads =
     (
         let started = Quiver_core.Stopwatch.start () in
         match
           Quiver_load.Load.run
-            conn ~dir:(File_path.of_string dir) (target into) writing ~threads
+            conn ~dir:(File_path.of_string dir) (target into) writing ~objects ~threads
         with
         | Ok { files; rows; bytes; skipped; advice } ->
             Format.printf "loaded %d rows (%d bytes) from %d files in %a@." rows
@@ -966,6 +966,36 @@ let () =
              a random key of this run when not given. Whoever holds $(docv) can undo \
              $(b,permute): keep it apart from the copies, one per environment.")
   in
+  let objects =
+    let open Cmdliner in
+    let kinds : (string * Quiver_core.Filter.kind) list =
+      [ ("views", Views); ("triggers", Triggers); ("routines", Routines); ("events", Events) ]
+    in
+    let parse text : (Quiver_core.Filter.objects, [ `Msg of string ]) result =
+      match (text, String.split_on_char ',' text) with
+      | "all", _ -> Ok (With_objects Quiver_core.Filter.every_kind)
+      | "none", _ -> Ok Without_objects
+      | _, names -> (
+          match Base.Option.all (List.map (fun name -> List.assoc_opt name kinds) names) with
+          | Some (first :: rest) -> Ok (With_objects (first, rest))
+          | Some [] | None ->
+              Error (`Msg ("expected all, none or a list of " ^ String.concat ", " (List.map fst kinds))))
+    in
+    let print ppf (objects : Quiver_core.Filter.objects) =
+      let named kind = Option.fold ~none:"" ~some:fst (List.find_opt (fun (_, k) -> k = kind) kinds) in
+      match objects with
+      | Without_objects -> Format.pp_print_string ppf "none"
+      | With_objects (first, rest) -> Format.pp_print_string ppf (String.concat "," (List.map named (first :: rest)))
+    in
+    Arg.(
+      value
+      & opt (conv (parse, print)) (Quiver_core.Filter.With_objects Quiver_core.Filter.every_kind)
+      & described [ "objects" ] ~docv:"WHICH"
+          ~doc:
+            "$(b,all) takes the databases' views, triggers, routines (procedures and \
+             functions) and events; $(b,none) takes none of them; a list such as \
+             $(b,views,routines) takes those kinds only, for a target that lacks the others.")
+  in
   let reading =
     let open Cmdliner in
     let mode =
@@ -1051,34 +1081,6 @@ let () =
                   ~doc:
                     "Take rows only of $(docv), repeatable; the other tables of \
                      the dump give only their schema.")))
-    and objects =
-      let kinds : (string * Quiver_core.Filter.kind) list =
-        [ ("views", Views); ("triggers", Triggers); ("routines", Routines); ("events", Events) ]
-      in
-      let parse text : (Quiver_core.Filter.objects, [ `Msg of string ]) result =
-        match (text, String.split_on_char ',' text) with
-        | "all", _ -> Ok (With_objects Quiver_core.Filter.every_kind)
-        | "none", _ -> Ok Without_objects
-        | _, names -> (
-            match Base.Option.all (List.map (fun name -> List.assoc_opt name kinds) names) with
-            | Some (first :: rest) -> Ok (With_objects (first, rest))
-            | Some [] | None ->
-                Error (`Msg ("expected all, none or a list of " ^ String.concat ", " (List.map fst kinds))))
-      in
-      let print ppf (objects : Quiver_core.Filter.objects) =
-        let named kind = Option.fold ~none:"" ~some:fst (List.find_opt (fun (_, k) -> k = kind) kinds) in
-        match objects with
-        | Without_objects -> Format.pp_print_string ppf "none"
-        | With_objects (first, rest) -> Format.pp_print_string ppf (String.concat "," (List.map named (first :: rest)))
-      in
-      Arg.(
-        value
-        & opt (conv (parse, print)) (Quiver_core.Filter.With_objects Quiver_core.Filter.every_kind)
-        & described [ "objects" ] ~docv:"WHICH"
-            ~doc:
-              "$(b,all) takes the dumped databases' views, triggers, routines (procedures and \
-               functions) and events; $(b,none) takes none of them; a list such as \
-               $(b,views,routines) takes those kinds only, for a target that lacks the others.")
     in
     let masking =
       let mask_rule =
@@ -1485,7 +1487,7 @@ let () =
     in
     Cmd.v
       (Cmd.info "load" ~doc:"Load a quiver dump into MySQL or MariaDB")
-      Term.(const load $ server `Source $ dir $ into $ writing $ threads)
+      Term.(const load $ server `Source $ dir $ into $ writing $ objects $ threads)
   in
   let copy_cmd =
     let open Cmdliner in

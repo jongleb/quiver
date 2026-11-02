@@ -8,17 +8,16 @@ type objects = Without_objects | With_objects of (kind * kind list) [@@deriving 
 
 let every_kind = (Views, [ Triggers; Routines; Events ])
 
+let kinds = function Without_objects -> [] | With_objects (first, rest) -> first :: rest
+
 let taken objects entries =
-  match objects with
-  | Without_objects -> []
-  | With_objects (first, rest) ->
-      List.filter
-        (fun (_, (kind : Definition.kind)) ->
-          let of_kind : kind =
-            match kind with View _ -> Views | Trigger _ -> Triggers | Procedure | Function -> Routines | Event -> Events
-          in
-          List.mem of_kind (first :: rest))
-        entries
+  List.filter
+    (fun (_, (kind : Definition.kind)) ->
+      let of_kind : kind =
+        match kind with View _ -> Views | Trigger _ -> Triggers | Procedure | Function -> Routines | Event -> Events
+      in
+      List.mem of_kind (kinds objects))
+    entries
 
 type error = Unmatched_rows of rule [@@deriving sexp_of]
 

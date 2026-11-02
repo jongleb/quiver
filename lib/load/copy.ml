@@ -155,14 +155,9 @@ type declaration = {
   declared : (unit, error) result Await.Await.Ivar.t;
 }
 
-(** How much of a part one transaction on the target takes. *)
-type transactions =
-  | Per_part
-  | Every of int  (** Bytes of text, then a commit: TiDB holds a transaction in its memory. *)
-
 type t = {
   target : Load.target;
-  transactions : transactions;
+  transactions : Fanout.transactions;
   keys : Load.keys;
   after : After_load.rule list;
   collations : Collations.t;
@@ -212,15 +207,13 @@ type turn = Any_time | Taken of Await.Await.Semaphore.t
 
 type loading = {
   owner : t;
-  loader : int;  (** Held from [part] to [close] or [discard]. *)
   turn : turn;
   job : job;
   renderer : csv;
   hash : Quiver_sink.Xxh3.t;
   mutable rows : int;
   mutable bytes : int;
-  mutable statement_rows : int;  (** Of the open [LOAD DATA]. *)
-  mutable statement_bytes : int;
+  fanout : Fanout.t;  (** Its own loader, held from [part] to [close] or [discard], and borrowed ones. *)
   mutable apart : (string * int) list;  (** [INSERT]s to run after the data, last first. *)
 }
 
@@ -497,8 +490,8 @@ let create config target ({ keys; after; binlog; collations } : Load.writing) ~i
              transactions =
                Quiver_core.Guarded.hold control (fun link ->
                    match Quiver_mysql.Link.server link with
-                   | Mysql_8_0 _ | Mysql_8_4 _ | Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _ -> Per_part
-                   | Tidb_8_5 _ -> Every Load.tidb_transaction_bytes);
+                   | Mysql_8_0 _ | Mysql_8_4 _ | Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _ -> Fanout.Per_part
+                   | Tidb_8_5 _ -> Fanout.Every Load.tidb_transaction_bytes);
              keys;
              after;
              collations;
@@ -683,6 +676,25 @@ let file_of (name : Quiver_core.Schema.Name.t) index =
        (Quiver_sink.Layout.file_name name.table)
        index)
 
+let began t (job : job) loader =
+  let statement = job.statement in
+  match
+    Quiver_core.Guarded.hold (Iarray.get t.loaders loader) (fun link ->
+        match
+          let%bind () = execute link (Use job.into.database) in
+          let%bind () = execute link Begin in
+          rejected statement (Quiver_mysql.Link.upload link statement)
+        with
+        | Ok () -> Ok ()
+        | Error error ->
+            ignore (execute link Rollback);
+            Error error)
+  with
+  | Ok () -> Ok ()
+  | Error error ->
+      Await.Await.Mpmc_queue.push t.idle loader;
+      Error (`Sink error)
+
 let loading t
     ({ name; fields = first, rest; _ } as table : Quiver_core.Schema.Table.t)
     ~index =
@@ -731,29 +743,15 @@ let loading t
         Taken turn
   in
   let loader = Await.Await.Mpmc_queue.pop Quiver_core.Blocking.await t.idle in
-  let statement = job.statement and database = job.into.database in
-  match
-    Quiver_core.Guarded.hold (Iarray.get t.loaders loader) (fun link ->
-        match
-          let%bind () = execute link (Use database) in
-          let%bind () = execute link Begin in
-          rejected statement (Quiver_mysql.Link.upload link statement)
-        with
-        | Ok () -> Ok ()
-        | Error error ->
-            ignore (execute link Rollback);
-            Error error)
-  with
+  match began t job loader with
   | Error error ->
-      Await.Await.Mpmc_queue.push t.idle loader;
       give_back turn;
-      Error (`Sink error)
+      Error error
   | Ok () ->
       Ok
         (Loading
            {
              owner = t;
-             loader;
              turn;
              job;
              renderer =
@@ -766,8 +764,7 @@ let loading t
              hash = Quiver_sink.Xxh3.create ();
              rows = 0;
              bytes = 0;
-             statement_rows = 0;
-             statement_bytes = 0;
+             fanout = Fanout.create t.transactions loader;
              apart = [];
            })
 
@@ -904,41 +901,43 @@ let render (renderer : renderer) (batch : Quiver_core.Batch.sealed @ local) =
       rendered
 
 let append_loading (part : loading) text rows =
-  let statement = part.job.statement and enums = part.job.enums in
-  let statement_rows = part.statement_rows + rows
-  and statement_bytes = part.statement_bytes + String.length text in
-  let full =
-    match part.owner.transactions with
-    | Every bytes when statement_bytes >= bytes -> `Full
-    | Every _ | Per_part -> `Room
+  let t = part.owner and statement = part.job.statement and enums = part.job.enums in
+  let borrowed =
+    match (part.turn, Fanout.wish part.fanout) with
+    | Taken _, (Borrow | Enough) | Any_time, Enough -> Ok ()
+    | Any_time, Borrow -> (
+        match Await.Await.Mpmc_queue.pop_nonblocking t.idle with
+        | Null -> Ok ()
+        | This loader -> Result.map (fun () -> Fanout.add part.fanout loader) (began t part.job loader))
   in
+  let%bind () = borrowed in
+  let loader, step = Fanout.send part.fanout ~bytes:(String.length text) ~rows in
   match
-    Quiver_core.Guarded.hold (Iarray.get part.owner.loaders part.loader) (fun link ->
+    Quiver_core.Guarded.hold (Iarray.get t.loaders loader) (fun link ->
         let%bind () = rejected statement (Quiver_mysql.Link.send_data link text) in
-        match full with
-        | `Room -> Ok ()
-        | `Full ->
-            let%bind () = rejected statement (Quiver_mysql.Link.complete link ~rows:statement_rows ~enums) in
+        match step with
+        | Open -> Ok ()
+        | Ended { rows; after } -> (
+            let%bind () = rejected statement (Quiver_mysql.Link.complete link ~rows ~enums) in
             let%bind () = execute link Commit in
-            let%bind () = execute link Begin in
-            rejected statement (Quiver_mysql.Link.upload link statement))
+            match after with
+            | Back -> Ok ()
+            | Again ->
+                let%bind () = execute link Begin in
+                rejected statement (Quiver_mysql.Link.upload link statement)))
   with
   | Error error -> Error (`Sink error)
   | Ok () ->
+      let () =
+        match step with
+        | Ended { after = Back; _ } -> Await.Await.Mpmc_queue.push t.idle loader
+        | Ended { after = Again; _ } | Open -> ()
+      in
       (* Hashed only, never written: the string stays as it is. *)
       Quiver_sink.Xxh3.add part.hash (Bytes.unsafe_of_string text) ~pos:0
         ~len:(String.length text);
       part.rows <- part.rows + rows;
       part.bytes <- part.bytes + String.length text;
-      let () =
-        match full with
-        | `Room ->
-            part.statement_rows <- statement_rows;
-            part.statement_bytes <- statement_bytes
-        | `Full ->
-            part.statement_rows <- 0;
-            part.statement_bytes <- 0
-      in
       Ok ()
 
 let append part rendered =
@@ -970,17 +969,20 @@ let append part rendered =
           Ok ())
   | Loading _, Records _ | Building _, Text _ -> Error (`Sink Mismatched_render)
 
+let abandon t (job : job) ({ loader; rows } : Fanout.statement) =
+  Quiver_core.Guarded.hold (Iarray.get t.loaders loader) (fun link ->
+      ignore (rejected job.statement (Quiver_mysql.Link.complete link ~rows ~enums:job.enums));
+      ignore (execute link Rollback))
+
 let close_loading (part : loading) answer =
-  let t = part.owner and statement = part.job.statement and rows = part.statement_rows
-  and enums = part.job.enums and apart = List.rev part.apart in
-  let outcome =
-    Quiver_core.Guarded.hold (Iarray.get t.loaders part.loader) (fun link ->
+  let t = part.owner and statement = part.job.statement and enums = part.job.enums
+  and apart = List.rev part.apart in
+  let own, borrowed = Fanout.ends part.fanout in
+  let committed ({ loader; rows } : Fanout.statement) more =
+    Quiver_core.Guarded.hold (Iarray.get t.loaders loader) (fun link ->
         match
           let%bind () = rejected statement (Quiver_mysql.Link.complete link ~rows ~enums) in
-          let%bind () =
-            Base.List.fold_result apart ~init:() ~f:(fun () (insert, rows) ->
-                rejected insert (Quiver_mysql.Link.insert link insert ~rows ~enums))
-          in
+          let%bind () = more link in
           execute link Commit
         with
         | Ok () -> Ok ()
@@ -988,7 +990,17 @@ let close_loading (part : loading) answer =
             ignore (execute link Rollback);
             Error error)
   in
-  Await.Await.Mpmc_queue.push t.idle part.loader;
+  let outcome =
+    match Base.Result.all_unit (List.map (fun statement -> committed statement (fun _ -> Ok ())) borrowed) with
+    | Error error ->
+        abandon t part.job own;
+        Error error
+    | Ok () ->
+        committed own (fun link ->
+            Base.List.fold_result apart ~init:() ~f:(fun () (insert, rows) ->
+                rejected insert (Quiver_mysql.Link.insert link insert ~rows ~enums)))
+  in
+  List.iter (fun ({ loader; _ } : Fanout.statement) -> Await.Await.Mpmc_queue.push t.idle loader) (own :: borrowed);
   give_back part.turn;
   match outcome with
   | Error error -> answer (Error error)
@@ -1079,12 +1091,13 @@ let close part answer =
   | Building building -> close_building building answer
 
 let discard_loading (part : loading) =
-  let statement = part.job.statement and rows = part.statement_rows
-  and enums = part.job.enums in
-  Quiver_core.Guarded.hold (Iarray.get part.owner.loaders part.loader) (fun link ->
-      ignore (rejected statement (Quiver_mysql.Link.complete link ~rows ~enums));
-      ignore (execute link Rollback));
-  Await.Await.Mpmc_queue.push part.owner.idle part.loader;
+  let t = part.owner in
+  let own, borrowed = Fanout.ends part.fanout in
+  List.iter
+    (fun ({ loader; _ } as statement : Fanout.statement) ->
+      abandon t part.job statement;
+      Await.Await.Mpmc_queue.push t.idle loader)
+    (own :: borrowed);
   give_back part.turn
 
 let discard = function Loading loading -> discard_loading loading | Building _ -> ()

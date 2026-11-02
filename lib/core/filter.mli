@@ -20,6 +20,8 @@ type objects = Without_objects | With_objects of (kind * kind list) [@@deriving 
 
 val every_kind : kind * kind list
 
+val kinds : objects -> kind list
+
 val taken : objects -> (Ident.t * Definition.kind) list -> (Ident.t * Definition.kind) list
 (** Those of a database's catalog the dump takes, in order. *)
 

@@ -14,7 +14,12 @@ type token = { start : int; length : int; kind : kind }
 val tokens : string -> token list @@ portable
 (** In order, outside quotes and plain comments; inside [/*! ... */] too. *)
 
-val created : string -> string option @@ portable
-(** The name a statement such as [CREATE DEFINER=`u`@`h` PROCEDURE `p`] or [CREATE TABLE IF NOT
-    EXISTS `t`] names after its first kind of object: [TABLE], [VIEW], [SEQUENCE], [PROCEDURE],
-    [FUNCTION], [EVENT] or [TRIGGER], in any case. *)
+(** A kind of object a statement makes or drops. *)
+type made = Table | View | Sequence | Procedure | Function | Event | Trigger
+
+type named = { made : made; name : string }
+
+val created : string -> named option @@ portable
+(** What a statement such as [CREATE DEFINER=`u`@`h` PROCEDURE `p`], [CREATE TABLE IF NOT EXISTS
+    `t`] or [DROP EVENT IF EXISTS `e`] names after its first kind of object: [TABLE], [VIEW],
+    [SEQUENCE], [PROCEDURE], [FUNCTION], [EVENT] or [TRIGGER], in any case. *)

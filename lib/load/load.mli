@@ -23,7 +23,7 @@ type error =
   | No_sequences of File_path.Part.t
       (** The target is MySQL, which has no sequences, and the dump has this one. *)
   | Unsupported_objects of File_path.Part.t
-      (** The target is TiDB, which has no triggers, routines or events, and the dump has these. *)
+      (** The target is TiDB, which has no triggers, routines or events, and the file has one taken. *)
   | Renaming of Qualifier.error  (** The database cannot take another name in its definitions. *)
   | Non_positive_threads of int
   | Unstarted of Quiver_core.Concurrent.error  (** No loading thread could start. *)
@@ -135,11 +135,20 @@ type writing = {
   collations : Collations.t;  (** Rewritten in every definition. *)
 }
 
+val object_kind : string -> Quiver_core.Filter.kind option @@ portable
+(** The kind of object a statement of a database's views, triggers or routines file makes or
+    drops; none for a table, a sequence or a [SET]. *)
+
+val taken_statement : Quiver_core.Filter.objects -> string -> string option @@ portable
+(** The statement as a load taking these kinds runs it from an objects file: none when it makes
+    or drops an object of another kind. *)
+
 val run :
   Quiver_mysql.Provider.conn_config ->
   dir:File_path.t ->
   target ->
   writing ->
+  objects:Quiver_core.Filter.objects ->
   threads:int ->
   ( summary,
     [> `Load of error

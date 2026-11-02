@@ -209,7 +209,21 @@ let tidb_transaction_bytes = 16 * 1024 * 1024
 
 type writing = { keys : keys; after : After_load.rule list; binlog : binlog; collations : Collations.t }
 
-let run config ~dir target { keys; after; binlog; collations } ~threads =
+let object_kind statement =
+  Option.bind (Sql_text.created statement) (fun ({ made; _ } : Sql_text.named) : Quiver_core.Filter.kind option ->
+      match made with
+      | View -> Some Views
+      | Trigger -> Some Triggers
+      | Procedure | Function -> Some Routines
+      | Event -> Some Events
+      | Table | Sequence -> None)
+
+let taken_statement objects statement =
+  Option.fold (object_kind statement) ~none:(Some statement) ~some:(fun kind ->
+      Base.Option.some_if (List.mem kind (Quiver_core.Filter.kinds objects)) statement)
+
+let run config ~dir target { keys; after; binlog; collations } ~objects:wanted ~threads =
+  let kinds = Quiver_core.Filter.kinds wanted in
   let read file consume =
     match
       In_channel.open_bin
@@ -366,23 +380,28 @@ let run config ~dir target { keys; after; binlog; collations } ~threads =
            let%bind stubs = files "-schema" in
            let%map views = files "-schema-view" in
            let optional base = Result.to_list (schema_file base) in
-           ( List.map (fun stub -> Run { database; files = [ stub ] }) stubs,
+           let among some files = if List.exists (fun kind -> List.mem kind kinds) some then files else [] in
+           ( List.map (fun stub -> Run { database; files = [ stub ] }) (among [ Views ] stubs),
              List.filter_map
                (function [] -> None | files -> Some (Run { database; files }))
-               [ views; optional (prefix ^ "-schema-triggers"); optional (prefix ^ "-schema-post") ] ))
+               [
+                 among [ Views ] views;
+                 among [ Triggers ] (optional (prefix ^ "-schema-triggers"));
+                 among [ Routines; Events ] (optional (prefix ^ "-schema-post"));
+               ] ))
          databases)
+  in
+  let object_files =
+    List.concat_map
+      (fun (stubs, runs) ->
+        List.concat_map (function Run { files; _ } -> files | Create _ | Fill _ | Update _ | Stop -> []) (stubs @ runs))
+      objects
   in
   let%bind qualifier =
     match (target, databases) with
     | Same_names, _ | Into _, [] -> Ok None
     | Into into, database :: _ ->
-        let files =
-          sequences database
-          @ List.concat_map
-              (fun (stubs, runs) ->
-                List.concat_map (function Run { files; _ } -> files | Create _ | Fill _ | Update _ | Stop -> []) (stubs @ runs))
-              objects
-        in
+        let files = sequences database @ object_files in
         let created = ref [] in
         let%bind () =
           Base.Result.all_unit
@@ -391,7 +410,10 @@ let run config ~dir target { keys; after; binlog; collations } ~threads =
                  let%map (_ : Quiver_core.Checksum.t) =
                    read file (fun text ->
                        Statements.iter text (fun statement ->
-                           Ok (Option.iter (fun name -> created := name :: !created) (Sql_text.created statement))))
+                           Ok
+                             (Option.iter
+                                (fun ({ name; _ } : Sql_text.named) -> created := name :: !created)
+                                (Sql_text.created statement))))
                  in
                  ())
                files)
@@ -451,20 +473,22 @@ let run config ~dir target { keys; after; binlog; collations } ~threads =
   let%bind () =
     match
       let%bind () =
-        let routines =
-          List.concat_map
-            (fun database ->
-              let prefix = Quiver_sink.Layout.file_name database in
-              List.filter_map
-                (fun suffix -> Result.to_option (schema_file (prefix ^ suffix)))
-                [ "-schema-triggers"; "-schema-post" ])
-            databases
-        in
-        match (Quiver_mysql.Link.server control, List.concat_map sequences databases, routines) with
-        | (Mysql_8_0 _ | Mysql_8_4 _), file :: _, _ -> Error (`Load (No_sequences file))
-        | Tidb_8_5 _, _, file :: _ -> Error (`Load (Unsupported_objects file))
-        | (Mysql_8_0 _ | Mysql_8_4 _), [], _ | (Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _), _, _ | Tidb_8_5 _, _, [] ->
-            Ok ()
+        match (Quiver_mysql.Link.server control, List.concat_map sequences databases) with
+        | (Mysql_8_0 _ | Mysql_8_4 _), file :: _ -> Error (`Load (No_sequences file))
+        | (Mysql_8_0 _ | Mysql_8_4 _), [] | (Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _), _ -> Ok ()
+        | Tidb_8_5 _, _ ->
+            Base.Result.all_unit
+              (List.map
+                 (fun file ->
+                   let%map (_ : Quiver_core.Checksum.t) =
+                     read file (fun text ->
+                         Statements.iter text (fun statement ->
+                             match Option.bind (taken_statement wanted statement) object_kind with
+                             | Some (Triggers | Routines | Events) -> Error (`Load (Unsupported_objects file))
+                             | Some Views | None -> Ok ()))
+                   in
+                   ())
+                 object_files)
       in
       let%bind () =
         match resume with Fresh -> record control "(started)" | Resuming -> Ok ()
@@ -756,7 +780,13 @@ let run config ~dir target { keys; after; binlog; collations } ~threads =
                   let%bind () = Quiver_mysql.Link.run_statement link (Use (renamed target database)) in
                   let%map () =
                     Base.List.fold_result files ~init:() ~f:(fun () file ->
-                        let%map _ = statements ddl link file translate in
+                        let%map (_ : Quiver_core.Checksum.t) =
+                          read file (fun text ->
+                              Statements.iter text (fun statement ->
+                                  Option.fold (taken_statement wanted statement) ~none:(Ok ()) ~some:(fun statement ->
+                                      let sql = translate statement in
+                                      rejected file sql (ddl link sql))))
+                        in
                         ())
                   in
                   Ran)

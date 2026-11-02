@@ -5,6 +5,8 @@ let () =
       ("sequence", Test_sequence.tests);
       ("collations", Test_collations.tests);
       ("pieces", Test_pieces.tests);
+      ("fanout", Test_fanout.tests);
+      ("load objects", Test_load_objects.tests);
       ("qualifier", Test_qualifier.tests);
       ("batch", Test_batch.tests);
       ("batch model", Test_batch_model.tests);

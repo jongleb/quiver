@@ -108,9 +108,9 @@ let rewritten =
 let created =
   QCheck2.Test.make ~count:3000
     ~name:
-      "the name a CREATE statement makes is found after its kind, whatever comes before it and \
-       whatever its body names"
-    ~print:(fun (statement, name) -> Printf.sprintf "%S -> %S" statement name)
+      "the kind and name a CREATE or DROP statement makes or drops are found after its first \
+       kind, whatever comes before it and whatever its body names"
+    ~print:(fun (statement, (_, name)) -> Printf.sprintf "%S -> %S" statement name)
     QCheck2.Gen.(
       let name =
         map (String.concat "")
@@ -118,7 +118,20 @@ let created =
       in
       let quoted name = "`" ^ Base.String.substr_replace_all name ~pattern:"`" ~with_:"``" ^ "`" in
       let* name in
-      let* kind = oneof_list [ "TABLE"; "table"; "VIEW"; "SEQUENCE"; "PROCEDURE"; "FUNCTION"; "EVENT"; "TRIGGER" ] in
+      let* kind, made =
+        oneof_list
+          Quiver_load.Sql_text.
+            [
+              ("TABLE", Table);
+              ("table", Table);
+              ("VIEW", View);
+              ("SEQUENCE", Sequence);
+              ("PROCEDURE", Procedure);
+              ("Function", Function);
+              ("EVENT", Event);
+              ("trigger", Trigger);
+            ]
+      in
       let* before =
         oneof_list
           [
@@ -140,8 +153,12 @@ let created =
             " start with 1 minvalue 1 maxvalue 9 increment by 1 cache 1000 nocycle ENGINE=InnoDB";
           ]
       in
-      return ("CREATE " ^ before ^ kind ^ " " ^ guard ^ quoted name ^ body, name))
-    (fun (statement, name) -> Option.equal String.equal (Quiver_load.Sql_text.created statement) (Some name))
+      let* verb, guard = oneof_list [ ("CREATE ", guard); ("DROP ", "IF EXISTS ") ] in
+      return (verb ^ before ^ kind ^ " " ^ guard ^ quoted name ^ body, (made, name)))
+    (fun (statement, expected) ->
+      Option.equal ( = )
+        (Option.map (fun ({ made; name } : Quiver_load.Sql_text.named) -> (made, name)) (Quiver_load.Sql_text.created statement))
+        (Some expected))
 
 let tests =
   [
@@ -170,6 +187,8 @@ let tests =
           Alcotest.(check (list (option string)))
             "none"
             [ None; None; None ]
-            (List.map Quiver_load.Sql_text.created
+            (List.map
+               (fun statement ->
+                 Option.map (fun ({ name; _ } : Quiver_load.Sql_text.named) -> name) (Quiver_load.Sql_text.created statement))
                [ "SET character_set_client = utf8mb4"; "DO SETVAL(`s`, 1)"; "/*!40101 SET NAMES utf8mb4*/" ]));
   ]

@@ -1,5 +1,7 @@
 type kind = Word | Backquoted of string
 type token = { start : int; length : int; kind : kind }
+type made = Table | View | Sequence | Procedure | Function | Event | Trigger
+type named = { made : made; name : string }
 
 (** How a backslash reads inside quotes. *)
 type escapes = Backslash | Literal
@@ -69,9 +71,21 @@ let created statement =
     | _ :: _ | [] -> None
   in
   let rec named = function
-    | ({ kind = Word; _ } as token) :: rest
-      when List.mem (word token) [ "TABLE"; "VIEW"; "SEQUENCE"; "PROCEDURE"; "FUNCTION"; "EVENT"; "TRIGGER" ] ->
-        first rest
+    | ({ kind = Word; _ } as token) :: rest -> (
+        let made =
+          match word token with
+          | "TABLE" -> Some Table
+          | "VIEW" -> Some View
+          | "SEQUENCE" -> Some Sequence
+          | "PROCEDURE" -> Some Procedure
+          | "FUNCTION" -> Some Function
+          | "EVENT" -> Some Event
+          | "TRIGGER" -> Some Trigger
+          | _ -> None
+        in
+        match made with
+        | Some made -> Option.map (fun name -> { made; name }) (first rest)
+        | None -> named rest)
     | _ :: rest -> named rest
     | [] -> None
   in

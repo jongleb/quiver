@@ -691,8 +691,8 @@ into_tidb() {
   "$quiver" load --tls disabled -P "$port" -u root -d "$dir" -t 2 > "$dir.killed.log" 2>&1 &
   killed=$!
   sleep 4
-  kill -9 "$killed" 2> /dev/null
-  wait "$killed" 2> /dev/null
+  kill -9 "$killed" 2> /dev/null || true
+  wait "$killed" 2> /dev/null || true
   "$quiver" load --tls disabled -P "$port" -u root -d "$dir" -t 2 > "$dir.resumed.log" 2>&1 \
     || fail "resumed load: $(cat "$dir.resumed.log")"
   same "a load killed and resumed"

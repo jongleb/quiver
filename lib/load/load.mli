@@ -143,6 +143,20 @@ val taken_statement : Quiver_core.Filter.objects -> string -> string option @@ p
 (** The statement as a load taking these kinds runs it from an objects file: none when it makes
     or drops an object of another kind. *)
 
+(** A database's schema files of the objects a load takes. *)
+type object_files = {
+  stubs : File_path.Part.t list;  (** Each view's stand-in table, run on its own before the rest. *)
+  runs : File_path.Part.t list list;  (** Views, triggers, then routines and events, each in order. *)
+}
+
+val object_files :
+  Quiver_core.Filter.objects ->
+  entries:Base.Set.M(Base.String).t ->
+  Quiver_core.Ident.t ->
+  (object_files, [> `Load of error ]) result
+  @@ portable
+(** From the names of the dump's files. *)
+
 val run :
   Quiver_mysql.Provider.conn_config ->
   dir:File_path.t ->

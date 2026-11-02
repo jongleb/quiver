@@ -222,8 +222,48 @@ let taken_statement objects statement =
   Option.fold (object_kind statement) ~none:(Some statement) ~some:(fun kind ->
       Base.Option.some_if (List.mem kind (Quiver_core.Filter.kinds objects)) statement)
 
+let schema_file entries base =
+  Option.to_result
+    ~none:(`Load (Missing (File_path.Part.of_string (base ^ ".sql"))))
+    (List.find_map
+       (fun extension ->
+         Base.Option.some_if (Base.Set.mem entries (base ^ extension)) (File_path.Part.of_string (base ^ extension)))
+       [ ".sql"; ".sql.zst" ])
+
+type object_files = { stubs : File_path.Part.t list; runs : File_path.Part.t list list }
+
+let object_files objects ~entries database =
+  let kinds = Quiver_core.Filter.kinds objects in
+  let prefix = Quiver_sink.Layout.file_name database in
+  let views =
+    List.filter_map
+      (fun entry ->
+        Option.bind (Base.String.chop_prefix entry ~prefix:(prefix ^ ".")) (fun rest ->
+            Option.map
+              (fun view -> prefix ^ "." ^ view)
+              (List.find_map
+                 (fun suffix -> Base.String.chop_suffix rest ~suffix)
+                 [ "-schema-view.sql"; "-schema-view.sql.zst" ])))
+      (Base.Set.to_list entries)
+  in
+  let files suffix = Base.Result.all (List.map (fun view -> schema_file entries (view ^ suffix)) views) in
+  let%bind stubs = files "-schema" in
+  let%map views = files "-schema-view" in
+  let optional base = Result.to_list (schema_file entries base) in
+  let among some files = if List.exists (fun kind -> List.mem kind kinds) some then files else [] in
+  {
+    stubs = among [ Views ] stubs;
+    runs =
+      List.filter
+        (Fun.negate Base.List.is_empty)
+        [
+          among [ Views ] views;
+          among [ Triggers ] (optional (prefix ^ "-schema-triggers"));
+          among [ Routines; Events ] (optional (prefix ^ "-schema-post"));
+        ];
+  }
+
 let run config ~dir target { keys; after; binlog; collations } ~objects:wanted ~threads =
-  let kinds = Quiver_core.Filter.kinds wanted in
   let read file consume =
     match
       In_channel.open_bin
@@ -266,17 +306,6 @@ let run config ~dir target { keys; after; binlog; collations } ~objects:wanted ~
         Statements.iter text (fun statement ->
             let sql = rewrite statement in
             rejected file sql (run link sql)))
-  in
-  let schema_file base =
-    Option.to_result
-      ~none:(`Load (Missing (File_path.Part.of_string (base ^ ".sql"))))
-      (List.find_map
-         (fun extension ->
-           let file = File_path.Part.of_string (base ^ extension) in
-           Base.Option.some_if
-             (Sys.file_exists (File_path.to_string File_path.Operators.(dir /?. file)))
-             file)
-         [ ".sql"; ".sql.zst" ])
   in
   let table_base ({ database; table } : Quiver_core.Schema.Name.t) =
     Quiver_sink.Layout.file_name database
@@ -340,7 +369,7 @@ let run config ~dir target { keys; after; binlog; collations } ~objects:wanted ~
   in
   let%bind entries =
     match Sys.readdir (File_path.to_string dir) with
-    | entries -> Ok (List.sort String.compare (Array.to_list entries))
+    | entries -> Ok (Base.Set.of_array (module Base.String) entries)
     | exception Sys_error message ->
         Error (`Load (Unreadable { file = File_path.Part.of_string "."; message }))
   in
@@ -354,44 +383,18 @@ let run config ~dir target { keys; after; binlog; collations } ~objects:wanted ~
               (List.find_map
                  (fun suffix -> Base.String.chop_suffix rest ~suffix)
                  [ "-schema-sequence.sql"; "-schema-sequence.sql.zst" ])))
-      entries
+      (Base.Set.to_list entries)
   in
   let%bind objects =
     Base.Result.all
       (List.map
          (fun database ->
-           let prefix = Quiver_sink.Layout.file_name database in
-           let views =
-             List.filter_map
-               (fun entry ->
-                 Option.bind
-                   (Base.String.chop_prefix entry ~prefix:(prefix ^ "."))
-                   (fun rest ->
-                     Option.map
-                       (fun view -> prefix ^ "." ^ view)
-                       (List.find_map
-                          (fun suffix -> Base.String.chop_suffix rest ~suffix)
-                          [ "-schema-view.sql"; "-schema-view.sql.zst" ])))
-               entries
-           in
-           let files suffix =
-             Base.Result.all (List.map (fun view -> schema_file (view ^ suffix)) views)
-           in
-           let%bind stubs = files "-schema" in
-           let%map views = files "-schema-view" in
-           let optional base = Result.to_list (schema_file base) in
-           let among some files = if List.exists (fun kind -> List.mem kind kinds) some then files else [] in
-           ( List.map (fun stub -> Run { database; files = [ stub ] }) (among [ Views ] stubs),
-             List.filter_map
-               (function [] -> None | files -> Some (Run { database; files }))
-               [
-                 among [ Views ] views;
-                 among [ Triggers ] (optional (prefix ^ "-schema-triggers"));
-                 among [ Routines; Events ] (optional (prefix ^ "-schema-post"));
-               ] ))
+           let%map { stubs; runs } = object_files wanted ~entries database in
+           ( List.map (fun stub -> Run { database; files = [ stub ] }) stubs,
+             List.map (fun files -> Run { database; files }) runs ))
          databases)
   in
-  let object_files =
+  let taken_files =
     List.concat_map
       (fun (stubs, runs) ->
         List.concat_map (function Run { files; _ } -> files | Create _ | Fill _ | Update _ | Stop -> []) (stubs @ runs))
@@ -401,7 +404,7 @@ let run config ~dir target { keys; after; binlog; collations } ~objects:wanted ~
     match (target, databases) with
     | Same_names, _ | Into _, [] -> Ok None
     | Into into, database :: _ ->
-        let files = sequences database @ object_files in
+        let files = sequences database @ taken_files in
         let created = ref [] in
         let%bind () =
           Base.Result.all_unit
@@ -488,13 +491,13 @@ let run config ~dir target { keys; after; binlog; collations } ~objects:wanted ~
                              | Some Views | None -> Ok ()))
                    in
                    ())
-                 object_files)
+                 taken_files)
       in
       let%bind () =
         match resume with Fresh -> record control "(started)" | Resuming -> Ok ()
       in
       Base.List.fold_result databases ~init:() ~f:(fun () database ->
-          let%bind file = schema_file (Quiver_sink.Layout.file_name database ^ "-schema-create") in
+          let%bind file = schema_file entries (Quiver_sink.Layout.file_name database ^ "-schema-create") in
           let%bind _ =
             statements ddl control file (fun statement ->
                 create_database target database (Collations.rewrite collations statement))
@@ -537,7 +540,7 @@ let run config ~dir target { keys; after; binlog; collations } ~objects:wanted ~
   let create link (({ Quiver_core.Schema.Name.database; table } as name), parts)
       =
     let%bind () = Quiver_mysql.Link.run_statement link (Use (renamed target database)) in
-    let%bind file = schema_file (table_base name ^ "-schema") in
+    let%bind file = schema_file entries (table_base name ^ "-schema") in
     let deferred = ref [] in
     let%bind _ =
       retried ~cause (fun () ->

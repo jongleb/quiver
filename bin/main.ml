@@ -684,50 +684,75 @@ let () =
                  | Quiver_load.Load.cause ]]
                  error))
   in
-  let mirror (conn : Quiver_mysql.Provider.conn_config) database into tables workers stores =
+  let mirror (conn : Quiver_mysql.Provider.conn_config) other database into tables workers stores =
     let open Base.Result.Let_syntax in
-    let link =
+    let connect (conn : Quiver_mysql.Provider.conn_config) =
       Quiver_mysql.Link.connect ~local_data:Without_local_data conn.route ~timeouts:conn.timeouts ~user:conn.user
         ~password:conn.password
     in
+    let tidb link =
+      match Quiver_mysql.Link.server link with
+      | Mysql_8_0 _ | Mysql_8_4 _ | Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _ -> Error `Not_tidb
+      | Tidb_8_5 _ -> Ok link
+    in
     let mirrored =
-      let%bind link = link in
+      let%bind link = connect conn in
       let copied =
-        match Quiver_mysql.Link.server link with
-        | Mysql_8_0 _ | Mysql_8_4 _ | Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _ -> Error `Not_tidb
-        | Tidb_8_5 _ ->
-            let%bind tables =
-              match tables with
-              | _ :: _ -> Ok tables
-              | [] ->
-                  let%bind rows = Quiver_mysql.Link.run_query link (Base_tables database) in
-                  Base.Result.all
-                    (List.map
-                       (fun row ->
-                         match row with
-                         | [| Some table |] -> Quiver_core.Ident.of_string table
-                         | row -> Error (`Region (Quiver_tikv.Region.Malformed (Array.to_list row))))
-                       rows)
-            in
-            let%bind () = Quiver_mysql.Link.run_statement link (Create_database into) in
-            Base.List.fold_result tables ~init:() ~f:(fun () table ->
-                let started = Quiver_core.Stopwatch.start () in
-                let%bind copied =
-                  Quiver_tikv.Mirror.copy link ~source:{ database; table } ~target:{ database = into; table }
-                    { timeout = conn.timeouts.connecting; sizes = { scan = 1024; job = 16 lsl 20; batch = 16 lsl 10 }; workers; stores }
-                in
-                Format.printf "%s.%s: %d keys, %d bytes, checksum %016Lx as TiDB's, in %a@." (into :> string)
-                  (table :> string) copied.keys copied.bytes copied.checksum Core.Time_ns.Span.pp
-                  (Quiver_core.Stopwatch.elapsed started);
-                Ok ())
+        let%bind onto =
+          Option.fold other ~none:(Ok Quiver_tikv.Mirror.Same_cluster) ~some:(fun other ->
+              Result.map (fun onto -> Quiver_tikv.Mirror.Other_cluster onto) (connect other))
+        in
+        let copied =
+          let%bind link = tidb link in
+          let%bind target = match onto with Same_cluster -> Ok link | Other_cluster onto -> tidb onto in
+          let%bind tables =
+            match tables with
+            | _ :: _ -> Ok tables
+            | [] ->
+                let%bind rows = Quiver_mysql.Link.run_query link (Base_tables database) in
+                Base.Result.all
+                  (List.map
+                     (fun row ->
+                       match row with
+                       | [| Some table |] -> Quiver_core.Ident.of_string table
+                       | row -> Error (`Region (Quiver_tikv.Region.Malformed (Array.to_list row))))
+                     rows)
+          in
+          let%bind () = Quiver_mysql.Link.run_statement target (Create_database into) in
+          Base.List.fold_result tables ~init:() ~f:(fun () table ->
+              let started = Quiver_core.Stopwatch.start () in
+              let%bind copied =
+                Quiver_tikv.Mirror.copy link ~into:onto ~source:{ database; table } ~target:{ database = into; table }
+                  {
+                    timeout = conn.timeouts.connecting;
+                    sizes = { scan = 1024; job = 16 lsl 20; batch = 16 lsl 10 };
+                    workers;
+                    stores;
+                  }
+              in
+              Format.printf "%s.%s: %d keys, %d bytes, checksum %016Lx as TiDB's, in %a@." (into :> string)
+                (table :> string) copied.keys copied.bytes copied.checksum Core.Time_ns.Span.pp
+                (Quiver_core.Stopwatch.elapsed started);
+              Ok ())
+        in
+        let () = match onto with Same_cluster -> () | Other_cluster onto -> Quiver_mysql.Link.close onto in
+        copied
       in
       Quiver_mysql.Link.close link;
       copied
     in
     match mirrored with
     | Ok () -> 0
-    | Error `Not_tidb -> told "mirror copies within one TiDB cluster; the server is not TiDB"
+    | Error `Not_tidb -> told "mirror copies tables of TiDB clusters; a server is not TiDB"
     | Error error ->
+        let () =
+          match error with
+          | `Mirror (Quiver_tikv.Mirror.Ids_differ _) ->
+              Format.eprintf
+                "hint: the source's columns or indexes have other ids than a table made by its definition, as \
+                 after a column dropped or added in the middle; quiver copy copies it through SQL@."
+          | _ -> ()
+        in
         failed
           ([%sexp_of:
              [ `Mirror of Quiver_tikv.Mirror.error
@@ -735,6 +760,7 @@ let () =
              | `Wire of Quiver_mysql.Wire.error
              | `Ident of Quiver_core.Ident.error
              | `Read of Quiver_tikv.Read.error
+             | `Status of Quiver_tikv.Status.error
              | `Ingest of Quiver_tikv.Ingest.error
              | `Pd of Quiver_tikv.Pd.error
              | `Region of Quiver_tikv.Region.error
@@ -969,8 +995,15 @@ let () =
                   | `Set tls -> tls))
         $ socket $ host $ port $ tls)
     in
+    let placed =
+      Term.(
+        const (fun socket host port tls ->
+            match (socket, host, port, tls) with None, None, None, `Unset -> `Defaulted | _ -> `Given)
+        $ socket $ host $ port $ tls)
+    in
     Term.(
-      const (fun route user password timeouts zero_dates keyless_read ->
+      const (fun placed route user password timeouts zero_dates keyless_read ->
+          ( placed,
           Result.map
             (fun route ->
               {
@@ -982,11 +1015,18 @@ let () =
                 generated = Left_out;
                 keyless_read;
               })
-            route)
-      $ route $ user $ password $ timeouts $ zero_dates $ keyless_read)
+            route ))
+      $ placed $ route $ user $ password $ timeouts $ zero_dates $ keyless_read)
   in
   let server side =
-    Cmdliner.Term.(term_result (const (Result.map warned) $ conn side))
+    Cmdliner.Term.(term_result (const (fun (_, config) -> Result.map warned config) $ conn side))
+  in
+  let other_server =
+    Cmdliner.Term.(
+      term_result
+        (const (fun (placed, config) ->
+             match placed with `Defaulted -> Ok None | `Given -> Result.map (fun config -> Some (warned config)) config)
+        $ conn `Target))
   in
   let mask_key secret =
     match secret with
@@ -1585,10 +1625,13 @@ let () =
     Cmd.v
       (Cmd.info "mirror"
          ~doc:
-           "Copy tables of a TiDB cluster into another database of the same cluster as TiKV keeps them: \
-            rows and indexes read at one TSO and imported under the new tables' ids, with no SQL on \
-            the way, checked against TiDB's checksum")
-      Term.(const mirror $ server `Source $ database $ into $ tables $ workers $ stores)
+           "Copy tables of a TiDB cluster into another database, of the same cluster or of the one \
+            the $(b,--to-host) options name, as TiKV keeps them: rows and indexes read at one TSO \
+            and imported under the new tables' ids, with no SQL on the way, checked against TiDB's \
+            checksum. Into another cluster the two must agree on new collations, and the copy is \
+            made by the source's definition, its columns' and indexes' ids checked against the \
+            source's through TiDB's status port")
+      Term.(const mirror $ server `Source $ other_server $ database $ into $ tables $ workers $ stores)
   in
   let copy_cmd =
     let open Cmdliner in
@@ -1845,7 +1888,7 @@ let () =
                    counts once every target committed it.")
         $ Arg.value
             (outputdir ~doc:"Write files here instead of loading into a server.")
-        $ output $ conn `Target $ into $ writing $ ingest)
+        $ output $ Term.(const snd $ conn `Target) $ into $ writing $ ingest)
   in
   let mask_cmd =
     let open Cmdliner in

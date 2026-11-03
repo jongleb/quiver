@@ -9,6 +9,9 @@ type error =
   | Partitioned of Quiver_core.Schema.Name.t
   | Mismatch of { copied : copied; target : copied }
   | Allocator of string
+  | Collations_differ of { source : string; target : string }
+  | Definition of Quiver_core.Schema.Name.t
+  | Ids_differ of { source : Status.ids; target : Status.ids }
 [@@deriving sexp_of ~portable]
 
 type failure =
@@ -87,13 +90,20 @@ let cuts regions keys =
       match inside with [] -> None | _ :: _ -> Some (region, inside))
     regions
 
-let range ~address ~timeout ~version ~commit_ts ~sizes ~into { start; stop; target_start; target_stop } =
-  let%bind pd = Pd.connect ~timeout address in
+let range ~source ~target ~timeout ~version ~commit_ts ~sizes ~into { start; stop; target_start; target_stop } =
+  let%bind source_pd = Pd.connect ~timeout source in
+  let%bind pd =
+    Result.map_error
+      (fun error ->
+        Pd.close source_pd;
+        error)
+      (Pd.connect ~timeout target)
+  in
   let stores = Stores.create ~timeout and random = Random.State.make_self_init () in
   let copied =
-    let%bind source_regions = learned pd ~start ~stop:(Before stop) in
+    let%bind source_regions = learned source_pd ~start ~stop:(Before stop) in
     let%bind target_regions = learned pd ~start:target_start ~stop:(Before target_stop) in
-    let locate known ~start ~stop ~unheld (freshness : Read.freshness) key =
+    let locate pd known ~start ~stop ~unheld (freshness : Read.freshness) key =
       let%bind () =
         match freshness with
         | Known -> Ok ()
@@ -103,7 +113,7 @@ let range ~address ~timeout ~version ~commit_ts ~sizes ~into { start; stop; targ
     in
     let read : _ Read.store =
       {
-        locate = locate (ref source_regions) ~start ~stop ~unheld:(fun key -> `Read (Read.Unheld key));
+        locate = locate source_pd (ref source_regions) ~start ~stop ~unheld:(fun key -> `Read (Read.Unheld key));
         scan =
           (fun region ~start ~stop ->
             let%bind connection = Stores.connection stores region.address in
@@ -114,7 +124,7 @@ let range ~address ~timeout ~version ~commit_ts ~sizes ~into { start; stop; targ
     let write : _ Ingest.store =
       {
         locate =
-          locate (ref target_regions) ~start:target_start ~stop:target_stop ~unheld:(fun key -> `Ingest (Ingest.Unheld key));
+          locate pd (ref target_regions) ~start:target_start ~stop:target_stop ~unheld:(fun key -> `Ingest (Ingest.Unheld key));
         write =
           (fun region job ->
             let%bind connections =
@@ -155,27 +165,38 @@ let range ~address ~timeout ~version ~commit_ts ~sizes ~into { start; stop; targ
     Ok { keys = !keys; bytes = !bytes; checksum = !checksum }
   in
   Stores.close stores;
+  Pd.close source_pd;
   Pd.close pd;
   copied
 
-let table link ~source ~target ~version ~commit_ts { timeout; sizes; workers; stores = tuning } =
-  let%bind source_id = Region.table_id link source in
-  let%bind into = Region.table_id link target in
-  let%bind instances = Quiver_mysql.Link.run_query link Pd_instances in
-  let%bind address =
+let table ~from ~into:onto ~source ~target ~version ~commit_ts { timeout; sizes; workers; stores = tuning } =
+  let%bind source_id = Region.table_id from source in
+  let%bind into = Region.table_id onto target in
+  let pd_of link =
+    let%bind instances = Quiver_mysql.Link.run_query link Pd_instances in
     match instances with
     | [| Some address |] :: _ -> Ok address
     | row :: _ -> Error (`Region (Region.Malformed (Array.to_list row)))
     | [] -> Error (`Region (Region.Malformed []))
   in
+  let%bind source_address = pd_of from in
+  let%bind target_address = pd_of onto in
   let first, past = Codec.table source_id in
-  let%bind pd = Pd.connect ~timeout address in
+  let%bind source_pd = Pd.connect ~timeout source_address in
+  let%bind pd =
+    Result.map_error
+      (fun error ->
+        Pd.close source_pd;
+        error)
+      (Pd.connect ~timeout target_address)
+  in
   let%bind regions =
     Result.map_error
       (fun error ->
+        Pd.close source_pd;
         Pd.close pd;
         error)
-      (learned pd ~start:first ~stop:(Before past))
+      (learned source_pd ~start:first ~stop:(Before past))
   in
   let whole = ranges ~source:source_id ~into regions in
   let parts = Int.max 1 (((4 * workers) + List.length whole - 1) / Int.max 1 (List.length whole)) in
@@ -231,12 +252,15 @@ let table link ~source ~target ~version ~commit_ts { timeout; sizes; workers; st
   in
   let tikv = Pd.stores pd in
   Stores.close stores;
+  Pd.close source_pd;
   Pd.close pd;
   let%bind () = split in
   let work () =
     Quiver_core.Concurrent.spread ~workers
       (Iarray.of_list divided)
-      (fun range_of_region -> (range ~address ~timeout ~version ~commit_ts ~sizes ~into range_of_region : (copied, failure) result))
+      (fun range_of_region ->
+        (range ~source:source_address ~target:target_address ~timeout ~version ~commit_ts ~sizes ~into range_of_region
+          : (copied, failure) result))
   in
   let%bind copied =
     match tuning with
@@ -263,26 +287,43 @@ let table link ~source ~target ~version ~commit_ts { timeout; sizes; workers; st
   in
   match total with Ok total -> Ok total | Error (#failure as error) -> Error error
 
-type 'e session = {
+type 'link cluster = Same_cluster | Other_cluster of 'link
+
+type 'e side = {
   query : Quiver_mysql.Query.t -> (string option array list, 'e) result;
   execute : Quiver_mysql.Statement.t -> (unit, 'e) result;
   server : Quiver_mysql.Server.t;
+  ids : Quiver_core.Schema.Name.t -> (Status.ids, 'e) result;
+}
+
+type 'e session = {
+  source_side : 'e side;
+  target_side : 'e side;
+  cluster : unit cluster;
   name : unit -> string;
   keys : Quiver_core.Schema.Name.t -> version:int64 -> commit_ts:int64 -> (copied, 'e) result;
 }
 
 let through session ~source ~target =
+  let { source_side; target_side; _ } = session in
   let malformed row = Error (`Region (Region.Malformed (Array.to_list row))) in
-  let%bind partitions = session.query (Partitioned source) in
-  let%bind () =
-    match partitions with
-    | [ [| Some "0" |] ] -> Ok ()
-    | [ [| Some _ |] ] -> Error (`Mirror (Partitioned source))
-    | row :: _ -> malformed row
-    | [] -> malformed [||]
+  let one side query =
+    let%bind rows = side.query query in
+    match rows with [ [| Some value |] ] -> Ok value | row :: _ -> malformed row | [] -> malformed [||]
   in
-  let tso () =
-    let%bind rows = session.query (Binlog_status session.server) in
+  let%bind partitions = one source_side (Partitioned source) in
+  let%bind () = match partitions with "0" -> Ok () | _ -> Error (`Mirror (Partitioned source)) in
+  let%bind () =
+    match session.cluster with
+    | Same_cluster -> Ok ()
+    | Other_cluster () ->
+        let%bind here = one source_side New_collations in
+        let%bind there = one target_side New_collations in
+        if String.equal (String.lowercase_ascii here) (String.lowercase_ascii there) then Ok ()
+        else Error (`Mirror (Collations_differ { source = here; target = there }))
+  in
+  let tso side =
+    let%bind rows = side.query (Binlog_status side.server) in
     match rows with
     | row :: _ when Array.length row > 1 ->
         Option.fold ~none:(malformed row) ~some:Result.ok (Option.bind row.(1) Int64.of_string_opt)
@@ -295,12 +336,33 @@ let through session ~source ~target =
       (fun table : Quiver_core.Schema.Name.t -> { target with table })
       (Result.map_error (fun _ -> `Region (Region.Malformed [ Some name ])) (Quiver_core.Ident.of_string name))
   in
-  let%bind version = tso () in
-  let%bind () = session.execute (Create_like { table = service; like = source }) in
+  let%bind version = tso source_side in
+  let%bind () =
+    match session.cluster with
+    | Same_cluster -> target_side.execute (Create_like { table = service; like = source })
+    | Other_cluster () -> (
+        let%bind rows = source_side.query (Show_create (Table source)) in
+        match rows with
+        | [ [| _; Some definition |] ] ->
+            Option.fold
+              ~none:(Error (`Mirror (Definition source)))
+              ~some:(fun body -> target_side.execute (Create_table { table = service; body }))
+              (Base.String.chop_prefix definition ~prefix:("CREATE TABLE " ^ Quiver_core.Ident.backquoted source.table))
+        | row :: _ -> malformed row
+        | [] -> malformed [||])
+  in
   let copied =
-    let%bind commit_ts = tso () in
+    let%bind () =
+      match session.cluster with
+      | Same_cluster -> Ok ()
+      | Other_cluster () ->
+          let%bind here = source_side.ids source in
+          let%bind there = target_side.ids service in
+          if here = there then Ok () else Error (`Mirror (Ids_differ { source = here; target = there }))
+    in
+    let%bind commit_ts = tso target_side in
     let%bind copied = session.keys service ~version ~commit_ts in
-    let%bind sums = session.query (Checksum service) in
+    let%bind sums = target_side.query (Checksum service) in
     let%bind () =
       match sums with
       | [ ([| _; _; Some checksum; Some keys; Some bytes |] as row) ] -> (
@@ -312,7 +374,7 @@ let through session ~source ~target =
       | row :: _ -> malformed row
       | [] -> malformed [||]
     in
-    let%bind allocators = session.query (Next_row_ids source) in
+    let%bind allocators = source_side.query (Next_row_ids source) in
     let%bind rebased =
       Base.Result.all
         (List.filter_map
@@ -335,24 +397,37 @@ let through session ~source ~target =
               (fun most (kind, next) -> if kind = allocator then Some (Option.fold ~none:next ~some:(Int64.max next) most) else most)
               None rebased
           in
-          Option.fold ~none:(Ok ())
-            ~some:(fun next -> session.execute (Rebase { table = service; allocator; next }))
-            next)
+          Option.fold ~none:(Ok ()) ~some:(fun next -> target_side.execute (Rebase { table = service; allocator; next })) next)
     in
-    let%bind () = session.execute (Rename_table { from = service; into = target }) in
+    let%bind () = target_side.execute (Rename_table { from = service; into = target }) in
     Ok copied
   in
-  let () = match copied with Ok _ -> () | Error _ -> ignore (session.execute (Drop_table service)) in
+  let () = match copied with Ok _ -> () | Error _ -> ignore (target_side.execute (Drop_table service)) in
   copied
 
-let copy link ~source ~target settings =
+let copy link ~into ~source ~target settings =
   let random = Random.State.make_self_init () in
-  through
+  let side link =
     {
       query = Quiver_mysql.Link.run_query link;
       execute = Quiver_mysql.Link.run_statement link;
       server = Quiver_mysql.Link.server link;
+      ids =
+        (fun table ->
+          let%bind rows = Quiver_mysql.Link.run_query link Tidb_status in
+          match rows with
+          | [| Some address |] :: _ -> Status.table ~timeout:settings.timeout address table
+          | row :: _ -> Error (`Region (Region.Malformed (Array.to_list row)))
+          | [] -> Error (`Region (Region.Malformed [])));
+    }
+  in
+  let onto, cluster = match into with Same_cluster -> (link, Same_cluster) | Other_cluster onto -> (onto, Other_cluster ()) in
+  through
+    {
+      source_side = side link;
+      target_side = side onto;
+      cluster;
       name = (fun () -> "q_" ^ String.init 16 (fun _ -> "0123456789abcdef".[Random.State.int random 16]));
-      keys = (fun service ~version ~commit_ts -> table link ~source ~target:service ~version ~commit_ts settings);
+      keys = (fun service ~version ~commit_ts -> table ~from:link ~into:onto ~source ~target:service ~version ~commit_ts settings);
     }
     ~source ~target

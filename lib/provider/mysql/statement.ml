@@ -27,6 +27,7 @@ type t =
   | Drop_table of Quiver_core.Schema.Name.t
   | Create_database of Quiver_core.Ident.t
   | Create_like of { table : Quiver_core.Schema.Name.t; like : Quiver_core.Schema.Name.t }
+  | Create_table of { table : Quiver_core.Schema.Name.t; body : string }
   | Rebase of { table : Quiver_core.Schema.Name.t; allocator : allocator; next : int64 }
   | Drop_indexes of { table : Quiver_core.Schema.Name.t; indexes : Quiver_core.Ident.t list }
   | Scatter_regions
@@ -94,6 +95,7 @@ let sql = function
   | Drop_table name -> [%string "DROP TABLE IF EXISTS %{Query.qualified name}"]
   | Create_database name -> [%string "CREATE DATABASE IF NOT EXISTS %{Quiver_core.Ident.backquoted name}"]
   | Create_like { table; like } -> [%string "CREATE TABLE %{Query.qualified table} LIKE %{Query.qualified like}"]
+  | Create_table { table; body } -> [%string "CREATE TABLE %{Query.qualified table}%{body}"]
   | Rebase { table; allocator; next } ->
       let option = match allocator with Auto_increment -> "AUTO_INCREMENT" | Auto_random -> "AUTO_RANDOM_BASE" in
       [%string "ALTER TABLE %{Query.qualified table} %{option} = %{Int64.to_string next}"]

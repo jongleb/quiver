@@ -30,6 +30,12 @@ type error =
   | Partitioned of Quiver_core.Schema.Name.t  (** Its partitions would get new ids in the copy. *)
   | Mismatch of { copied : copied; target : copied }  (** TiDB's checksum of the target differs. *)
   | Allocator of string  (** An id allocator of a kind this side does not know. *)
+  | Collations_differ of { source : string; target : string }
+      (** The clusters' [new_collation_enabled]: an index's keys would be encoded otherwise. *)
+  | Definition of Quiver_core.Schema.Name.t  (** Its [SHOW CREATE TABLE] does not start with its name. *)
+  | Ids_differ of { source : Status.ids; target : Status.ids }
+      (** The ids of the columns and indexes of the source and its copy in the other cluster, as
+          after the source's [ALTER]s: its keys and values would not read as the copy's. *)
 [@@deriving sexp_of ~portable]
 
 (** Keys of the source from [start] up to [stop], and the same keys in the target. *)
@@ -50,7 +56,8 @@ val cuts : Region.t list -> string list -> (Region.t * string list) list
 (** Each region with the keys strictly inside it, the keys sorted: where it is to be split. *)
 
 val table :
-  Quiver_mysql.Link.t ->
+  from:Quiver_mysql.Link.t ->
+  into:Quiver_mysql.Link.t ->
   source:Quiver_core.Schema.Name.t ->
   target:Quiver_core.Schema.Name.t ->
   version:int64 ->
@@ -70,14 +77,26 @@ val table :
     | `Hpack of Hpack.error ] )
   result
 (** [source]'s keys as of [version] into [target] at [commit_ts], which must be later than any
-    version [target] holds; PD found through the link to TiDB, the regions of both learned from it,
+    version [target] holds; the TiDB of each, [from] and [into], the same or of two clusters, names
+    its cluster's PD, which the regions of its table are learned from;
     each region of [source], cut at keys evenly apart, copied by one of the workers; [target] split
     at the same keys and its regions scattered first. *)
 
-type 'e session = {
+(** Where the copy goes. *)
+type 'link cluster = Same_cluster | Other_cluster of 'link  (** Another cluster, through its TiDB. *)
+
+type 'e side = {
   query : Quiver_mysql.Query.t -> (string option array list, 'e) result;
   execute : Quiver_mysql.Statement.t -> (unit, 'e) result;
   server : Quiver_mysql.Server.t;
+  ids : Quiver_core.Schema.Name.t -> (Status.ids, 'e) result;  (** What the cluster's TiDB says of the table. *)
+}
+(** How a copy reaches one cluster's TiDB. *)
+
+type 'e session = {
+  source_side : 'e side;
+  target_side : 'e side;
+  cluster : unit cluster;
   name : unit -> string;  (** A table name no table has, for the copy while it is made. *)
   keys : Quiver_core.Schema.Name.t -> version:int64 -> commit_ts:int64 -> (copied, 'e) result;
       (** The source's keys as of [version] into this table at [commit_ts]. *)
@@ -93,11 +112,13 @@ val through :
 
 val copy :
   Quiver_mysql.Link.t ->
+  into:Quiver_mysql.Link.t cluster ->
   source:Quiver_core.Schema.Name.t ->
   target:Quiver_core.Schema.Name.t ->
   settings ->
   ( copied,
     [> `Mirror of error
+    | `Status of Status.error
     | `Read of Read.error
     | `Pd of Pd.error
     | `Ingest of Ingest.error
@@ -110,6 +131,9 @@ val copy :
     | `Http2 of Http2.error
     | `Hpack of Hpack.error ] )
   result
-(** [source] as of now into a new table [target]: made [LIKE] it under a name of its own, its keys
-    copied by {!table} at a later version, checked against TiDB's checksum, its id allocators moved
+@@ nonportable
+(** [source] as of now into a new table [target], in its cluster or another: made under a name of
+    its own ([LIKE] it, or by its definition in the other cluster, where the two clusters must agree
+    on collations and the copy's columns and indexes on their ids), its keys copied by {!table} at a
+    later version of the target's cluster, checked against TiDB's checksum, its id allocators moved
     past the source's, renamed; dropped on any failure. *)

@@ -65,6 +65,8 @@ type t =
       (** TiDB: each region's peers, their stores, whether each leads (1 or 0) and the store's
           address. *)
   | Pd_instances  (** TiDB: [host:port] of each PD server. *)
+  | Tidb_status  (** TiDB: [host:port] of each TiDB server's HTTP status service. *)
+  | New_collations  (** TiDB: whether the cluster was made with the new collation framework, as [True] or [False]. *)
   | Next_row_ids of Quiver_core.Schema.Name.t
       (** TiDB: each id allocator of the table, the next id it hands out and its kind. *)
   | Checksum of Quiver_core.Schema.Name.t

@@ -2,75 +2,129 @@ open Sexplib0.Sexp_conv
 open Quiver_tikv
 
 (* Where the model TiDB refuses. *)
-type failing = Never | At_create | At_keys | At_checksum | At_rebase | At_rename [@@deriving sexp_of]
+type failing = Never | At_create | At_ids | At_keys | At_checksum | At_rebase | At_rename [@@deriving sexp_of]
 
 (* What TiDB's checksum of the copy says against what was copied. *)
 type sums = Same | Fewer_keys | Other_crc [@@deriving sexp_of]
 
-type case = { partitions : int; allocators : (string * int64) list; sums : sums; failing : failing } [@@deriving sexp_of]
+(* Whether the other cluster agrees with the source. *)
+type agreement = Agree | Differ [@@deriving sexp_of]
+
+(* Where the copy goes, and what the other cluster says. *)
+type other = { collations : agreement; ids : agreement; definition : agreement } [@@deriving sexp_of]
+
+type place = Here | There of other [@@deriving sexp_of]
+
+type case = { place : place; partitions : int; allocators : (string * int64) list; sums : sums; failing : failing }
+[@@deriving sexp_of]
 
 let gen =
   QCheck2.Gen.(
-    let* partitions = oneof_weighted [ (5, return 0); (1, int_range 1 4) ]
+    let agreement = oneof_weighted [ (4, return Agree); (1, return Differ) ] in
+    let* place =
+      oneof
+        [
+          return Here;
+          map3 (fun collations ids definition -> There { collations; ids; definition }) agreement agreement agreement;
+        ]
+    and* partitions = oneof_weighted [ (5, return 0); (1, int_range 1 4) ]
     and* allocators =
       list_size (int_range 0 4)
         (pair
            (oneof_weighted [ (3, return "_TIDB_ROWID"); (3, return "AUTO_INCREMENT"); (2, return "AUTO_RANDOM"); (1, return "SEQUENCE"); (1, return "WEIRD") ])
            (map Int64.of_int (int_range 1 1_000_000)))
     and* sums = oneof_weighted [ (4, return Same); (1, return Fewer_keys); (1, return Other_crc) ]
-    and* failing = oneof_weighted [ (5, return Never); (1, return At_create); (1, return At_keys); (1, return At_checksum); (1, return At_rebase); (1, return At_rename) ] in
-    return { partitions; allocators; sums; failing })
+    and* failing =
+      oneof_weighted
+        [ (5, return Never); (1, return At_create); (1, return At_ids); (1, return At_keys); (1, return At_checksum); (1, return At_rebase); (1, return At_rename) ]
+    in
+    return { place; partitions; allocators; sums; failing })
 
 let name database table : Quiver_core.Schema.Name.t = { database = Support.ident database; table = Support.ident table }
-let source = name "d" "src" and target = name "d" "dst" and service = name "d" "q_model"
+let source = name "d" "src" and target = name "e" "dst" and service = name "e" "q_model"
 let copied : Mirror.copied = { keys = 10; bytes = 100; checksum = 0x8000_0000_0000_0001L }
+let ids columns : Status.ids = { columns; indexes = [ ("ka", 1) ]; handle = Integer_key }
+
+(* Statements, each with the cluster it ran in. *)
+type ran = Source_ran of Quiver_mysql.Statement.t | Target_ran of Quiver_mysql.Statement.t
 
 let run case =
-  let executed = ref [] and keyed = ref [] and clock = ref 100L in
+  let executed = ref [] and keyed = ref [] and source_clock = ref 100L and target_clock = ref 5000L in
   let refused = Error (`Region (Region.Malformed [ Some "refused" ])) in
-  let session : _ Mirror.session =
+  let cell text = Some text in
+  let there = match case.place with Here -> None | There there -> Some there in
+  let side ~here ~clock ~collation ~columns ~allocators ~tables : _ Mirror.side =
     {
       query =
         (fun query ->
-          let cell text = Some text in
           match query with
           | Partitioned _ -> Ok [ [| cell (Int.to_string case.partitions) |] ]
+          | New_collations -> Ok [ [| cell collation |] ]
           | Binlog_status _ ->
               clock := Int64.add !clock 7L;
               Ok [ [| cell "tidb-binlog"; cell (Int64.to_string !clock) |] ]
+          | Show_create (Table _) ->
+              let definition = match there with Some { definition = Differ; _ } -> "CREATE VIEW `src` AS SELECT 1" | Some _ | None -> "CREATE TABLE `src` (\n  `a` int\n)" in
+              Ok [ [| cell "src"; cell definition |] ]
+          | Checksum table when not (List.mem table tables) -> refused
           | Checksum _ when case.failing = At_checksum -> refused
           | Checksum _ ->
               let keys = match case.sums with Fewer_keys -> copied.keys - 1 | Same | Other_crc -> copied.keys
               and crc = match case.sums with Other_crc -> 1L | Same | Fewer_keys -> copied.checksum in
-              Ok [ [| cell "d"; cell "q_model"; cell (Printf.sprintf "%Lu" crc); cell (Int.to_string keys); cell (Int.to_string copied.bytes) |] ]
-          | Next_row_ids _ -> Ok (List.map (fun (kind, next) -> [| cell "d"; cell "src"; cell "c"; cell (Int64.to_string next); cell kind |]) case.allocators)
+              Ok [ [| cell "e"; cell "q_model"; cell (Printf.sprintf "%Lu" crc); cell (Int.to_string keys); cell (Int.to_string copied.bytes) |] ]
+          | Next_row_ids _ -> Ok (List.map (fun (kind, next) -> [| cell "d"; cell "src"; cell "c"; cell (Int64.to_string next); cell kind |]) allocators)
           | _ -> refused);
       execute =
         (fun statement ->
-          executed := statement :: !executed;
+          executed := here statement :: !executed;
           match (statement, case.failing) with
-          | Create_like _, At_create | Rebase _, At_rebase | Rename_table _, At_rename -> refused
+          | (Create_like _ | Create_table _), At_create | Rebase _, At_rebase | Rename_table _, At_rename -> refused
           | _ -> Ok ());
       server = Result.get_ok (Quiver_mysql.Server.of_version_string "8.0.11-TiDB-v8.5.8");
+      ids = (fun _ -> match case.failing with At_ids -> refused | _ -> Ok (ids columns));
+    }
+  in
+  let source_side = side ~here:(fun statement -> Source_ran statement) ~clock:source_clock ~collation:"True" ~columns:[ ("a", 1) ] ~allocators:case.allocators
+      ~tables:(match there with None -> [ source; service ] | Some _ -> [ source ]) in
+  let target_side, cluster =
+    match there with
+    | None -> (source_side, Mirror.Same_cluster)
+    | Some there ->
+        let collation = match there.collations with Agree -> "TRUE" | Differ -> "False"
+        and columns = match there.ids with Agree -> [ ("a", 1) ] | Differ -> [ ("a", 2) ] in
+        (side ~here:(fun statement -> Target_ran statement) ~clock:target_clock ~collation ~columns ~allocators:[] ~tables:[ service ], Other_cluster ())
+  in
+  let session : _ Mirror.session =
+    {
+      source_side;
+      target_side;
+      cluster;
       name = (fun () -> "q_model");
       keys =
         (fun table ~version ~commit_ts ->
           keyed := (table, version, commit_ts) :: !keyed;
-          match case.failing with At_keys -> refused | Never | At_create | At_checksum | At_rebase | At_rename -> Ok copied);
+          match case.failing with At_keys -> refused | _ -> Ok copied);
     }
   in
   let result = Mirror.through session ~source ~target in
   (result, List.rev !executed, List.rev !keyed)
 
-let show statements = String.concat "; " (List.map Quiver_mysql.Statement.sql statements)
+let show statements =
+  String.concat "; "
+    (List.map
+       (function
+         | Source_ran statement -> "source: " ^ Quiver_mysql.Statement.sql statement
+         | Target_ran statement -> "target: " ^ Quiver_mysql.Statement.sql statement)
+       statements)
 
 let copies =
   QCheck2.Test.make ~count:3000
-    ~name:"a copy is made, checked, moved past the source's ids and renamed, or the half-made table is dropped"
+    ~name:"a copy is made in its cluster, checked, moved past the source's ids and renamed, or the half-made table is dropped"
     ~print:(fun case -> Base.Sexp.to_string_hum (sexp_of_case case))
     gen
     (fun case ->
       let result, executed, keyed = run case in
+      let ran statement = match case.place with Here -> Source_ran statement | There _ -> Target_ran statement in
       let unknown = List.exists (fun (kind, _) -> kind = "WEIRD") case.allocators in
       let most kinds =
         List.fold_left (fun most (kind, next) -> if List.mem kind kinds then Some (Option.fold ~none:next ~some:(Int64.max next) most) else most) None case.allocators
@@ -82,16 +136,31 @@ let copies =
             Option.map (fun next -> Quiver_mysql.Statement.Rebase { table = service; allocator = Auto_random; next }) (most [ "AUTO_RANDOM" ]);
           ]
       in
-      let create = Quiver_mysql.Statement.Create_like { table = service; like = source } in
-      let failing = match (case.failing, rebases) with At_rebase, [] -> Never | failing, _ -> failing in
-      let ordered = match keyed with [ (table, version, commit_ts) ] -> table = service && Int64.compare version commit_ts < 0 | _ -> false in
-      match result with
+      let create : Quiver_mysql.Statement.t =
+        match case.place with Here -> Create_like { table = service; like = source } | There _ -> Create_table { table = service; body = " (\n  `a` int\n)" }
+      in
+      let refused = Error (`Region (Region.Malformed [ Some "refused" ])) in
+      let failing = match (case.failing, rebases, case.place) with At_rebase, [] , _ | At_ids, _, Here -> Never | failing, _, _ -> failing in
+      let ordered =
+        match (keyed, case.place) with
+        | [ (table, version, commit_ts) ], Here -> table = service && Int64.compare version commit_ts < 0
+        | [ (table, version, commit_ts) ], There _ -> table = service && Int64.compare version 1000L < 0 && Int64.compare commit_ts 5000L > 0
+        | _ -> false
+      in
+      let dropped = match List.rev executed with last :: _ -> last = ran (Drop_table service) | [] -> false in
+      match (result, case.place) with
       | _ when case.partitions > 0 -> result = Error (`Mirror (Mirror.Partitioned source)) && executed = [] && keyed = []
-      | _ when failing = At_create -> Result.is_error result && executed = [ create ] && keyed = []
-      | Ok got ->
+      | _, There { collations = Differ; _ } ->
+          result = Error (`Mirror (Mirror.Collations_differ { source = "True"; target = "False" })) && executed = [] && keyed = []
+      | _, There { definition = Differ; _ } -> result = Error (`Mirror (Mirror.Definition source)) && executed = [] && keyed = []
+      | _ when failing = At_create -> result = refused && executed = [ ran create ] && keyed = []
+      | _, There { ids = Differ; _ } when failing <> At_ids ->
+          result = Error (`Mirror (Mirror.Ids_differ { source = ids [ ("a", 1) ]; target = ids [ ("a", 2) ] })) && dropped && keyed = []
+      | _ when failing = At_ids -> result = refused && dropped && keyed = []
+      | Ok got, _ ->
           failing = Never && case.sums = Same && (not unknown) && got = copied && ordered
-          && show executed = show ((create :: rebases) @ [ Rename_table { from = service; into = target } ])
-      | Error error ->
+          && show executed = show (List.map ran ((create :: rebases) @ [ Rename_table { from = service; into = target } ]))
+      | Error error, _ ->
           let expected_error =
             match (failing, case.sums) with
             | At_keys, _ | At_checksum, _ -> error = `Region (Region.Malformed [ Some "refused" ])
@@ -102,10 +171,10 @@ let copies =
                 error = `Mirror (Mirror.Mismatch { copied; target })
             | _ when unknown -> error = `Mirror (Mirror.Allocator "WEIRD")
             | (At_rebase | At_rename), Same -> error = `Region (Region.Malformed [ Some "refused" ])
-            | (Never | At_create), Same -> false
+            | (Never | At_create | At_ids), Same -> false
           in
-          expected_error && ordered
-          && (match List.rev executed with Drop_table dropped :: _ -> dropped = service | _ -> false)
-          && not (List.exists (function Quiver_mysql.Statement.Rename_table _ -> failing <> At_rename | _ -> false) executed))
+          expected_error && ordered && dropped
+          && List.for_all (fun ran -> match (ran, case.place) with Source_ran _, There _ -> false | _ -> true) executed
+          && not (List.exists (function Source_ran (Rename_table _) | Target_ran (Rename_table _) -> failing <> At_rename | _ -> false) executed))
 
 let tests = [ QCheck_alcotest.to_alcotest copies ]

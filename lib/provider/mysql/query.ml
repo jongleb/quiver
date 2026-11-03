@@ -46,6 +46,8 @@ type t =
   | Table_regions of int64
   | Region_peers of int64 * int64 list
   | Pd_instances
+  | Tidb_status
+  | New_collations
   | Next_row_ids of Quiver_core.Schema.Name.t
   | Checksum of Quiver_core.Schema.Name.t
   | Partitioned of Quiver_core.Schema.Name.t
@@ -317,6 +319,8 @@ let sql = function
          information_schema.TIKV_REGION_PEERS p JOIN information_schema.TIKV_STORE_STATUS s ON s.STORE_ID = \
          p.STORE_ID WHERE p.REGION_ID IN (%{ids})"]
   | Pd_instances -> "SELECT INSTANCE FROM information_schema.CLUSTER_INFO WHERE TYPE = 'pd'"
+  | Tidb_status -> "SELECT STATUS_ADDRESS FROM information_schema.CLUSTER_INFO WHERE TYPE = 'tidb'"
+  | New_collations -> "SELECT VARIABLE_VALUE FROM mysql.tidb WHERE VARIABLE_NAME = 'new_collation_enabled'"
   | Next_row_ids name -> [%string "SHOW TABLE %{qualified name} NEXT_ROW_ID"]
   | Checksum name -> [%string "ADMIN CHECKSUM TABLE %{qualified name}"]
   | Base_tables database ->

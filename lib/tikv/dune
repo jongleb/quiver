@@ -1,7 +1,7 @@
 (library
  (name quiver_tikv)
  (public_name quiver.tikv)
- (libraries stdlib_stable base sexplib0 hex_encode unix quiver.core quiver.mysql)
+ (libraries stdlib_stable base sexplib0 hex_encode unix yojson quiver.core quiver.mysql)
  (foreign_stubs
   (language c)
   (names crc64_stubs)

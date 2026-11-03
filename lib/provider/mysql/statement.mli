@@ -44,6 +44,8 @@ type t =
   | Drop_table of Quiver_core.Schema.Name.t  (** If it exists. *)
   | Create_database of Quiver_core.Ident.t  (** If it does not exist, in the server's defaults. *)
   | Create_like of { table : Quiver_core.Schema.Name.t; like : Quiver_core.Schema.Name.t }
+  | Create_table of { table : Quiver_core.Schema.Name.t; body : string }
+      (** The table under this name, the rest of its definition as [SHOW CREATE TABLE] gives it after the name. *)
   | Rebase of { table : Quiver_core.Schema.Name.t; allocator : allocator; next : int64 }
       (** TiDB: the allocator hands out ids from [next] on. *)
   | Drop_indexes of { table : Quiver_core.Schema.Name.t; indexes : Quiver_core.Ident.t list }

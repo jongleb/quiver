@@ -835,13 +835,25 @@ module Make (S : Quiver_core.Sink_intf.S) = struct
         | Database { name; ddl; sequences } ->
             let%bind () = answered (fun () -> S.database sink name ~ddl ~sequences) in
             next stage channel
-        | Table { table; ddl; parts; order } ->
-            let%bind () =
-              answered (fun () ->
-                  Hashtbl.replace tables table.Quiver_core.Schema.Table.name table;
-                  S.table sink table ~ddl ~parts ~order)
+        | Table { table; ddl; parts; order; splits } -> (
+            let checked =
+              match (table.Quiver_core.Schema.Table.key, splits) with
+              | _, [] -> Ok []
+              | Primary key, _ :: _ ->
+                  Result.map_error ignore
+                    (Base.Result.all
+                       (List.map (fun (first, rest) -> Quiver_core.Key.make key (first :: rest)) splits))
+              | (Unique _ | Indexed _ | Row_id _ | No_key), _ :: _ -> Error ()
             in
-            next stage channel
+            match checked with
+            | Error () -> out_of_place "splits that are not of the table's primary key"
+            | Ok splits ->
+                let%bind () =
+                  answered (fun () ->
+                      Hashtbl.replace tables table.name table;
+                      S.table sink table ~ddl ~parts ~order ~splits)
+                in
+                next stage channel)
         | Grown { table = name } -> (
             match Hashtbl.find_opt tables name with
             | None -> out_of_place "a part of a table never announced"

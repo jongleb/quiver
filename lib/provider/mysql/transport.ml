@@ -104,14 +104,15 @@ let read t buffer ~off ~len =
       | Lost -> fail t (Tls lost)
       | Failed reason -> fail t (Tls reason))
 
-let write t text =
+let write t ?(pos = 0) ?len text =
+  let stop = Option.fold ~none:(String.length text) ~some:(fun len -> pos + len) len in
   let rec go off =
-    if off = String.length text then Ok ()
+    if off = stop then Ok ()
     else
       match t.channel with
       | Plain -> (
           match
-            Unix.write_substring t.fd text off (String.length text - off)
+            Unix.write_substring t.fd text off (stop - off)
           with
           | count -> go (off + count)
           | exception Unix.Unix_error ((EAGAIN | EWOULDBLOCK), _, _) ->
@@ -122,14 +123,14 @@ let write t text =
       | Secure session -> (
           match
             Quiver_openssl.Tls.write session text ~pos:off
-              ~len:(String.length text - off)
+              ~len:(stop - off)
           with
           | Done count -> go (off + count)
           | Want_write | Want_read -> Error (`Transport (Timed_out t.timeout))
           | Closed | Lost -> Error (`Transport (Tls lost))
           | Failed reason -> Error (`Transport (Tls reason)))
   in
-  go 0
+  go pos
 
 let start_tls t ~host authority =
   let check =

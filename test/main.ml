@@ -47,4 +47,12 @@ let () =
       ("spent", Test_spent.tests);
       ("schedule", Test_schedule.tests);
       ("innodb", Test_innodb.tests);
+      ("hpack", Test_hpack.tests);
+      ("proto", Test_proto.tests);
+      ("http2", Test_http2.tests);
+      ("kv", Test_kv.tests);
+      ("tikv read", Test_tikv_read.tests);
+      ("tikv ingest", Test_ingest.tests);
+      ("tikv pd", Test_pd.tests);
+      ("tikv mirror", Test_mirror.tests);
     ]

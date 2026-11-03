@@ -172,6 +172,17 @@ module Make (P : Provider_intf.S) (S : Sink_intf.S) = struct
             index)
           chunk_tables_planned
       in
+      let starts =
+        let starts = Array.make (Iarray.length tables) [] in
+        Array.iteri
+          (fun position (chunk : Chunk.t) ->
+            let table = chunk_tables_planned.(position) in
+            match chunk with
+            | Range { range = Between (lower, _) | From lower; _ } -> starts.(table) <- lower :: starts.(table)
+            | Range { range = Below _; _ } | Whole _ -> ())
+          chunks;
+        Iarray.of_array (Array.map List.rev starts)
+      in
       let table_databases =
         Iarray.map
           (fun { Schema.Table.name = { database; _ }; _ } ->
@@ -643,7 +654,8 @@ module Make (P : Provider_intf.S) (S : Sink_intf.S) = struct
               with
               | Withheld -> Await.Await.Ivar.fill_if_empty announcement Withheld
               | Announced ->
-                  let mask = Iarray.get masks table in
+                  let mask = Iarray.get masks table
+                  and starts = Iarray.get starts table in
                   let table = Iarray.get tables table
                   and parts = Iarray.get parts table in
                   let order : Schema.order =
@@ -658,9 +670,14 @@ module Make (P : Provider_intf.S) (S : Sink_intf.S) = struct
                         else Key_order
                     | Indexed _ | Row_id _ | No_key -> Key_order
                   in
+                  let splits =
+                    match (table.key, order) with
+                    | Primary _, Key_order -> starts
+                    | Primary _, Masked_key | (Unique _ | Indexed _ | Row_id _ | No_key), (Key_order | Masked_key) -> []
+                  in
                   announce announcement
                     (let%bind ddl = ddl (Table table.name) in
-                     S.table sink table ~ddl ~parts ~order))
+                     S.table sink table ~ddl ~parts ~order ~splits))
           | Chunk position -> (
               match
                 announced

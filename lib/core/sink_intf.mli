@@ -41,8 +41,12 @@ module type S = sig
     ddl:string ->
     parts:int ->
     order:Schema.order ->
+    splits:Key.t list ->
     (unit, [> `Sink of error ]) result
     @@ portable
+  (** [splits]: the primary key each planned part after the first starts at, in key order, so
+      a target that keeps a table in key ranges can cut it there before rows arrive; none when
+      the key is not the primary one or is masked. *)
 
   val add_part :
     t -> Schema.Table.t -> (unit, [> `Sink of error ]) result @@ portable

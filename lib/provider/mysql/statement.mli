@@ -1,4 +1,8 @@
 (** A command without a result set. *)
+(** A TiDB id allocator: [AUTO_INCREMENT] also gives [_tidb_rowid] unless the table caches ids
+    apart. *)
+type allocator = Auto_increment | Auto_random [@@deriving sexp_of ~portable]
+
 type t =
   | Configure_session of Server.t
       (** UTC time zone, empty [sql_mode], long network timeouts, [REPEATABLE
@@ -38,7 +42,16 @@ type t =
   | Import_tablespace of Quiver_core.Schema.Name.t
   | Rename_table of { from : Quiver_core.Schema.Name.t; into : Quiver_core.Schema.Name.t }
   | Drop_table of Quiver_core.Schema.Name.t  (** If it exists. *)
+  | Create_database of Quiver_core.Ident.t  (** If it does not exist, in the server's defaults. *)
+  | Create_like of { table : Quiver_core.Schema.Name.t; like : Quiver_core.Schema.Name.t }
+  | Rebase of { table : Quiver_core.Schema.Name.t; allocator : allocator; next : int64 }
+      (** TiDB: the allocator hands out ids from [next] on. *)
   | Drop_indexes of { table : Quiver_core.Schema.Name.t; indexes : Quiver_core.Ident.t list }
+  | Scatter_regions
+      (** TiDB: regions the session splits are spread over the stores before the split returns. *)
+  | Split_table of { table : Quiver_core.Ident.t; at : Quiver_core.Key.t * Quiver_core.Key.t list }
+      (** TiDB: [table] of the current database cut into regions at each key, of its clustered
+          primary key. *)
   | Load_local of {
       table : Quiver_core.Ident.t;
       dialect : Quiver_core.Output_format.dialect;

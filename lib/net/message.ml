@@ -11,7 +11,13 @@ type control =
       chunks : int;
     }
   | Database of { name : Quiver_core.Ident.t; ddl : string; sequences : Quiver_core.Sequence.t list }
-  | Table of { table : Quiver_core.Schema.Table.t; ddl : string; parts : int; order : Quiver_core.Schema.order }
+  | Table of {
+      table : Quiver_core.Schema.Table.t;
+      ddl : string;
+      parts : int;
+      order : Quiver_core.Schema.order;
+      splits : (Quiver_core.Key.value * Quiver_core.Key.value list) list;
+    }
   | Grown of { table : Quiver_core.Schema.Name.t }
   | Accepts of { database : Quiver_core.Ident.t; entries : (Quiver_core.Ident.t * Quiver_core.Definition.kind) list }
   | Objects of {

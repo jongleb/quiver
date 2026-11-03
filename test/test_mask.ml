@@ -1068,7 +1068,7 @@ let dump_through rules ~null_source =
     let sexp_of_error Never = Sexplib0.Sexp.Atom "never"
     let format _ = Output_format.Sql
     let database _ _ ~ddl:_ ~sequences:_ = Ok ()
-    let table _ _ ~ddl:_ ~parts:_ ~order:_ = Ok ()
+    let table _ _ ~ddl:_ ~parts:_ ~order:_ ~splits:_ = Ok ()
     let add_part _ _ = Ok ()
     let accepts _ _ _ = Ok ()
     let objects _ _ _ = Ok ()
@@ -1291,7 +1291,11 @@ let references_through_a_dump () =
           ranges = [];
         }
 
-    let plan _ _ _ = Ok [ Chunk.whole users; Chunk.whole orders ]
+    let plan _ _ _ =
+      Ok
+        (List.concat_map
+           (fun table -> Support.get_ok (Chunk.of_bounds table [ [ Key.Signed 1000L ] ]))
+           [ users; orders ])
 
     let snapshot () n =
       Ok (Array.init n (fun session -> Await.Capsule.Await.With_mutex.create (fun () -> session)), ())
@@ -1302,7 +1306,11 @@ let references_through_a_dump () =
 
     let read_chunk _ chunk _ writer =
       let ordering = Schema.Name.equal (Chunk.table chunk).name ordered in
-      let count = if ordering then 60 else 30 in
+      let count =
+        match (chunk : Chunk.t) with
+        | Range { range = From _ | Between _; _ } -> 0
+        | Range { range = Below _; _ } | Whole _ -> if ordering then 60 else 30
+      in
       let pending = ref (List.init count (fun i -> i + 1)) in
       Batch_writer.fill writer (fun (columns : Column.any Iarray.t @ local) ->
           match !pending with
@@ -1349,8 +1357,8 @@ let references_through_a_dump () =
     let format _ = Output_format.Sql
     let database _ _ ~ddl:_ ~sequences:_ = Ok ()
 
-    let table _ ({ name; _ } : Schema.Table.t) ~ddl:_ ~parts:_ ~order =
-      Portable.Atomic.update declared ~pure_f:(fun declared -> (name, order) :: declared);
+    let table _ ({ name; _ } : Schema.Table.t) ~ddl:_ ~parts:_ ~order ~splits =
+      Portable.Atomic.update declared ~pure_f:(fun declared -> (name, order, splits) :: declared);
       Ok ()
 
     let add_part _ _ = Ok ()
@@ -1453,13 +1461,15 @@ let references_through_a_dump () =
     "the manifest names the spread"
     [ ("id", "permute"); ("email", "permute"); ("user_id", "permute (a reference)"); ("mail", "permute (a reference)") ]
     (List.map (fun ({ column; action; _ } : Manifest.masked) -> ((column :> string), action)) manifest.masked);
-  Alcotest.(check (list (pair string string)))
-    "a table whose key is masked is declared so"
-    [ ("orders", "Key_order"); ("users", "Masked_key") ]
+  Alcotest.(check (list (triple string string (list string))))
+    "a table whose key is masked is declared so, without the keys its parts start at"
+    [ ("orders", "Key_order", [ "1000" ]); ("users", "Masked_key", []) ]
     (List.sort compare
        (List.map
-          (fun ((name : Schema.Name.t), order) ->
-            ((name.table :> string), Sexplib0.Sexp.to_string (Schema.sexp_of_order order)))
+          (fun ((name : Schema.Name.t), order, splits) ->
+            ( (name.table :> string),
+              Sexplib0.Sexp.to_string (Schema.sexp_of_order order),
+              List.map (fun split -> Sexplib0.Sexp.to_string (Key.sexp_of_t split)) splits ))
           (Portable.Atomic.get declared)))
 
 let hidden_ranges () =

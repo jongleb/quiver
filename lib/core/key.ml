@@ -47,7 +47,32 @@ let text value =
   | Instant moment -> printed Temporal.moment moment
   | Duration micros -> Int64.to_string micros ^ "µs"
 
-let sexp_of_value value = Sexplib0.Sexp.Atom (text value)
+let sexp_of_value value =
+  let tagged name atom = Sexplib0.Sexp.List [ Atom name; Atom atom ] in
+  match value with
+  | Signed v -> tagged "Signed" (Int64.to_string v)
+  | Unsigned v -> tagged "Unsigned" (Printf.sprintf "%Lu" v)
+  | Text text -> tagged "Text" text
+  | Binary bytes -> tagged "Binary" (Hex_encode.to_hex ~case:`Lowercase bytes)
+  | Exact text -> tagged "Exact" text
+  | Day day -> tagged "Day" (Core.Date.to_string day)
+  | Instant moment -> tagged "Instant" (Int.to_string (moment :> int))
+  | Duration v -> tagged "Duration" (Int64.to_string v)
+
+let value_of_sexp sexp =
+  let wrong () = Sexplib0.Sexp_conv.of_sexp_error "a key value" sexp in
+  let parsed parse atom = Base.Option.value_or_thunk ~default:wrong (parse atom) in
+  match sexp with
+  | List [ Atom "Signed"; Atom v ] -> Signed (parsed Int64.of_string_opt v)
+  | List [ Atom "Unsigned"; Atom v ] -> Unsigned (parsed (fun v -> Int64.of_string_opt ("0u" ^ v)) v)
+  | List [ Atom "Text"; Atom text ] -> Text text
+  | List [ Atom "Binary"; Atom hex ] ->
+      Binary (parsed (fun hex -> Base.Option.try_with (fun () -> Hex_encode.from_hex hex)) hex)
+  | List [ Atom "Exact"; Atom text ] -> Exact text
+  | List [ Atom "Day"; Atom day ] -> Day (parsed (fun day -> Base.Option.try_with (fun () -> Core.Date.of_string day)) day)
+  | List [ Atom "Instant"; Atom micros ] -> Instant (parsed (fun micros -> Option.bind (int_of_string_opt micros) Moment.of_micros) micros)
+  | List [ Atom "Duration"; Atom v ] -> Duration (parsed Int64.of_string_opt v)
+  | _ -> wrong ()
 
 type t = value * value list [@@deriving equal ~portable, yojson_of]
 

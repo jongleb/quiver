@@ -577,6 +577,32 @@ let name =
               string_printable;
             ])))
 
+let key_value =
+  QCheck2.Gen.(
+    let edge = oneof [ int64; oneof_list [ 0L; -1L; Int64.min_int; Int64.max_int ] ]
+    and text = string_size ~gen:char (int_range 0 30) in
+    oneof
+      [
+        map (fun v -> Quiver_core.Key.Signed v) edge;
+        map (fun v -> Quiver_core.Key.Unsigned v) edge;
+        map (fun text -> Quiver_core.Key.Text text) text;
+        map (fun bytes -> Quiver_core.Key.Binary bytes) text;
+        map (fun digits -> Quiver_core.Key.Exact digits) (oneof_list [ "0"; "-1.50"; "12345678901234567890.123" ]);
+        map (fun days -> Quiver_core.Key.Day (Quiver_core.Moment.date_of_days days)) (int_range (-719528) 2932896);
+        map
+          (fun micros -> Quiver_core.Key.Instant (Option.get (Quiver_core.Moment.of_micros micros)))
+          (oneof [ int_range (-62167219200000000) 253402300799999999; oneof_list [ 0; 1; -1; 253402300799999999; -62167219200000000 ] ]);
+        map (fun v -> Quiver_core.Key.Duration v) edge;
+      ])
+
+let key_values =
+  property ~count:2000 "a key value reads back from its S-expression's text as it was"
+    ~print:(fun value -> Sexplib0.Sexp.to_string (Quiver_core.Key.sexp_of_value value))
+    key_value
+    (fun value ->
+      Quiver_core.Key.equal_value value
+        (Quiver_core.Key.value_of_sexp (Parsexp.Single.parse_string_exn (Sexplib0.Sexp.to_string (Quiver_core.Key.sexp_of_value value)))))
+
 let messages =
   property ~count:500
     "every message reads back from the text of its S-expression"
@@ -631,8 +657,9 @@ let messages =
              in
              Quiver_net.Message.Database { name = database; ddl; sequences });
             (let* table = table and* ddl = text and* parts = count in
-             let+ order = oneof_list [ Quiver_core.Schema.Key_order; Masked_key ] in
-             Quiver_net.Message.Table { table; ddl; parts; order });
+             let* order = oneof_list [ Quiver_core.Schema.Key_order; Masked_key ] in
+             let+ splits = list_small (pair key_value (list_small key_value)) in
+             Quiver_net.Message.Table { table; ddl; parts; order; splits });
             map (fun table -> Quiver_net.Message.Grown { table }) table_name;
             map2
               (fun database definitions -> Quiver_net.Message.Objects { database; definitions })
@@ -752,7 +779,7 @@ let unchecked_sexp =
           Printf.sprintf "((name c)(ltype %s)(nullability %s))" ltype nullability
         in
         Printf.sprintf
-          "(Table(table((name(db t))(fields(%s()))(key %s)(estimate((rows 0)(bytes 0)))))(ddl \"\")(parts 1)(order Key_order))"
+          "(Table(table((name(db t))(fields(%s()))(key %s)(estimate((rows 0)(bytes 0)))))(ddl \"\")(parts 1)(order Key_order)(splits()))"
           field
           (match key with
           | `Primary -> Printf.sprintf "(Primary(%s()))" field
@@ -784,6 +811,7 @@ let unchecked_sexp =
 let tests =
   [
     messages;
+    key_values;
     unchecked_sexp;
     calendar;
     localized;

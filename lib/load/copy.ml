@@ -152,6 +152,7 @@ type declaration = {
   ddl : string;
   parts : int;
   order : Quiver_core.Schema.order;
+  splits : Quiver_core.Key.t list;  (** Where a TiDB target cuts it into regions before rows. *)
   declared : (unit, error) result Await.Await.Ivar.t;
 }
 
@@ -265,7 +266,7 @@ let on_idle_loader t work =
   Await.Await.Mpmc_queue.push t.idle loader;
   result
 
-let declare t { table = { name; _ } as table; ddl; parts; order; declared } =
+let declare t { table = { name; _ } as table; ddl; parts; order; splits; declared } =
   let into = { name with database = Load.renamed t.target name.database } in
   let remember foreign =
     match foreign with
@@ -283,6 +284,26 @@ let declare t { table = { name; _ } as table; ddl; parts; order; declared } =
       on_idle_loader t (fun link ->
           let%bind () = execute link (Use into.database) in
           let%bind () = retried link create in
+          let%bind () =
+            match (Quiver_mysql.Link.server link, splits) with
+            | Tidb_8_5 _, _ :: _ -> (
+                let clustering : Quiver_mysql.Query.t = Clustering into in
+                let%bind kept =
+                  rejected (Quiver_mysql.Query.sql clustering) (Quiver_mysql.Link.run_query link clustering)
+                in
+                match kept with
+                | [ [| Some "CLUSTERED" |] ] ->
+                    let%bind () = execute link Scatter_regions in
+                    Base.List.fold_result
+                      (Base.List.chunks_of splits ~length:1000)
+                      ~init:()
+                      ~f:(fun () -> function
+                        | first :: rest -> execute link (Split_table { table = into.table; at = (first, rest) })
+                        | [] -> Ok ())
+                | _ -> Ok ())
+            | (Mysql_8_0 _ | Mysql_8_4 _ | Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _ | Tidb_8_5 _), _ ->
+                Ok ()
+          in
           match (later, parts) with
           | first :: rest, 0 ->
               let%map () = run_in link into (first, rest) in
@@ -626,7 +647,7 @@ let accepts t database entries =
              match kind with View _ -> false | Trigger _ | Procedure | Function | Event -> true)
            entries)
 
-let table t ({ name; _ } as table : Quiver_core.Schema.Table.t) ~ddl ~parts ~order =
+let table t ({ name; _ } as table : Quiver_core.Schema.Table.t) ~ddl ~parts ~order ~splits =
   let declared = Await.Await.Ivar.create () in
   ignore (Portable_lockfree_htbl.set t.declared ~key:name ~data:declared);
   Portable.Atomic.update t.declaring ~pure_f:(fun declaring -> declared :: declaring);
@@ -634,7 +655,7 @@ let table t ({ name; _ } as table : Quiver_core.Schema.Table.t) ~ddl ~parts ~ord
   match qualified t name.database (Collations.rewrite t.collations ddl) with
   | Error error -> Error (`Sink error)
   | Ok ddl ->
-  let declaration = { table; ddl; parts; order; declared } in
+  let declaration = { table; ddl; parts; order; splits; declared } in
   match Quiver_core.Pool.submit t.preparing ~priority:table.estimate.bytes declaration with
   | Queued -> Ok ()
   | Unqueued ->

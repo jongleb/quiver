@@ -1,0 +1,12 @@
+(library
+ (name quiver_tikv)
+ (public_name quiver.tikv)
+ (libraries stdlib_stable base sexplib0 hex_encode unix quiver.core quiver.mysql)
+ (foreign_stubs
+  (language c)
+  (names crc64_stubs)
+  (flags (:standard -O3)))
+ (preprocess
+  (pps ppx_sexp_conv ppx_let ppx_string))
+ (flags
+  (:standard -open Stdlib_stable -open Sexplib0.Sexp_conv)))

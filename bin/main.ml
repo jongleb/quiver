@@ -684,6 +684,68 @@ let () =
                  | Quiver_load.Load.cause ]]
                  error))
   in
+  let mirror (conn : Quiver_mysql.Provider.conn_config) database into tables workers stores =
+    let open Base.Result.Let_syntax in
+    let link =
+      Quiver_mysql.Link.connect ~local_data:Without_local_data conn.route ~timeouts:conn.timeouts ~user:conn.user
+        ~password:conn.password
+    in
+    let mirrored =
+      let%bind link = link in
+      let copied =
+        match Quiver_mysql.Link.server link with
+        | Mysql_8_0 _ | Mysql_8_4 _ | Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _ -> Error `Not_tidb
+        | Tidb_8_5 _ ->
+            let%bind tables =
+              match tables with
+              | _ :: _ -> Ok tables
+              | [] ->
+                  let%bind rows = Quiver_mysql.Link.run_query link (Base_tables database) in
+                  Base.Result.all
+                    (List.map
+                       (fun row ->
+                         match row with
+                         | [| Some table |] -> Quiver_core.Ident.of_string table
+                         | row -> Error (`Region (Quiver_tikv.Region.Malformed (Array.to_list row))))
+                       rows)
+            in
+            let%bind () = Quiver_mysql.Link.run_statement link (Create_database into) in
+            Base.List.fold_result tables ~init:() ~f:(fun () table ->
+                let started = Quiver_core.Stopwatch.start () in
+                let%bind copied =
+                  Quiver_tikv.Mirror.copy link ~source:{ database; table } ~target:{ database = into; table }
+                    { timeout = conn.timeouts.connecting; sizes = { scan = 1024; job = 16 lsl 20; batch = 16 lsl 10 }; workers; stores }
+                in
+                Format.printf "%s.%s: %d keys, %d bytes, checksum %016Lx as TiDB's, in %a@." (into :> string)
+                  (table :> string) copied.keys copied.bytes copied.checksum Core.Time_ns.Span.pp
+                  (Quiver_core.Stopwatch.elapsed started);
+                Ok ())
+      in
+      Quiver_mysql.Link.close link;
+      copied
+    in
+    match mirrored with
+    | Ok () -> 0
+    | Error `Not_tidb -> told "mirror copies within one TiDB cluster; the server is not TiDB"
+    | Error error ->
+        failed
+          ([%sexp_of:
+             [ `Mirror of Quiver_tikv.Mirror.error
+             | `Link of Quiver_mysql.Link.error
+             | `Wire of Quiver_mysql.Wire.error
+             | `Ident of Quiver_core.Ident.error
+             | `Read of Quiver_tikv.Read.error
+             | `Ingest of Quiver_tikv.Ingest.error
+             | `Pd of Quiver_tikv.Pd.error
+             | `Region of Quiver_tikv.Region.error
+             | `Transport of Quiver_mysql.Transport.error
+             | `Proto of Quiver_tikv.Proto.error
+             | `Grpc of Quiver_tikv.Grpc.error
+             | `Http2 of Quiver_tikv.Http2.error
+             | `Hpack of Quiver_tikv.Hpack.error
+             | `Not_tidb ]]
+             error)
+  in
   let conn side =
     let open Cmdliner in
     let names short long =
@@ -1489,6 +1551,45 @@ let () =
       (Cmd.info "load" ~doc:"Load a quiver dump into MySQL or MariaDB")
       Term.(const load $ server `Source $ dir $ into $ writing $ objects $ threads)
   in
+  let mirror_cmd =
+    let open Cmdliner in
+    let database =
+      Arg.(required & opt (some ident) None & described [ "B"; "database" ] ~docv:"DB" ~doc:"The database whose tables are copied.")
+    and into =
+      Arg.(
+        required
+        & opt (some ident) None
+        & described [ "to-database" ] ~docv:"DB"
+            ~doc:"Where the copies go, made if it does not exist; a table already there is refused.")
+    and tables =
+      Arg.(
+        value & opt_all ident []
+        & described [ "T"; "table" ] ~docv:"TABLE" ~doc:"Copy only this table, repeatable; all of the database's when not given.")
+    and workers =
+      Arg.(
+        value & opt int 8
+        & described [ "w"; "workers" ] ~docv:"N"
+            ~doc:"Threads copying a table at once, each with connections of its own to PD and every TiKV store.")
+    and stores =
+      Arg.(
+        value
+        & opt (enum [ ("untouched", Quiver_tikv.Mirror.Untouched); ("import", Imported) ]) Quiver_tikv.Mirror.Untouched
+        & described [ "store-mode" ] ~docv:"MODE"
+            ~doc:
+              "$(b,untouched) leaves the TiKV stores as they are; $(b,import) keeps every store in \
+               import mode while a table's keys go in, as IMPORT INTO does: compaction never stalls \
+               the writes and no region is split by size, but compaction takes more threads and the \
+               cluster's other writes may slow down meanwhile (on one machine running every store it \
+               made copies slower), and a store left in it goes back by itself after ten minutes.")
+    in
+    Cmd.v
+      (Cmd.info "mirror"
+         ~doc:
+           "Copy tables of a TiDB cluster into another database of the same cluster as TiKV keeps them: \
+            rows and indexes read at one TSO and imported under the new tables' ids, with no SQL on \
+            the way, checked against TiDB's checksum")
+      Term.(const mirror $ server `Source $ database $ into $ tables $ workers $ stores)
+  in
   let copy_cmd =
     let open Cmdliner in
     let into =
@@ -1918,7 +2019,7 @@ let () =
       (Cmd.info "mask" ~doc:"Try an expression of the masking language on values, with no server" ~man)
       Term.(const run $ kind $ row $ scripts $ expression $ values $ mask_secret)
   in
-  let documented = [ dump_cmd; load_cmd; copy_cmd; agent_cmd; collect_cmd; relay_cmd; mask_cmd ] in
+  let documented = [ dump_cmd; load_cmd; copy_cmd; mirror_cmd; agent_cmd; collect_cmd; relay_cmd; mask_cmd ] in
   let help name =
     let buffer = Buffer.create 8192 in
     let formatter = Format.formatter_of_buffer buffer in

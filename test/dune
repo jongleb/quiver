@@ -2,7 +2,8 @@
  (name main)
  (deps
   (glob_files tls/*)
-  (glob_files innodb/*))
+  (glob_files innodb/*)
+  (glob_files http2/*))
  (flags
   (:standard -open Stdlib_stable))
  (libraries
@@ -24,6 +25,7 @@
   quiver.quiverfile
   quiver.docs
   quiver.net
+  quiver.tikv
   quiver.openssl
   zarith
   threads.posix

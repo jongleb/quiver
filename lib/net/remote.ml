@@ -1128,8 +1128,16 @@ let waited_for_acks t =
   Core.Time_ns.Span.of_int_ns (Portable.Atomic.get t.unacknowledged_wait)
 let database t name ~ddl ~sequences = sent t (Database { name; ddl; sequences })
 
-let table t (table : Quiver_core.Schema.Table.t) ~ddl ~parts ~order =
-  sent t (Table { table; ddl; parts; order })
+let table t (table : Quiver_core.Schema.Table.t) ~ddl ~parts ~order ~splits =
+  sent t
+    (Table
+       {
+         table;
+         ddl;
+         parts;
+         order;
+         splits = List.map (fun (key : Quiver_core.Key.t) -> (key :> Quiver_core.Key.value * Quiver_core.Key.value list)) splits;
+       })
 
 let add_part t (table : Quiver_core.Schema.Table.t) =
   sent t (Grown { table = table.name })

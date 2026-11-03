@@ -89,6 +89,7 @@ module Recorder = struct
     mutable databases : Ident.t list;
     mutable sequences : (Ident.t * Ident.t list) list;  (** Declared with each database. *)
     mutable tables : (Schema.Name.t * int) list;  (** With their parts. *)
+    mutable splits : (Schema.Name.t * Key.t list) list;
     mutable grown : Schema.Name.t list;  (** A part more, once each. *)
     mutable objects : (Ident.t * Ident.t list) list;
     mutable unannounced : int;
@@ -130,12 +131,13 @@ module Recorder = struct
           (database, List.map (fun ({ name; _ } : Sequence.t) -> name) sequences) :: log.sequences);
     Ok ()
 
-  let table t ({ name; _ } : Schema.Table.t) ~ddl:_ ~parts ~order:_ =
+  let table t ({ name; _ } : Schema.Table.t) ~ddl:_ ~parts ~order:_ ~splits =
     logged t (fun log ->
         (match List.mem name.database log.databases with
         | true -> ()
         | false -> log.unannounced <- log.unannounced + 1);
-        log.tables <- (name, parts) :: log.tables);
+        log.tables <- (name, parts) :: log.tables;
+        log.splits <- (name, splits) :: log.splits);
     Ok ()
 
   let accepts t (database : Ident.t) _ =
@@ -621,6 +623,7 @@ let holds
                   databases = [];
                   sequences = [];
                   tables = [];
+                  splits = [];
                   grown = [];
                   objects = [];
                   unannounced = 0;
@@ -683,7 +686,7 @@ let holds
           (fun { databases; tables; objects; unannounced; _ } ->
             (databases, tables, objects, unannounced))
       and announced_sequences = Recorder.logged recorder (fun { sequences; _ } -> sequences)
-      in
+      and announced_splits = Recorder.logged recorder (fun { splits; _ } -> splits) in
       match outcome with
       | Error `Timeout -> false
       | Ok outcome -> (
@@ -790,6 +793,18 @@ let holds
                announced_sequences
           && List.length announced_tables
              = List.length (List.sort_uniq compare (List.map fst announced_tables))
+          && List.for_all
+               (fun (name, splits) ->
+                 List.equal Key.equal splits
+                   (List.filter_map
+                      (fun (chunk : Chunk.t) ->
+                        match chunk with
+                        | Range { table; range = Between (lower, _) | From lower; _ }
+                          when Schema.Name.equal table.name name ->
+                            Some lower
+                        | Range _ | Whole _ -> None)
+                      chunks))
+               announced_splits
           && List.for_all
                (fun (name, parts) ->
                  parts

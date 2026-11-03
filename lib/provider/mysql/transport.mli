@@ -41,7 +41,8 @@ val connect :
   (t, [> `Transport of error ]) result @@ portable
 
 val read : t -> Base_bigstring.t -> off:int -> len:int -> int @@ portable
-val write : t -> string -> (unit, [> `Transport of error ]) result @@ portable
+val write : t -> ?pos:int -> ?len:int -> string -> (unit, [> `Transport of error ]) result @@ portable
+(** [len] bytes of the text from [pos], all of it by default. *)
 
 val start_tls :
   t -> host:string -> authority -> (trust, [> `Transport of error ]) result @@ portable

@@ -18,10 +18,15 @@ type value =
 
 val equal_value : value -> value -> bool @@ portable
 val sexp_of_value : value -> Sexplib0.Sexp.t @@ portable
+(** Exact: {!value_of_sexp} reads it back. *)
+
+val value_of_sexp : Sexplib0.Sexp.t -> value @@ portable
+(** Raises as derived converters do. *)
+
 val yojson_of_value : value -> Yojson.Safe.t
 
 type t = private value * value list [@@deriving sexp_of ~portable, equal ~portable, yojson_of]
-(** A boundary: one value per key field, in key order. *)
+(** A boundary: one value per key field, in key order; its S-expression is for people. *)
 
 val pp : Format.formatter -> t -> unit @@ portable
 

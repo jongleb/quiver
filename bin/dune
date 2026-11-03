@@ -11,6 +11,7 @@
   quiver.sink
   quiver.mysql
   quiver.load
+  quiver.tikv
   quiver.net
   quiver.quiverfile
   quiver.docs

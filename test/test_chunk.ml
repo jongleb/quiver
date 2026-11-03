@@ -457,6 +457,29 @@ let tests =
           "printed"
           [ "db.t, id below X'C001'"; "db.t, id from X'C001'" ]
           (List.map (Format.asprintf "%a" Chunk.pp) chunks));
+    Alcotest.test_case "a table is split into regions at its keys, each value a literal of its kind" `Quick (fun () ->
+        let key values =
+          Support.get_ok
+            (Key.make
+               ( { Schema.Field.name = Support.ident "a"; ltype = Int64; nullability = Not_null },
+                 [
+                   { name = Support.ident "b"; ltype = String; nullability = Not_null };
+                   { name = Support.ident "c"; ltype = Datetime Ltype.Fsp.microseconds; nullability = Not_null };
+                 ] )
+               values)
+        and instant = Option.get (Moment.of_micros 1_700_000_000_123_456) in
+        Alcotest.(check string)
+          "statement"
+          "SPLIT TABLE `t``x` BY (-5, _utf8mb4 X'c3a9', '2023-11-14 22:13:20.123456'), (7, _utf8mb4 X'', \
+           '1970-01-01 00:00:00.000000')"
+          (Quiver_mysql.Statement.sql
+             (Split_table
+                {
+                  table = Support.ident "t`x";
+                  at =
+                    ( key [ Signed (-5L); Text "é"; Instant instant ],
+                      [ key [ Signed 7L; Text ""; Instant (Option.get (Moment.of_micros 0)) ] ] );
+                })));
     QCheck_alcotest.to_alcotest
       (exact_cover
          {

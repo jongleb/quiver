@@ -22,7 +22,7 @@ module Anything = struct
 
   let format () = Output_format.Sql
   let database () _ ~ddl:_ ~sequences:_ = Ok ()
-  let table () _ ~ddl:_ ~parts:_ ~order:_ = Ok ()
+  let table () _ ~ddl:_ ~parts:_ ~order:_ ~splits:_ = Ok ()
   let add_part () _ = Ok ()
   let accepts () _ _ = Ok ()
   let objects () _ _ = Ok ()
@@ -101,11 +101,11 @@ let controls =
     let chunk = int_range 0 4 and n = int_range 0 3 in
     oneof
       [
-        map
-          (fun n ->
-            Quiver_net.Message.sexp_of_control
-              (Table { table = table n; ddl = ""; parts = 1 + n; order = Key_order }))
-          n;
+        map2
+          (fun n splits ->
+            Quiver_net.Message.sexp_of_control (Table { table = table n; ddl = ""; parts = 1 + n; order = Key_order; splits }))
+          n
+          (oneof_list [ []; [ (Quiver_core.Key.Signed 5L, []) ]; [ (Quiver_core.Key.Text "x", [ Quiver_core.Key.Signed 1L ]) ] ]);
         pure
           (Quiver_net.Message.sexp_of_control
              (Database { name = ident "db"; ddl = ""; sequences = [] }));
@@ -401,7 +401,7 @@ let hostile_collector =
               Atomic.set stage "declaring the database";
               ignore (Quiver_net.Remote.database agent (ident "db") ~ddl:"" ~sequences:[]);
               Atomic.set stage "declaring the table";
-              ignore (Quiver_net.Remote.table agent (table 0) ~ddl:"" ~parts ~order:Key_order);
+              ignore (Quiver_net.Remote.table agent (table 0) ~ddl:"" ~parts ~order:Key_order ~splits:[]);
               for index = 0 to parts - 1 do
                 Atomic.set stage (Printf.sprintf "opening part %d" index);
                 match Quiver_net.Remote.part agent (table 0) ~index with

@@ -617,6 +617,20 @@ tidb() {
   "$quiver" copy --tls disabled -P "$port" -u root -B quiver_tidb -t 4 --to-tls "$tls" \
     --to-port "$target_port" --to-password quiver > "$dir.copy.log" 2>&1 || fail "copy: $(cat "$dir.copy.log")"
   same "copy"
+  source_sql -e "DROP DATABASE IF EXISTS quiver_tidb_twin"
+  "$quiver" copy --tls disabled -P "$port" -u root -B quiver_tidb -t 4 --to-tls disabled --to-port "$port" \
+    --to-user root --to-database quiver_tidb_twin > "$dir.twin.log" 2>&1 || fail "copy into TiDB: $(cat "$dir.twin.log")"
+  for table in big:id composite:region,code nonclustered:id "no_key:msg, at" nothing:id; do
+    name=${table%%:*} order=${table#*:}
+    [ "$(source_sql -N -e "SELECT * FROM quiver_tidb.$name ORDER BY $order" | cksum)" \
+      = "$(source_sql -N -e "SELECT * FROM quiver_tidb_twin.$name ORDER BY $order" | cksum)" ] \
+      || fail "TiDB into TiDB: rows of $name differ"
+  done
+  for name in big composite; do
+    [ "$(source_sql -N -e "SHOW TABLE quiver_tidb_twin.$name REGIONS" | wc -l)" -gt 1 ] \
+      || fail "TiDB into TiDB: $name was not split before its rows"
+  done
+  source_sql -e "DROP DATABASE quiver_tidb_twin"
   if "$quiver" dump --snapshot ftwrl --tls disabled -P "$port" -u root -B quiver_tidb -o "$out/$service-ftwrl" \
     2> "$out/$service-ftwrl.log"; then
     fail "ftwrl was accepted"
@@ -641,7 +655,7 @@ tidb() {
   if source_sql -e 'SELECT NEXTVAL(spent)' quiver_tidb_seq > /dev/null 2>&1; then fail "a spent sequence came back"; fi
   [ "$(source_sql -N -e 'INSERT INTO counted (v) VALUES (4); SELECT MAX(id) FROM counted' quiver_tidb_seq)" = 1002 ] \
     || fail "a default from a sequence"
-  echo "$service: dumped at one TSO and copied into $target, rows equal; ftwrl refused; sequences restored, refused by MySQL"
+  echo "$service: dumped at one TSO and copied into $target and into itself split at the source's regions, rows equal; ftwrl refused; sequences restored, refused by MySQL"
 }
 # MySQL into TiDB, which holds a transaction in its memory: a keyed table, a keyless one read
 # as one part well over a transaction, and text with line breaks, quotes and backslashes go

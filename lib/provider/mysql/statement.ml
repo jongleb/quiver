@@ -1,3 +1,5 @@
+type allocator = Auto_increment | Auto_random [@@deriving sexp_of ~portable]
+
 type t =
   | Configure_session of Server.t
   | Flush_tables_with_read_lock
@@ -23,7 +25,12 @@ type t =
   | Import_tablespace of Quiver_core.Schema.Name.t
   | Rename_table of { from : Quiver_core.Schema.Name.t; into : Quiver_core.Schema.Name.t }
   | Drop_table of Quiver_core.Schema.Name.t
+  | Create_database of Quiver_core.Ident.t
+  | Create_like of { table : Quiver_core.Schema.Name.t; like : Quiver_core.Schema.Name.t }
+  | Rebase of { table : Quiver_core.Schema.Name.t; allocator : allocator; next : int64 }
   | Drop_indexes of { table : Quiver_core.Schema.Name.t; indexes : Quiver_core.Ident.t list }
+  | Scatter_regions
+  | Split_table of { table : Quiver_core.Ident.t; at : Quiver_core.Key.t * Quiver_core.Key.t list }
   | Load_local of {
       table : Quiver_core.Ident.t;
       dialect : Quiver_core.Output_format.dialect;
@@ -85,11 +92,23 @@ let sql = function
   | Import_tablespace name -> [%string "ALTER TABLE %{Query.qualified name} IMPORT TABLESPACE"]
   | Rename_table { from; into } -> [%string "RENAME TABLE %{Query.qualified from} TO %{Query.qualified into}"]
   | Drop_table name -> [%string "DROP TABLE IF EXISTS %{Query.qualified name}"]
+  | Create_database name -> [%string "CREATE DATABASE IF NOT EXISTS %{Quiver_core.Ident.backquoted name}"]
+  | Create_like { table; like } -> [%string "CREATE TABLE %{Query.qualified table} LIKE %{Query.qualified like}"]
+  | Rebase { table; allocator; next } ->
+      let option = match allocator with Auto_increment -> "AUTO_INCREMENT" | Auto_random -> "AUTO_RANDOM_BASE" in
+      [%string "ALTER TABLE %{Query.qualified table} %{option} = %{Int64.to_string next}"]
   | Drop_indexes { table; indexes } ->
       let dropped =
         String.concat ", " (List.map (fun index -> "DROP INDEX " ^ Quiver_core.Ident.backquoted index) indexes)
       in
       [%string "ALTER TABLE %{Query.qualified table} %{dropped}"]
+  | Scatter_regions -> "SET SESSION tidb_scatter_region = 'table'"
+  | Split_table { table; at = first, rest } ->
+      let tuple (key : Quiver_core.Key.t) =
+        let first, rest = (key :> Quiver_core.Key.value * Quiver_core.Key.value list) in
+        [%string {|(%{String.concat ", " (List.map Query.literal (first :: rest))})|}]
+      in
+      [%string {|SPLIT TABLE %{Quiver_core.Ident.backquoted table} BY %{String.concat ", " (List.map tuple (first :: rest))}|}]
   | Commit -> "COMMIT"
   | Rollback -> "ROLLBACK"
   | Load_local { table; dialect; columns } ->

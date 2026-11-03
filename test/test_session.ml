@@ -81,7 +81,12 @@ let table n =
     (Schema.Table.make ~generated:[]
        ~name:{ database = ident "db"; table = ident ("t" ^ string_of_int n) }
        ~fields:[ { name = ident "id"; ltype = Int64; nullability = Not_null } ]
-       ~key:No_key ~estimate:{ rows = 0; bytes = 0 })
+       ~key:(Primary (ident "id", [])) ~estimate:{ rows = 0; bytes = 0 })
+
+let splits n parts =
+  List.init
+    (Int.max 0 (parts - 1))
+    (fun at -> Support.get_ok (Key.make (table n).fields [ Signed (Int64.of_int ((at * 1000) - 500 + n)) ]))
 
 (** A sink that remembers what reached it, refusing one table or its parts if
     told to. *)
@@ -95,6 +100,7 @@ module Recorder = struct
 
   type log = {
     mutable tables : Schema.Name.t list;  (** Created, latest first. *)
+    mutable splits : (Schema.Name.t * Key.t list) list;  (** Of each created table, latest first. *)
     mutable closed : ((Schema.Name.t * int) * int64 list) list;
     mutable finished : string option;  (** The manifest, as JSON text. *)
   }
@@ -119,13 +125,14 @@ module Recorder = struct
       refuse;
       log =
         Await.Capsule.Await.With_mutex.create (fun () ->
-            { tables = []; closed = []; finished = None });
+            { tables = []; splits = []; closed = []; finished = None });
     }
 
   let logged t f =
     Guarded.hold t.log f
 
   let tables t = logged t (fun log -> log.tables)
+  let splits t = logged t (fun log -> log.splits)
   let closed t = logged t (fun log -> log.closed)
 
   let finished t =
@@ -134,12 +141,14 @@ module Recorder = struct
   let format _ = Output_format.Sql
   let database _ _ ~ddl:_ ~sequences:_ = Ok ()
 
-  let table t ({ name; _ } : Schema.Table.t) ~ddl:_ ~parts:_ ~order:_ =
+  let table t ({ name; _ } : Schema.Table.t) ~ddl:_ ~parts:_ ~order:_ ~splits =
     match t.refuse with
     | Some (Creating refused) when Schema.Name.equal refused name ->
         Error (`Sink (Refused_table name))
     | Some (Creating _ | Closing _ | Accepting) | None ->
-        logged t (fun log -> log.tables <- name :: log.tables);
+        logged t (fun log ->
+            log.tables <- name :: log.tables;
+            log.splits <- (name, splits) :: log.splits);
         Ok ()
 
   let accepts t _ _ =
@@ -604,7 +613,7 @@ let property
     (fun n parts ->
       ignore
         (Quiver_net.Remote.table agent (table n) ~ddl:""
-           ~parts:(List.length parts) ~order:Key_order))
+           ~parts:(List.length parts) ~order:Key_order ~splits:(splits n (List.length parts))))
     tables;
   let jobs =
     Array.of_list
@@ -784,6 +793,10 @@ let property
              Result.is_ok result
              && List.sort compare (Recorder.closed recorder)
                 = List.sort compare expected
+             && List.equal
+                  (fun (name, splits) (other, others) -> Schema.Name.equal name other && List.equal Key.equal splits others)
+                  (List.rev (Recorder.splits recorder))
+                  (List.mapi (fun n parts -> ((table n).name, splits n (List.length parts))) tables)
              &&
              match Option.map Manifest.read (Recorder.finished recorder) with
              | Some (Ok { parts; _ }) ->

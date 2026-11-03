@@ -56,6 +56,22 @@ type t =
   | Text_collations  (** Ids of the server's [utf8mb4], [utf8mb3] and [latin1] collations, with the set's name. *)
   | Auto_increment of Quiver_core.Schema.Name.t
       (** The table's [AUTO_INCREMENT] column, if it has one. *)
+  | Clustering of Quiver_core.Schema.Name.t
+  | Table_id of Quiver_core.Schema.Name.t  (** TiDB: the table's [TIDB_TABLE_ID]. *)
+  | Table_regions of int64
+      (** TiDB: id, bounds in hex of their order-keeping form, and epoch of each region holding
+          some of the table's keys; a region once for each of the table's ranges it holds. *)
+  | Region_peers of int64 * int64 list
+      (** TiDB: each region's peers, their stores, whether each leads (1 or 0) and the store's
+          address. *)
+  | Pd_instances  (** TiDB: [host:port] of each PD server. *)
+  | Next_row_ids of Quiver_core.Schema.Name.t
+      (** TiDB: each id allocator of the table, the next id it hands out and its kind. *)
+  | Checksum of Quiver_core.Schema.Name.t
+      (** TiDB: the CRC64 XOR of every key and value of the table, their count and bytes. *)
+  | Partitioned of Quiver_core.Schema.Name.t  (** The number of the table's partitions. *)
+  | Base_tables of Quiver_core.Ident.t  (** The database's tables, not views or sequences, by name. *)
+      (** TiDB: the table's [TIDB_PK_TYPE], [CLUSTERED] when its rows are kept by its primary key. *)
   | Warnings  (** Level, code and message of the last statement's warnings. *)
   | Loaded_files of { dump : string; target : string }
       (** Data files an earlier [quiver load] of this dump committed. *)
@@ -88,6 +104,9 @@ type t =
 [@@deriving sexp_of ~portable]
 
 val sql : t -> string @@ portable
+
+val literal : Quiver_core.Key.value -> string @@ portable
+(** As a key's field compares with it, in a session at UTC. *)
 
 val bytes : string -> string @@ portable
 (** A binary string literal: [X'…']. *)

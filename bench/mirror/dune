@@ -1,0 +1,7 @@
+(executable
+ (name main)
+ (flags
+  (:standard -open Stdlib_stable -open Sexplib0.Sexp_conv))
+ (preprocess
+  (pps ppx_sexp_conv))
+ (libraries stdlib_stable core sexplib0 quiver.core quiver.mysql quiver.tikv unix))

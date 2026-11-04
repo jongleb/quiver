@@ -156,8 +156,8 @@ let index ~version ~commands =
   String.concat "\n"
     [
       "<h1>quiver</h1>";
-      "<p class=\"lead\">A parallel, consistent logical copier for MySQL and MariaDB: dump, load, copy server to \
-       server, across the network, masking personal data as it is read.</p>";
+      "<p class=\"lead\">A parallel, consistent logical copier for MySQL, MariaDB and TiDB: dump, load, copy server to \
+       server, across the network, masking personal data as it is read, and TiDB to TiDB as TiKV keys.</p>";
       "<h2>Install</h2>";
       pre
         "curl -fsSL https://raw.githubusercontent.com/jongleb/quiver/main/install.sh | sh\n\

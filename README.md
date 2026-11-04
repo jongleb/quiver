@@ -7,19 +7,20 @@
 
 # quiver
 
-**Dump, load, copy and stream MySQL and MariaDB from one consistent snapshot, at the speed of the server.**
+**Dump, load, copy and stream MySQL, MariaDB and TiDB from one consistent snapshot, at the speed of the server.**
 
-Its own protocol client, its own columnar batches, its own network transport.
+Its own protocol client, its own columnar batches, its own network transport, its own TiKV client.
 
 [![CI](https://github.com/jongleb/quiver/actions/workflows/ci.yml/badge.svg)](https://github.com/jongleb/quiver/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/jongleb/quiver?color=e8590c)](https://github.com/jongleb/quiver/releases)
 ![OxCaml](https://img.shields.io/badge/OxCaml-5.2%2Box-ec6813?logo=ocaml&logoColor=white)
 ![MySQL 8.0 · 8.4](https://img.shields.io/badge/MySQL-8.0%20%C2%B7%208.4-4479a1?logo=mysql&logoColor=white)
 ![MariaDB 10.11 · 11.4 · 11.8](https://img.shields.io/badge/MariaDB-10.11%20%C2%B7%2011.4%20%C2%B7%2011.8-003545?logo=mariadb&logoColor=white)
+![TiDB 8.5](https://img.shields.io/badge/TiDB-8.5-e30c5c?logo=tidb&logoColor=white)
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-8a2be2)](LICENSE)
 
 [Install](#install) · [Quick start](#quick-start) · [How it works](#how-it-works) ·
-[Numbers](#numbers) · [Across the network](#across-the-network)
+[Numbers](#numbers) · [TiDB](#tidb) · [Across the network](#across-the-network)
 
 </div>
 
@@ -121,6 +122,22 @@ time than `LOAD DATA` on one laptop.
 **JSON numbers stay exact.** MySQL reads some of the doubles it prints in JSON as the next
 double, so a copy through text changes them. quiver finds those numbers and writes them as exact
 SQL literals.
+
+</td>
+</tr>
+<tr>
+<td valign="top">
+
+**TiDB as TiKV keeps it.** `quiver mirror` reads a table's rows and indexes straight from TiKV at
+one TSO and imports them into another table, of the same cluster or another one, with no SQL on
+the way: 2.0–2.3× faster than `IMPORT INTO … FROM SELECT`.
+
+</td>
+<td valign="top">
+
+**Between MySQL, MariaDB and TiDB.** TiDB dumps at one TSO with no lock and loads in pieces that
+resume. Collations a target lacks are renamed, sequences carried, objects it cannot hold refused
+before anything is made.
 
 </td>
 </tr>
@@ -253,6 +270,7 @@ quiver copy    # MySQL to MySQL with no files in between
 quiver agent   # MySQL to the network, runs next to the source
 quiver collect # the network to files or MySQL, runs next to the target, can forward
 quiver relay   # a hop that forwards bytes
+quiver mirror  # TiDB to TiDB as raw keys, store to store
 ```
 
 ### Dump and load
@@ -576,6 +594,58 @@ the top. A list at the top goes only to the commands that take that option. See
 `copy` and agent → collector, and masking with the policy in [examples/shop.scm](examples/shop.scm),
 keys included.
 
+## TiDB
+
+TiDB 8.5 speaks MySQL's protocol, so `dump`, `load` and `copy` work with it as they do with MySQL,
+and `quiver mirror` copies TiDB to TiDB below SQL, as TiKV keeps the data.
+
+```sh
+quiver dump -h tidb.example -P 4000 -B shop -o ./shop                      # one TSO, no lock
+quiver copy -h mysql.example -B shop --to-host tidb.example --to-port 4000 # MySQL into TiDB
+quiver copy -h mariadb.example -B shop --to-host tidb.example --to-port 4000 \
+  --collation utf8mb4_uca1400_ai_ci=utf8mb4_0900_ai_ci --objects views     # MariaDB into TiDB
+```
+
+- **One TSO for everything.** Every connection reads at the same TSO (`tidb_snapshot`), the schema
+  too; the TSO goes to the manifest as the `--start-ts` of a TiCDC changefeed. Tables split at
+  their regions, and a table without a clustered key by `_tidb_rowid`.
+- **Into TiDB.** A new table is split at the source's part boundaries and scattered before rows
+  arrive, so writes reach every TiKV from the start. A part goes in transactions of 16 MiB and
+  borrows idle loaders; `quiver load` commits in pieces and resumes from the last one.
+- **What the target lacks.** `--collation FROM=TO` renames collations TiDB does not know.
+  Triggers, routines and events are refused before anything is made (`--objects views` leaves
+  them out). Sequences of TiDB and MariaDB are carried and go on from where they were.
+
+### TiDB to TiDB as keys
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/mirror-dark.svg">
+  <img src="assets/mirror.svg" alt="IMPORT INTO FROM SELECT: source TiKV, then TiDB decodes every row into values and encodes it again into keys and indexes, then target TiKV. quiver mirror: KvScan at one TSO region by region, a worker per region swaps the table id and sums CRC64 of every pair in one buffer, the target is split and scattered first, Write to every replica and MultiIngest at the leader, then its own CRC64 is checked against ADMIN CHECKSUM, ids moved past the source's and the table renamed. Into another cluster with --to-host each side has its own PD and regions, new collations and column and index ids are checked first. On 3 TiKV: a keyed table of 1 M rows, 3 M keys: 4.29–4.48 s against 10.06–10.25 s, 2.3×; a table without a key, 2 M keys: 4.30–4.31 s against 8.75–8.95 s, 2.0×" width="100%">
+</picture>
+
+```sh
+quiver mirror -h tidb.example -P 4000 -B shop --to-database shop_copy          # the same cluster
+quiver mirror -h tidb.example -P 4000 -B shop -T orders \
+  --to-host other.example --to-port 4000 --to-database shop                    # another cluster
+```
+
+The copy is made under a name of its own (`CREATE TABLE … LIKE`, or the source's `SHOW CREATE
+TABLE` in another cluster). Its rows and indexes are read from TiKV at one TSO, region by region
+on `-w` workers, and imported through `ImportSST` under the copy's table id, at a version after
+it. TiDB's `ADMIN CHECKSUM TABLE` must equal quiver's own CRC64 of what it wrote; then the id
+allocators move past the source's and the copy is renamed. On any failure it is dropped.
+
+Into another cluster the two must agree on new collations, and the copy's column and index ids
+must be the source's, read from TiDB's status port. A table altered since it was made, with a
+column dropped and added, has other ids and is refused, with nothing left behind; `quiver copy`
+moves it through SQL. Partitioned tables are refused too. `--store-mode import` keeps every TiKV
+in import mode during the copy, as `IMPORT INTO` does; on one machine it made copies slower, so
+it is off by default.
+
+*tiup playground 8.5.8 on one laptop, 3 TiKV with 3 replicas, PD, TiDB and quiver on the same
+cores, 4 workers. Into another cluster (two playgrounds, one TiKV each): 3 M keys in 1.59 s,
+2 M keys in 1.68 s. Script: `bench/mirror`.*
+
 ## Across the network
 
 <picture>
@@ -689,7 +759,8 @@ quiver is young and moving fast.
 | Unix sockets, `my.cnf`, every common login | shipped |
 | Agent, collector, relays and chains, mutual TLS 1.3 | shipped |
 | Online tuning of streams, compression, readers; chunks divided while read | shipped |
-| TiDB 8.5 as a source: one TSO, chunks by regions, dump and copy into MySQL | in progress |
+| TiDB 8.5 as a source and a target: one TSO, chunks by regions, `_tidb_rowid`, sequences, `--collation` | new in 1.6 |
+| `quiver mirror`: TiDB to TiDB as TiKV keys, within a cluster or into another | new in 1.6 |
 | Resuming a network transfer from the same snapshot | next |
 | Postgres and other providers | after MySQL is done |
 

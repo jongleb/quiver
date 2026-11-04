@@ -45,7 +45,7 @@ roundtrip() {
   }
   check() {
     sums=$(sql -N -e "CHECKSUM TABLE $tables")
-    [ "$(printf '%s\n' "$sums" | grep -c -E '	[0-9]+$')" = 10 ] || fail "bad checksums: $sums"
+    [ "$(printf '%s\n' "$sums" | grep -c -E '	[0-9]+$')" = 11 ] || fail "bad checksums: $sums"
     [ "$(sql -N -e 'SELECT COUNT(*) FROM quiver_it.big')" = 50000 ] || fail "big lost rows"
     printf '%s\n' "$sums"
   }

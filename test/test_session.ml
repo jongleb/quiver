@@ -525,11 +525,10 @@ let property
         address = Quiver_net.Channel.listening_address socket;
       } )
   in
-  let collected recorder ~columns ?next socket =
+  let collected recorder ~columns ?next ?(reconnect = Support.reconnect) socket =
     Support.start (fun () ->
           (let%bind session =
-             Quiver_net.Collector.accept socket protection
-               ~reconnect:Support.reconnect
+             Quiver_net.Collector.accept socket protection ~reconnect
            in
            let%bind forward =
              match next with
@@ -577,7 +576,10 @@ let property
             address (List.init hops Fun.id) )
     | Chained ->
         let tail, tail_address = listen () in
-        let tail_result = collected last ~columns:last_columns tail in
+        let tail_result =
+          collected last ~columns:last_columns
+            ~reconnect:(Core.Time_ns.Span.of_sec 30.) tail
+        in
         let head, head_address = listen () in
         let head_result =
           collected first ~columns:first_columns ~next:(breaking_at Into_last tail_address) head
@@ -860,7 +862,11 @@ let property
              (List.map (fun ({ name; _ } : Schema.Table.t) -> name) schema)
   in
   List.iter Quiver_net.Channel.stop !listeners;
-  match outcome with Ok verdict -> verdict | Error `Timeout -> false
+  match outcome with
+  | Ok verdict -> verdict
+  | Error `Timeout ->
+      QCheck2.Test.fail_reportf "the session took longer than %.1f s"
+        session_seconds
 
 let session =
   QCheck2.Test.make ~count:60

@@ -6,12 +6,11 @@ type settings = { timeout : Core.Time_ns.Span.t; sizes : sizes; workers : int; s
 type copied = { keys : int; bytes : int; checksum : int64 } [@@deriving sexp_of ~portable]
 
 type error =
-  | Partitioned of Quiver_core.Schema.Name.t
   | Mismatch of { copied : copied; target : copied }
   | Allocator of string
   | Collations_differ of { source : string; target : string }
   | Definition of Quiver_core.Schema.Name.t
-  | Ids_differ of { source : Status.ids; target : Status.ids }
+  | Undescribed of Quiver_core.Schema.Name.t
 [@@deriving sexp_of ~portable]
 
 type failure =
@@ -23,7 +22,8 @@ type failure =
   | `Proto of Proto.error
   | `Grpc of Grpc.error
   | `Http2 of Http2.error
-  | `Hpack of Hpack.error ]
+  | `Hpack of Hpack.error
+  | `Renumber of Renumber.error ]
 
 let learned pd ~start ~stop =
   let rec go tries =
@@ -35,19 +35,15 @@ let learned pd ~start ~stop =
   in
   go 0
 
-type range = { start : string; stop : string; target_start : string; target_stop : string }
+type range = { start : string; stop : string }
 
-let ranges ~source ~into regions =
-  let first, past = Codec.table source and target_first, target_past = Codec.table into in
+let ranges ~source regions =
+  let first, past = Codec.table source in
   List.filter_map
     (fun (region : Region.t) ->
       let start = Base.String.max region.start first
       and stop = match region.stop with Endless -> past | Before stop -> Base.String.min stop past in
-      if String.compare start stop >= 0 then None
-      else
-        let target_start = if start = first then target_first else Codec.retabled ~into start
-        and target_stop = if stop = past then target_past else Codec.retabled ~into stop in
-        Some { start; stop; target_start; target_stop })
+      if String.compare start stop >= 0 then None else Some { start; stop })
     regions
 
 let points ~first ~last ~parts =
@@ -68,14 +64,7 @@ let points ~first ~last ~parts =
     (fun point -> String.compare first point < 0 && String.compare point last <= 0)
     (List.sort_uniq String.compare (List.init (Int.max 0 (parts - 1)) (fun i -> point (i + 1))))
 
-let divide ~into (range : range) points =
-  let starts = range.start :: points and stops = points @ [ range.stop ] in
-  List.map2
-    (fun start stop ->
-      let target_start = if start = range.start then range.target_start else Codec.retabled ~into start
-      and target_stop = if stop = range.stop then range.target_stop else Codec.retabled ~into stop in
-      { start; stop; target_start; target_stop })
-    starts stops
+let divide (range : range) points = List.map2 (fun start stop -> { start; stop }) (range.start :: points) (points @ [ range.stop ])
 
 let cuts regions keys =
   List.filter_map
@@ -90,7 +79,28 @@ let cuts regions keys =
       match inside with [] -> None | _ :: _ -> Some (region, inside))
     regions
 
-let range ~source ~target ~timeout ~version ~commit_ts ~sizes ~into { start; stop; target_start; target_stop } =
+let locate pd known ~start ~stop ~unheld (freshness : Read.freshness) key =
+  let%bind () =
+    match freshness with
+    | Known -> Ok ()
+    | Afresh -> Result.map (fun regions -> known := regions) (learned pd ~start ~stop:(Before stop))
+  in
+  Option.to_result ~none:(unheld key) (Region.find !known key)
+
+let reader pd stores ~start ~stop ~version ~limit =
+  let%bind regions = learned pd ~start ~stop:(Before stop) in
+  Ok
+    ({
+       locate = locate pd (ref regions) ~start ~stop ~unheld:(fun key -> `Read (Read.Unheld key));
+       scan =
+         (fun region ~start ~stop ->
+           let%bind connection = Stores.connection stores region.address in
+           Kv.scan connection region.context ~direction:Forward ~start ~stop ~version ~limit);
+       pause = (fun span -> Unix.sleepf (Core.Time_ns.Span.to_sec span));
+     }
+      : _ Read.store)
+
+let range ~source ~target ~timeout ~version ~commit_ts ~sizes ~plan (into, { start; stop }) =
   let%bind source_pd = Pd.connect ~timeout source in
   let%bind pd =
     Result.map_error
@@ -101,26 +111,9 @@ let range ~source ~target ~timeout ~version ~commit_ts ~sizes ~into { start; sto
   in
   let stores = Stores.create ~timeout and random = Random.State.make_self_init () in
   let copied =
-    let%bind source_regions = learned source_pd ~start ~stop:(Before stop) in
+    let%bind read = reader source_pd stores ~start ~stop ~version ~limit:sizes.scan in
+    let target_start, target_stop = Codec.table into in
     let%bind target_regions = learned pd ~start:target_start ~stop:(Before target_stop) in
-    let locate pd known ~start ~stop ~unheld (freshness : Read.freshness) key =
-      let%bind () =
-        match freshness with
-        | Known -> Ok ()
-        | Afresh -> Result.map (fun regions -> known := regions) (learned pd ~start ~stop:(Before stop))
-      in
-      Option.to_result ~none:(unheld key) (Region.find !known key)
-    in
-    let read : _ Read.store =
-      {
-        locate = locate source_pd (ref source_regions) ~start ~stop ~unheld:(fun key -> `Read (Read.Unheld key));
-        scan =
-          (fun region ~start ~stop ->
-            let%bind connection = Stores.connection stores region.address in
-            Kv.scan connection region.context ~direction:Forward ~start ~stop ~version ~limit:sizes.scan);
-        pause = (fun span -> Unix.sleepf (Core.Time_ns.Span.to_sec span));
-      }
-    in
     let write : _ Ingest.store =
       {
         locate =
@@ -140,25 +133,32 @@ let range ~source ~target ~timeout ~version ~commit_ts ~sizes ~into { start; sto
         pause = (fun span -> Unix.sleepf (Core.Time_ns.Span.to_sec span));
       }
     in
-    let gathered = Pairs.create () and size = ref 0 and keys = ref 0 and bytes = ref 0 and checksum = ref 0L in
+    let gathered = Pairs.create () and size = ref 0 and keys = ref 0 and bytes = ref 0 and checksum = ref 0L and last = ref "" in
     let flush () =
       let delivered = Ingest.deliver write ~commit_ts ~batch:sizes.batch (Pairs.all gathered) in
       Pairs.clear gathered;
       size := 0;
+      last := "";
       delivered
     in
     let%bind () =
       Read.range read ~start ~stop:(Before stop) ~limit:sizes.scan ~f:(fun pairs ->
-          List.iter
-            (fun (pair : Kv.pair) ->
-              let cost = String.length pair.key + String.length pair.value in
-              let key = Codec.retabled ~into pair.key in
-              Pairs.add gathered key pair.value;
-              checksum := Int64.logxor !checksum (Crc64.pair key pair.value);
-              size := !size + cost;
-              incr keys;
-              bytes := !bytes + cost)
-            pairs;
+          let%bind () =
+            Base.List.fold_result pairs ~init:() ~f:(fun () (pair : Kv.pair) ->
+                Option.fold ~none:(Ok ())
+                  ~some:(fun key ->
+                    let%bind value = Renumber.value plan ~key:pair.key pair.value in
+                    let%bind () = if String.compare key !last < 0 then flush () else Ok () in
+                    let cost = String.length key + String.length value in
+                    Pairs.add gathered key value;
+                    last := key;
+                    checksum := Int64.logxor !checksum (Crc64.pair key value);
+                    size := !size + cost;
+                    incr keys;
+                    bytes := !bytes + cost;
+                    Ok ())
+                  (Renumber.key plan pair.key))
+          in
           if !size >= sizes.job then flush () else Ok ())
     in
     let%bind () = flush () in
@@ -169,19 +169,50 @@ let range ~source ~target ~timeout ~version ~commit_ts ~sizes ~into { start; sto
   Pd.close pd;
   copied
 
-let table ~from ~into:onto ~source ~target ~version ~commit_ts { timeout; sizes; workers; stores = tuning } =
-  let%bind source_id = Region.table_id from source in
-  let%bind into = Region.table_id onto target in
-  let pd_of link =
-    let%bind instances = Quiver_mysql.Link.run_query link Pd_instances in
-    match instances with
-    | [| Some address |] :: _ -> Ok address
-    | row :: _ -> Error (`Region (Region.Malformed (Array.to_list row)))
-    | [] -> Error (`Region (Region.Malformed []))
+let pd_of link =
+  let%bind instances = Quiver_mysql.Link.run_query link Pd_instances in
+  match instances with
+  | [| Some address |] :: _ -> Ok address
+  | row :: _ -> Error (`Region (Region.Malformed (Array.to_list row)))
+  | [] -> Error (`Region (Region.Malformed []))
+
+let described link (name : Quiver_core.Schema.Name.t) ~at ~timeout =
+  let%bind table = Region.table_id link name in
+  let%bind address = pd_of link in
+  let%bind pd = Pd.connect ~timeout address in
+  let stores = Stores.create ~timeout in
+  let pairs ~start ~stop =
+    let got = ref [] in
+    let%bind read = reader pd stores ~start ~stop ~version:at ~limit:256 in
+    let%bind () =
+      Read.range read ~start ~stop:(Before stop) ~limit:256 ~f:(fun pairs ->
+          got := List.rev_append pairs !got;
+          Ok ())
+    in
+    Ok (List.rev !got)
   in
+  let info =
+    let start, stop = Codec.databases in
+    let%bind databases = pairs ~start ~stop in
+    let wanted = String.lowercase_ascii (name.database :> string) in
+    let%bind found =
+      Base.List.fold_result databases ~init:None ~f:(fun found (pair : Kv.pair) ->
+          let%bind database, id = Info.database pair.value in
+          Ok (if String.equal database wanted then Some id else found))
+    in
+    let%bind database = Option.to_result ~none:(`Mirror (Undescribed name)) found in
+    let key = Codec.described ~database ~table in
+    let%bind described = pairs ~start:key ~stop:(key ^ "\x00") in
+    match described with [ pair ] -> Info.of_json pair.value | _ -> Error (`Mirror (Undescribed name))
+  in
+  Stores.close stores;
+  Pd.close pd;
+  info
+
+let table ~from ~into:onto ~plan ~version ~commit_ts { timeout; sizes; workers; stores = tuning } =
+  let tables = Renumber.tables plan in
   let%bind source_address = pd_of from in
   let%bind target_address = pd_of onto in
-  let first, past = Codec.table source_id in
   let%bind source_pd = Pd.connect ~timeout source_address in
   let%bind pd =
     Result.map_error
@@ -190,20 +221,26 @@ let table ~from ~into:onto ~source ~target ~version ~commit_ts { timeout; sizes;
         error)
       (Pd.connect ~timeout target_address)
   in
-  let%bind regions =
+  let%bind held =
     Result.map_error
       (fun error ->
         Pd.close source_pd;
         Pd.close pd;
         error)
-      (learned source_pd ~start:first ~stop:(Before past))
+      (Base.Result.all
+         (List.map
+            (fun (source, _) ->
+              let first, past = Codec.table source in
+              learned source_pd ~start:first ~stop:(Before past))
+            tables))
   in
-  let whole = ranges ~source:source_id ~into regions in
+  let regions = List.concat held in
+  let whole = List.concat (List.map2 (fun (source, into) regions -> List.map (fun part -> (into, part)) (ranges ~source regions)) tables held) in
   let parts = Int.max 1 (((4 * workers) + List.length whole - 1) / Int.max 1 (List.length whole)) in
   let stores = Stores.create ~timeout in
   let divided =
     List.concat_map
-      (fun (part : range) ->
+      (fun (into, (part : range)) ->
         let edge direction ~start ~stop =
           Option.bind (Region.find regions start) (fun (region : Region.t) ->
               match
@@ -224,14 +261,23 @@ let table ~from ~into:onto ~source ~target ~version ~commit_ts { timeout; sizes;
               | 0 -> cuts
               | _ -> kinds stop (stop :: cuts))
         in
-        divide ~into part (List.sort_uniq String.compare (List.filter (fun key -> String.compare part.start key < 0 && String.compare key part.stop < 0) (kinds part.start []))))
+        List.map
+          (fun range -> (into, range))
+          (divide part (List.sort_uniq String.compare (List.filter (fun key -> String.compare part.start key < 0 && String.compare key part.stop < 0) (kinds part.start [])))))
       whole
   in
   let split =
-    let target_first, target_past = Codec.table into in
-    let keys = List.sort_uniq String.compare (List.map (fun (part : range) -> part.target_start) divided) in
+    let keys = List.sort_uniq String.compare (List.filter_map (fun (_, (part : range)) -> Renumber.key plan part.start) divided) in
     let rec go keys tries made =
-      let%bind regions = learned pd ~start:target_first ~stop:(Before target_past) in
+      let%bind held =
+        Base.Result.all
+          (List.map
+             (fun (_, into) ->
+               let first, past = Codec.table into in
+               learned pd ~start:first ~stop:(Before past))
+             tables)
+      in
+      let regions = List.sort_uniq (fun (a : Region.t) (b : Region.t) -> Int64.compare a.context.id b.context.id) (List.concat held) in
       let%bind made, refused =
         Base.List.fold_result (cuts regions keys) ~init:(made, []) ~f:(fun (made, refused) ((region : Region.t), keys) ->
             let%bind connection = Stores.connection stores region.address in
@@ -258,8 +304,8 @@ let table ~from ~into:onto ~source ~target ~version ~commit_ts { timeout; sizes;
   let work () =
     Quiver_core.Concurrent.spread ~workers
       (Iarray.of_list divided)
-      (fun range_of_region ->
-        (range ~source:source_address ~target:target_address ~timeout ~version ~commit_ts ~sizes ~into range_of_region
+      (fun part ->
+        (range ~source:source_address ~target:target_address ~timeout ~version ~commit_ts ~sizes ~plan part
           : (copied, failure) result))
   in
   let%bind copied =
@@ -293,7 +339,7 @@ type 'e side = {
   query : Quiver_mysql.Query.t -> (string option array list, 'e) result;
   execute : Quiver_mysql.Statement.t -> (unit, 'e) result;
   server : Quiver_mysql.Server.t;
-  ids : Quiver_core.Schema.Name.t -> (Status.ids, 'e) result;
+  described : Quiver_core.Schema.Name.t -> at:int64 -> (Info.t, 'e) result;
 }
 
 type 'e session = {
@@ -301,7 +347,7 @@ type 'e session = {
   target_side : 'e side;
   cluster : unit cluster;
   name : unit -> string;
-  keys : Quiver_core.Schema.Name.t -> version:int64 -> commit_ts:int64 -> (copied, 'e) result;
+  keys : Renumber.t -> version:int64 -> commit_ts:int64 -> (copied, 'e) result;
 }
 
 let through session ~source ~target =
@@ -311,8 +357,6 @@ let through session ~source ~target =
     let%bind rows = side.query query in
     match rows with [ [| Some value |] ] -> Ok value | row :: _ -> malformed row | [] -> malformed [||]
   in
-  let%bind partitions = one source_side (Partitioned source) in
-  let%bind () = match partitions with "0" -> Ok () | _ -> Error (`Mirror (Partitioned source)) in
   let%bind () =
     match session.cluster with
     | Same_cluster -> Ok ()
@@ -352,16 +396,11 @@ let through session ~source ~target =
         | [] -> malformed [||])
   in
   let copied =
-    let%bind () =
-      match session.cluster with
-      | Same_cluster -> Ok ()
-      | Other_cluster () ->
-          let%bind here = source_side.ids source in
-          let%bind there = target_side.ids service in
-          if here = there then Ok () else Error (`Mirror (Ids_differ { source = here; target = there }))
-    in
     let%bind commit_ts = tso target_side in
-    let%bind copied = session.keys service ~version ~commit_ts in
+    let%bind here = source_side.described source ~at:version in
+    let%bind there = target_side.described service ~at:commit_ts in
+    let%bind plan = Renumber.make ~source:here ~target:there in
+    let%bind copied = session.keys plan ~version ~commit_ts in
     let%bind sums = target_side.query (Checksum service) in
     let%bind () =
       match sums with
@@ -412,13 +451,7 @@ let copy link ~into ~source ~target settings =
       query = Quiver_mysql.Link.run_query link;
       execute = Quiver_mysql.Link.run_statement link;
       server = Quiver_mysql.Link.server link;
-      ids =
-        (fun table ->
-          let%bind rows = Quiver_mysql.Link.run_query link Tidb_status in
-          match rows with
-          | [| Some address |] :: _ -> Status.table ~timeout:settings.timeout address table
-          | row :: _ -> Error (`Region (Region.Malformed (Array.to_list row)))
-          | [] -> Error (`Region (Region.Malformed [])));
+      described = (fun table ~at -> described link table ~at ~timeout:settings.timeout);
     }
   in
   let onto, cluster = match into with Same_cluster -> (link, Same_cluster) | Other_cluster onto -> (onto, Other_cluster ()) in
@@ -428,6 +461,6 @@ let copy link ~into ~source ~target settings =
       target_side = side onto;
       cluster;
       name = (fun () -> "q_" ^ String.init 16 (fun _ -> "0123456789abcdef".[Random.State.int random 16]));
-      keys = (fun service ~version ~commit_ts -> table ~from:link ~into:onto ~source ~target:service ~version ~commit_ts settings);
+      keys = (fun plan ~version ~commit_ts -> table ~from:link ~into:onto ~plan ~version ~commit_ts settings);
     }
     ~source ~target

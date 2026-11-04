@@ -1,4 +1,8 @@
 let () =
+  let plan =
+    let table id : Quiver_tikv.Info.t = { id; columns = []; indexes = []; handle = Row_number; layout = Whole } in
+    match Quiver_tikv.Renumber.make ~source:(table 75L) ~target:(table 300L) with Ok plan -> plan | Error _ -> exit 1
+  in
   let responses = int_of_string Sys.argv.(1) and scan_only = Array.length Sys.argv > 2 && Sys.argv.(2) = "scan" in
   let response first =
     let buffer = Buffer.create (1024 * 100) in
@@ -37,7 +41,7 @@ let () =
         | Ok (Pairs pairs) ->
             List.iter
               (fun (pair : Quiver_tikv.Kv.pair) ->
-                let key = Quiver_tikv.Codec.retabled ~into:300L pair.key in
+                let key = match Quiver_tikv.Renumber.key plan pair.key with Some key -> key | None -> exit 1 in
                 Quiver_tikv.Pairs.add gathered key pair.value;
                 checksum := Int64.logxor !checksum (Quiver_tikv.Crc64.pair key pair.value);
                 size := !size + String.length pair.key + String.length pair.value)

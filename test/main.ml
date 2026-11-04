@@ -55,5 +55,6 @@ let () =
       ("tikv ingest", Test_ingest.tests);
       ("tikv pd", Test_pd.tests);
       ("tikv mirror", Test_mirror.tests);
-      ("tikv status", Test_status.tests);
+      ("tikv info", Test_info.tests);
+      ("tikv renumber", Test_renumber.tests);
     ]

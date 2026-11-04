@@ -540,10 +540,10 @@ let stores () =
   Unix.close listener
 
 let ranges =
-  let first, past = Codec.table 75L and target_first, target_past = Codec.table 300L in
+  let first, past = Codec.table 75L in
   let inside = QCheck2.Gen.(map (fun tail -> first ^ tail) (string_size ~gen:(oneof_list [ '_'; 'i'; 'r'; '\x00'; '\xff' ]) (int_range 0 6))) in
   let bound = QCheck2.Gen.(oneof [ inside; return first; return past; return "t\x7f"; return "u"; map (fun key -> past ^ key) (string_size (int_range 1 3)) ]) in
-  QCheck2.Test.make ~count:3000 ~name:"a table's keys split by regions cover it and the target's keys once, each part where its keys go"
+  QCheck2.Test.make ~count:3000 ~name:"a table's keys split by regions cover it once, each key in one part"
     ~print:(fun (bounds, keys) -> Base.Sexp.to_string ([%sexp_of: string list * string list] (bounds, keys)))
     QCheck2.Gen.(pair (map (List.sort_uniq String.compare) (list_size (int_range 0 8) bound)) (list_size (int_range 0 20) inside))
     (fun (bounds, keys) ->
@@ -560,23 +560,16 @@ let ranges =
             })
           ("" :: bounds)
       in
-      let parts = Mirror.ranges ~source:75L ~into:300L regions in
+      let parts = Mirror.ranges ~source:75L regions in
       let rec chained expected first_of last_of = function
         | [] -> expected
         | (part : Mirror.range) :: rest -> if first_of part = expected && String.compare (first_of part) (last_of part) < 0 then chained (last_of part) first_of last_of rest else "broken"
       in
       chained first (fun (part : Mirror.range) -> part.start) (fun part -> part.stop) parts = past
-      && chained target_first (fun (part : Mirror.range) -> part.target_start) (fun part -> part.target_stop) parts = target_past
       && List.for_all
            (fun key ->
              String.compare key past >= 0
-             || List.exists
-                  (fun (part : Mirror.range) ->
-                    String.compare part.start key <= 0 && String.compare key part.stop < 0
-                    &&
-                    let moved = Codec.retabled ~into:300L key in
-                    String.compare part.target_start moved <= 0 && String.compare moved part.target_stop < 0)
-                  parts)
+             || List.exists (fun (part : Mirror.range) -> String.compare part.start key <= 0 && String.compare key part.stop < 0) parts)
            keys)
 
 let row_key table handle =
@@ -609,15 +602,13 @@ let points =
       && List.for_all (fun key -> List.exists (fun i -> near i key) (List.init parts (fun i -> i + 1))) points
       &&
       let start = fst (Codec.table 75L) and stop = snd (Codec.table 75L) in
-      let whole : Mirror.range = { start; stop; target_start = fst (Codec.table 300L); target_stop = snd (Codec.table 300L) } in
-      let parts = Mirror.divide ~into:300L whole points in
+      let whole : Mirror.range = { start; stop } in
+      let parts = Mirror.divide whole points in
       let rec chained expected first_of last_of = function
         | [] -> expected
         | (part : Mirror.range) :: rest -> if first_of part = expected && String.compare (first_of part) (last_of part) < 0 then chained (last_of part) first_of last_of rest else "broken"
       in
-      chained start (fun (part : Mirror.range) -> part.start) (fun part -> part.stop) parts = stop
-      && chained whole.target_start (fun (part : Mirror.range) -> part.target_start) (fun part -> part.target_stop) parts = whole.target_stop
-      && List.for_all (fun (part : Mirror.range) -> part.start = start || part.target_start = Codec.retabled ~into:300L part.start) parts)
+      chained start (fun (part : Mirror.range) -> part.start) (fun part -> part.stop) parts = stop)
 
 let neighbours () =
   let first = row_key 75L 0x00FFFFFFFFFFFFFFL and last = row_key 75L 0x0100000000000000L in

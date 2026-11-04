@@ -3,7 +3,8 @@
  (deps
   (glob_files tls/*)
   (glob_files innodb/*)
-  (glob_files http2/*))
+  (glob_files http2/*)
+  (glob_files tikv/*))
  (flags
   (:standard -open Stdlib_stable))
  (libraries

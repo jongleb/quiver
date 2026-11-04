@@ -65,13 +65,11 @@ type t =
       (** TiDB: each region's peers, their stores, whether each leads (1 or 0) and the store's
           address. *)
   | Pd_instances  (** TiDB: [host:port] of each PD server. *)
-  | Tidb_status  (** TiDB: [host:port] of each TiDB server's HTTP status service. *)
   | New_collations  (** TiDB: whether the cluster was made with the new collation framework, as [True] or [False]. *)
   | Next_row_ids of Quiver_core.Schema.Name.t
       (** TiDB: each id allocator of the table, the next id it hands out and its kind. *)
   | Checksum of Quiver_core.Schema.Name.t
       (** TiDB: the CRC64 XOR of every key and value of the table, their count and bytes. *)
-  | Partitioned of Quiver_core.Schema.Name.t  (** The number of the table's partitions. *)
   | Base_tables of Quiver_core.Ident.t  (** The database's tables, not views or sequences, by name. *)
       (** TiDB: the table's [TIDB_PK_TYPE], [CLUSTERED] when its rows are kept by its primary key. *)
   | Warnings  (** Level, code and message of the last statement's warnings. *)

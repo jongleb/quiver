@@ -2,7 +2,7 @@ open Sexplib0.Sexp_conv
 open Quiver_tikv
 
 (* Where the model TiDB refuses. *)
-type failing = Never | At_create | At_ids | At_keys | At_checksum | At_rebase | At_rename [@@deriving sexp_of]
+type failing = Never | At_create | At_described | At_keys | At_checksum | At_rebase | At_rename [@@deriving sexp_of]
 
 (* What TiDB's checksum of the copy says against what was copied. *)
 type sums = Same | Fewer_keys | Other_crc [@@deriving sexp_of]
@@ -15,7 +15,7 @@ type other = { collations : agreement; ids : agreement; definition : agreement }
 
 type place = Here | There of other [@@deriving sexp_of]
 
-type case = { place : place; partitions : int; allocators : (string * int64) list; sums : sums; failing : failing }
+type case = { place : place; changing : agreement; partitions : int; allocators : (string * int64) list; sums : sums; failing : failing }
 [@@deriving sexp_of]
 
 let gen =
@@ -27,6 +27,7 @@ let gen =
           return Here;
           map3 (fun collations ids definition -> There { collations; ids; definition }) agreement agreement agreement;
         ]
+    and* changing = oneof_weighted [ (6, return Agree); (1, return Differ) ]
     and* partitions = oneof_weighted [ (5, return 0); (1, int_range 1 4) ]
     and* allocators =
       list_size (int_range 0 4)
@@ -36,29 +37,40 @@ let gen =
     and* sums = oneof_weighted [ (4, return Same); (1, return Fewer_keys); (1, return Other_crc) ]
     and* failing =
       oneof_weighted
-        [ (5, return Never); (1, return At_create); (1, return At_ids); (1, return At_keys); (1, return At_checksum); (1, return At_rebase); (1, return At_rename) ]
+        [ (5, return Never); (1, return At_create); (1, return At_described); (1, return At_keys); (1, return At_checksum); (1, return At_rebase); (1, return At_rename) ]
     in
-    return { place; partitions; allocators; sums; failing })
+    return { place; changing; partitions; allocators; sums; failing })
 
 let name database table : Quiver_core.Schema.Name.t = { database = Support.ident database; table = Support.ident table }
 let source = name "d" "src" and target = name "e" "dst" and service = name "e" "q_model"
 let copied : Mirror.copied = { keys = 10; bytes = 100; checksum = 0x8000_0000_0000_0001L }
-let ids columns : Status.ids = { columns; indexes = [ ("ka", 1) ]; handle = Integer_key }
+let described ~id ~column ~state ~partitions : Info.t =
+  let layout : Info.layout =
+    match List.init partitions (fun i : Info.partition -> { name = Printf.sprintf "p%d" i; id = Int64.add id (Int64.of_int (i + 1)) }) with
+    | first :: rest -> Partitioned (first, rest)
+    | [] -> Whole
+  in
+  {
+    id;
+    columns = [ { name = "a"; id = column; state; missing = Unset; kind = Bytes } ];
+    indexes = [ { name = "ka"; id = 1L; state = Public; scope = Local } ];
+    handle = Integer_key;
+    layout;
+  }
 
 (* Statements, each with the cluster it ran in. *)
 type ran = Source_ran of Quiver_mysql.Statement.t | Target_ran of Quiver_mysql.Statement.t
 
 let run case =
-  let executed = ref [] and keyed = ref [] and source_clock = ref 100L and target_clock = ref 5000L in
+  let executed = ref [] and keyed = ref [] and asked = ref [] and source_clock = ref 100L and target_clock = ref 5000L in
   let refused = Error (`Region (Region.Malformed [ Some "refused" ])) in
   let cell text = Some text in
   let there = match case.place with Here -> None | There there -> Some there in
-  let side ~here ~clock ~collation ~columns ~allocators ~tables : _ Mirror.side =
+  let side ~here ~clock ~collation ~column ~id ~allocators ~tables : _ Mirror.side =
     {
       query =
         (fun query ->
           match query with
-          | Partitioned _ -> Ok [ [| cell (Int.to_string case.partitions) |] ]
           | New_collations -> Ok [ [| cell collation |] ]
           | Binlog_status _ ->
               clock := Int64.add !clock 7L;
@@ -81,18 +93,22 @@ let run case =
           | (Create_like _ | Create_table _), At_create | Rebase _, At_rebase | Rename_table _, At_rename -> refused
           | _ -> Ok ());
       server = Result.get_ok (Quiver_mysql.Server.of_version_string "8.0.11-TiDB-v8.5.8");
-      ids = (fun _ -> match case.failing with At_ids -> refused | _ -> Ok (ids columns));
+      described =
+        (fun table ~at ->
+          asked := (table, at) :: !asked;
+          let state : Info.state = match case.changing with Agree -> Public | Differ -> Changing in
+          match case.failing with At_described -> refused | _ -> Ok (described ~id ~column ~state ~partitions:case.partitions));
     }
   in
-  let source_side = side ~here:(fun statement -> Source_ran statement) ~clock:source_clock ~collation:"True" ~columns:[ ("a", 1) ] ~allocators:case.allocators
+  let source_side = side ~here:(fun statement -> Source_ran statement) ~clock:source_clock ~collation:"True" ~column:1 ~id:75L ~allocators:case.allocators
       ~tables:(match there with None -> [ source; service ] | Some _ -> [ source ]) in
   let target_side, cluster =
     match there with
     | None -> (source_side, Mirror.Same_cluster)
     | Some there ->
         let collation = match there.collations with Agree -> "TRUE" | Differ -> "False"
-        and columns = match there.ids with Agree -> [ ("a", 1) ] | Differ -> [ ("a", 2) ] in
-        (side ~here:(fun statement -> Target_ran statement) ~clock:target_clock ~collation ~columns ~allocators:[] ~tables:[ service ], Other_cluster ())
+        and column = match there.ids with Agree -> 1 | Differ -> 2 in
+        (side ~here:(fun statement -> Target_ran statement) ~clock:target_clock ~collation ~column ~id:300L ~allocators:[] ~tables:[ service ], Other_cluster ())
   in
   let session : _ Mirror.session =
     {
@@ -101,13 +117,13 @@ let run case =
       cluster;
       name = (fun () -> "q_model");
       keys =
-        (fun table ~version ~commit_ts ->
-          keyed := (table, version, commit_ts) :: !keyed;
+        (fun plan ~version ~commit_ts ->
+          keyed := (Renumber.tables plan, version, commit_ts) :: !keyed;
           match case.failing with At_keys -> refused | _ -> Ok copied);
     }
   in
   let result = Mirror.through session ~source ~target in
-  (result, List.rev !executed, List.rev !keyed)
+  (result, List.rev !executed, List.rev !keyed, List.rev !asked)
 
 let show statements =
   String.concat "; "
@@ -123,7 +139,7 @@ let copies =
     ~print:(fun case -> Base.Sexp.to_string_hum (sexp_of_case case))
     gen
     (fun case ->
-      let result, executed, keyed = run case in
+      let result, executed, keyed, asked = run case in
       let ran statement = match case.place with Here -> Source_ran statement | There _ -> Target_ran statement in
       let unknown = List.exists (fun (kind, _) -> kind = "WEIRD") case.allocators in
       let most kinds =
@@ -140,25 +156,34 @@ let copies =
         match case.place with Here -> Create_like { table = service; like = source } | There _ -> Create_table { table = service; body = " (\n  `a` int\n)" }
       in
       let refused = Error (`Region (Region.Malformed [ Some "refused" ])) in
-      let failing = match (case.failing, rebases, case.place) with At_rebase, [] , _ | At_ids, _, Here -> Never | failing, _, _ -> failing in
+      let failing = match (case.failing, rebases) with At_rebase, [] -> Never | failing, _ -> failing in
+      let into = match case.place with Here -> 75L | There _ -> 300L in
+      let physical =
+        match case.partitions with
+        | 0 -> [ (75L, into) ]
+        | n -> List.init n (fun i -> (Int64.of_int (76 + i), Int64.add into (Int64.of_int (i + 1))))
+      in
       let ordered =
         match (keyed, case.place) with
-        | [ (table, version, commit_ts) ], Here -> table = service && Int64.compare version commit_ts < 0
-        | [ (table, version, commit_ts) ], There _ -> table = service && Int64.compare version 1000L < 0 && Int64.compare commit_ts 5000L > 0
+        | [ (tables, version, commit_ts) ], Here -> tables = physical && Int64.compare version commit_ts < 0
+        | [ (tables, version, commit_ts) ], There _ -> tables = physical && Int64.compare version 1000L < 0 && Int64.compare commit_ts 5000L > 0
         | _ -> false
+      in
+      let described_at =
+        match (asked, keyed) with
+        | [ (first, at); (second, later) ], [ (_, version, commit_ts) ] -> first = source && at = version && second = service && later = commit_ts
+        | _, _ -> false
       in
       let dropped = match List.rev executed with last :: _ -> last = ran (Drop_table service) | [] -> false in
       match (result, case.place) with
-      | _ when case.partitions > 0 -> result = Error (`Mirror (Mirror.Partitioned source)) && executed = [] && keyed = []
       | _, There { collations = Differ; _ } ->
           result = Error (`Mirror (Mirror.Collations_differ { source = "True"; target = "False" })) && executed = [] && keyed = []
       | _, There { definition = Differ; _ } -> result = Error (`Mirror (Mirror.Definition source)) && executed = [] && keyed = []
       | _ when failing = At_create -> result = refused && executed = [ ran create ] && keyed = []
-      | _, There { ids = Differ; _ } when failing <> At_ids ->
-          result = Error (`Mirror (Mirror.Ids_differ { source = ids [ ("a", 1) ]; target = ids [ ("a", 2) ] })) && dropped && keyed = []
-      | _ when failing = At_ids -> result = refused && dropped && keyed = []
+      | _ when failing = At_described -> result = refused && dropped && keyed = []
+      | _ when case.changing = Differ -> result = Error (`Renumber (Renumber.Changing "a")) && dropped && keyed = []
       | Ok got, _ ->
-          failing = Never && case.sums = Same && (not unknown) && got = copied && ordered
+          failing = Never && case.sums = Same && (not unknown) && got = copied && ordered && described_at
           && show executed = show (List.map ran ((create :: rebases) @ [ Rename_table { from = service; into = target } ]))
       | Error error, _ ->
           let expected_error =
@@ -171,7 +196,7 @@ let copies =
                 error = `Mirror (Mirror.Mismatch { copied; target })
             | _ when unknown -> error = `Mirror (Mirror.Allocator "WEIRD")
             | (At_rebase | At_rename), Same -> error = `Region (Region.Malformed [ Some "refused" ])
-            | (Never | At_create | At_ids), Same -> false
+            | (Never | At_create | At_described), Same -> false
           in
           expected_error && ordered && dropped
           && List.for_all (fun ran -> match (ran, case.place) with Source_ran _, There _ -> false | _ -> true) executed

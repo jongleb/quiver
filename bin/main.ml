@@ -747,10 +747,16 @@ let () =
     | Error error ->
         let () =
           match error with
-          | `Mirror (Quiver_tikv.Mirror.Ids_differ _) ->
+          | `Renumber (Quiver_tikv.Renumber.Missing _ | Old_row) ->
               Format.eprintf
-                "hint: the source's columns or indexes have other ids than a table made by its definition, as \
-                 after a column dropped or added in the middle; quiver copy copies it through SQL@."
+                "hint: the source has rows its copy would read otherwise: written before a column was added \
+                 with a default quiver does not write into them (JSON, TIMESTAMP of TiDB before 3.0, a character \
+                 set other than utf8mb4, utf8, ascii, latin1 and binary), or in TiDB's first row format; quiver \
+                 copy copies the table through SQL@."
+          | `Renumber (Quiver_tikv.Renumber.Changing _ | Rearranging) ->
+              Format.eprintf "hint: the table's schema or partitions are being changed; copy it once the change is done@."
+          | `Renumber (Quiver_tikv.Renumber.Global_index _) ->
+              Format.eprintf "hint: a global index names partitions in its values, which mirror does not move; quiver copy copies the table through SQL@."
           | _ -> ()
         in
         failed
@@ -760,7 +766,8 @@ let () =
              | `Wire of Quiver_mysql.Wire.error
              | `Ident of Quiver_core.Ident.error
              | `Read of Quiver_tikv.Read.error
-             | `Status of Quiver_tikv.Status.error
+             | `Info of Quiver_tikv.Info.error
+             | `Renumber of Quiver_tikv.Renumber.error
              | `Ingest of Quiver_tikv.Ingest.error
              | `Pd of Quiver_tikv.Pd.error
              | `Region of Quiver_tikv.Region.error
@@ -1629,8 +1636,8 @@ let () =
             the $(b,--to-host) options name, as TiKV keeps them: rows and indexes read at one TSO \
             and imported under the new tables' ids, with no SQL on the way, checked against TiDB's \
             checksum. Into another cluster the two must agree on new collations, and the copy is \
-            made by the source's definition, its columns' and indexes' ids checked against the \
-            source's through TiDB's status port")
+            made by the source's definition; where its columns and indexes have other ids, as \
+            after the source's ALTERs, keys and rows are written under the copy's")
       Term.(const mirror $ server `Source $ other_server $ database $ into $ tables $ workers $ stores)
   in
   let copy_cmd =

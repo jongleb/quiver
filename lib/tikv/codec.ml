@@ -54,3 +54,9 @@ let kind_end key =
     increment (String.sub key 0 19) 18
   else if length >= 11 && String.sub key 9 2 = "_r" then Some (String.sub key 0 9 ^ "_s")
   else None
+
+let hashed key = "m" ^ encode_bytes key ^ "\x00\x00\x00\x00\x00\x00\x00h"
+let databases =
+  let first = hashed "DBs" in
+  (first, String.sub first 0 (String.length first - 1) ^ "i")
+let described ~database ~table = hashed ("DB:" ^ Int64.to_string database) ^ encode_bytes ("Table:" ^ Int64.to_string table)

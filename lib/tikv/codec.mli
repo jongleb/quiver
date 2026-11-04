@@ -28,3 +28,9 @@ val retabled : into:int64 -> string -> string
 val kind_end : string -> string option
 (** The first key past the index, or the rows, of the table this key is of: what keys of one kind
     span. *)
+
+val databases : string * string
+(** The first meta key describing a database and the first key past those. *)
+
+val described : database:int64 -> table:int64 -> string
+(** The meta key describing the table of this database. *)

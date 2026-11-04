@@ -76,7 +76,8 @@ let () =
                ([%sexp_of:
                   [ `Mirror of Quiver_tikv.Mirror.error
                   | `Read of Quiver_tikv.Read.error
-                  | `Status of Quiver_tikv.Status.error
+                  | `Info of Quiver_tikv.Info.error
+                  | `Renumber of Quiver_tikv.Renumber.error
                   | `Pd of Quiver_tikv.Pd.error
                   | `Ingest of Quiver_tikv.Ingest.error
                   | `Region of Quiver_tikv.Region.error

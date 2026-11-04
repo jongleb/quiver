@@ -1092,10 +1092,14 @@ module Make (S : Quiver_core.Sink_intf.S) = struct
             Await.Await.Ivar.fill_if_empty finishing None;
             let answer = Await.Await.Ivar.read Quiver_core.Blocking.await answered in
             Await.Await.Mpmc_queue.push outbox Last;
-            Option.iter
-              (fun (downstream : downstream) -> Channel.finish downstream.control)
-              forward;
-            report (Result.bind controlled (fun () -> answer)))
+            let outcome = Result.bind controlled (fun () -> answer) in
+            report outcome;
+            Result.iter
+              (fun () ->
+                Option.iter
+                  (fun (downstream : downstream) -> Channel.finish downstream.control)
+                  forward)
+              outcome)
           ~unstarted:ignore;
         launch (fun () -> write 0) ~unstarted:ignore;
       ]

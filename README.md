@@ -635,10 +635,15 @@ on `-w` workers, and imported through `ImportSST` under the copy's table id, at 
 it. TiDB's `ADMIN CHECKSUM TABLE` must equal quiver's own CRC64 of what it wrote; then the id
 allocators move past the source's and the copy is renamed. On any failure it is dropped.
 
-Into another cluster the two must agree on new collations, and the copy's column and index ids
-must be the source's, read from TiDB's status port. A table altered since it was made, with a
-column dropped and added, has other ids and is refused, with nothing left behind; `quiver copy`
-moves it through SQL. Partitioned tables are refused too. `--store-mode import` keeps every TiKV
+Both tables are described as TiKV keeps them at the versions read and written. Into another
+cluster the two must agree on new collations, and where the copy's columns and indexes have other
+ids, as after the source's `ALTER`s, keys, rows and what indexes keep to restore their columns are
+written under the copy's; keys of a dropped index, until TiKV collects them, stay behind. A row
+written before a column was added with a default gets that default written in, as TiDB writes it;
+a default quiver does not write (JSON other than null, a `TIMESTAMP` of TiDB before 3.0, another
+character set) refuses the table, with nothing left behind, and `quiver copy` moves it through SQL.
+A partitioned table is copied partition by partition, each into the copy's partition of its name;
+one with a global index is refused. `--store-mode import` keeps every TiKV
 in import mode during the copy, as `IMPORT INTO` does; on one machine it made copies slower, so
 it is off by default.
 

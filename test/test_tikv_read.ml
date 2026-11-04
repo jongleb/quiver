@@ -292,9 +292,6 @@ let queries () =
   Alcotest.(check string) "PD" "SELECT INSTANCE FROM information_schema.CLUSTER_INFO WHERE TYPE = 'pd'" (Quiver_mysql.Query.sql Pd_instances);
   Alcotest.(check string) "allocators" "SHOW TABLE `d`.`t'` NEXT_ROW_ID" (Quiver_mysql.Query.sql (Next_row_ids name));
   Alcotest.(check string) "checksum" "ADMIN CHECKSUM TABLE `d`.`t'`" (Quiver_mysql.Query.sql (Checksum name));
-  Alcotest.(check string) "partitions"
-    "SELECT COUNT(*) FROM information_schema.PARTITIONS WHERE TABLE_SCHEMA = _utf8mb4 X'64' AND TABLE_NAME = _utf8mb4 X'7427' AND PARTITION_NAME IS NOT NULL"
-    (Quiver_mysql.Query.sql (Partitioned name));
   let copy : Quiver_core.Schema.Name.t = { database = Support.ident "d"; table = Support.ident "q_1" } in
   Alcotest.(check string) "made like" "CREATE TABLE `d`.`q_1` LIKE `d`.`t'`" (Quiver_mysql.Statement.sql (Create_like { table = copy; like = name }));
   Alcotest.(check string) "row ids moved on" "ALTER TABLE `d`.`q_1` AUTO_INCREMENT = 30001"

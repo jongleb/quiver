@@ -1,8 +1,8 @@
 @@ portable
 
-(** A table's keys copied as they are into another table of the same TiDB cluster: rows and
-    indexes read from TiKV at one version and imported under the other table's id. The tables
-    must agree on the ids of their columns and indexes, as [CREATE TABLE … LIKE] makes them. *)
+(** A table's keys copied into another table, of the same TiDB cluster or another: rows and
+    indexes read from TiKV at one version and imported under the other table's ids
+    ({!Renumber}). *)
 
 type sizes = {
   scan : int;  (** Keys a read asks TiKV for at a time. *)
@@ -27,29 +27,25 @@ type copied = { keys : int; bytes : int; checksum : int64 } [@@deriving sexp_of 
     checksum of a table sums them. *)
 
 type error =
-  | Partitioned of Quiver_core.Schema.Name.t  (** Its partitions would get new ids in the copy. *)
   | Mismatch of { copied : copied; target : copied }  (** TiDB's checksum of the target differs. *)
   | Allocator of string  (** An id allocator of a kind this side does not know. *)
   | Collations_differ of { source : string; target : string }
       (** The clusters' [new_collation_enabled]: an index's keys would be encoded otherwise. *)
   | Definition of Quiver_core.Schema.Name.t  (** Its [SHOW CREATE TABLE] does not start with its name. *)
-  | Ids_differ of { source : Status.ids; target : Status.ids }
-      (** The ids of the columns and indexes of the source and its copy in the other cluster, as
-          after the source's [ALTER]s: its keys and values would not read as the copy's. *)
+  | Undescribed of Quiver_core.Schema.Name.t  (** No description of the table under TiKV's meta keys. *)
 [@@deriving sexp_of ~portable]
 
-(** Keys of the source from [start] up to [stop], and the same keys in the target. *)
-type range = { start : string; stop : string; target_start : string; target_stop : string }
+(** Keys of the source from [start] up to [stop]. *)
+type range = { start : string; stop : string }
 
-val ranges : source:int64 -> into:int64 -> Region.t list -> range list
-(** The source table's keys split at the bounds of its regions, each part also as the target
-    table's keys. *)
+val ranges : source:int64 -> Region.t list -> range list
+(** The source table's keys split at the bounds of its regions. *)
 
 val points : first:string -> last:string -> parts:int -> string list
 (** Up to [parts - 1] keys after [first] and up to [last], evenly apart in the eight bytes after
     their common prefix: a row's handle, when they are keys of rows. *)
 
-val divide : into:int64 -> range -> string list -> range list
+val divide : range -> string list -> range list
 (** The range cut at these keys, in order, all inside it. *)
 
 val cuts : Region.t list -> string list -> (Region.t * string list) list
@@ -58,13 +54,13 @@ val cuts : Region.t list -> string list -> (Region.t * string list) list
 val table :
   from:Quiver_mysql.Link.t ->
   into:Quiver_mysql.Link.t ->
-  source:Quiver_core.Schema.Name.t ->
-  target:Quiver_core.Schema.Name.t ->
+  plan:Renumber.t ->
   version:int64 ->
   commit_ts:int64 ->
   settings ->
   ( copied,
     [> `Read of Read.error
+    | `Renumber of Renumber.error
     | `Pd of Pd.error
     | `Ingest of Ingest.error
     | `Region of Region.error
@@ -76,11 +72,33 @@ val table :
     | `Http2 of Http2.error
     | `Hpack of Hpack.error ] )
   result
-(** [source]'s keys as of [version] into [target] at [commit_ts], which must be later than any
-    version [target] holds; the TiDB of each, [from] and [into], the same or of two clusters, names
-    its cluster's PD, which the regions of its table are learned from;
-    each region of [source], cut at keys evenly apart, copied by one of the workers; [target] split
-    at the same keys and its regions scattered first. *)
+(** The keys of the plan's source table, or of each of its partitions, as of [version] into the
+    copy's at [commit_ts], which must be later than any version the copy holds; the TiDB of each,
+    [from] and [into], the same or of two clusters, names its cluster's PD, which the regions of
+    their tables are learned from; each region of the source, cut at keys evenly apart, copied by
+    one of the workers; the target split at the same keys and its regions scattered first. *)
+
+val described :
+  Quiver_mysql.Link.t ->
+  Quiver_core.Schema.Name.t ->
+  at:int64 ->
+  timeout:Core.Time_ns.Span.t ->
+  ( Info.t,
+    [> `Mirror of error
+    | `Info of Info.error
+    | `Read of Read.error
+    | `Pd of Pd.error
+    | `Region of Region.error
+    | `Link of Quiver_mysql.Link.error
+    | `Wire of Quiver_mysql.Wire.error
+    | `Transport of Quiver_mysql.Transport.error
+    | `Proto of Proto.error
+    | `Grpc of Grpc.error
+    | `Http2 of Http2.error
+    | `Hpack of Hpack.error ] )
+  result
+@@ nonportable
+(** The table as its TiKV keeps its description at this version. *)
 
 (** Where the copy goes. *)
 type 'link cluster = Same_cluster | Other_cluster of 'link  (** Another cluster, through its TiDB. *)
@@ -89,7 +107,7 @@ type 'e side = {
   query : Quiver_mysql.Query.t -> (string option array list, 'e) result;
   execute : Quiver_mysql.Statement.t -> (unit, 'e) result;
   server : Quiver_mysql.Server.t;
-  ids : Quiver_core.Schema.Name.t -> (Status.ids, 'e) result;  (** What the cluster's TiDB says of the table. *)
+  described : Quiver_core.Schema.Name.t -> at:int64 -> (Info.t, 'e) result;  (** The table at this version. *)
 }
 (** How a copy reaches one cluster's TiDB. *)
 
@@ -98,13 +116,13 @@ type 'e session = {
   target_side : 'e side;
   cluster : unit cluster;
   name : unit -> string;  (** A table name no table has, for the copy while it is made. *)
-  keys : Quiver_core.Schema.Name.t -> version:int64 -> commit_ts:int64 -> (copied, 'e) result;
-      (** The source's keys as of [version] into this table at [commit_ts]. *)
+  keys : Renumber.t -> version:int64 -> commit_ts:int64 -> (copied, 'e) result;
+      (** The plan's keys as of [version] into the copy at [commit_ts]. *)
 }
 (** How a copy reaches TiDB and TiKV. *)
 
 val through :
-  ([> `Mirror of error | `Region of Region.error ] as 'e) session ->
+  ([> `Mirror of error | `Region of Region.error | `Renumber of Renumber.error ] as 'e) session ->
   source:Quiver_core.Schema.Name.t ->
   target:Quiver_core.Schema.Name.t ->
   (copied, 'e) result
@@ -118,7 +136,8 @@ val copy :
   settings ->
   ( copied,
     [> `Mirror of error
-    | `Status of Status.error
+    | `Info of Info.error
+    | `Renumber of Renumber.error
     | `Read of Read.error
     | `Pd of Pd.error
     | `Ingest of Ingest.error
@@ -134,6 +153,6 @@ val copy :
 @@ nonportable
 (** [source] as of now into a new table [target], in its cluster or another: made under a name of
     its own ([LIKE] it, or by its definition in the other cluster, where the two clusters must agree
-    on collations and the copy's columns and indexes on their ids), its keys copied by {!table} at a
-    later version of the target's cluster, checked against TiDB's checksum, its id allocators moved
-    past the source's, renamed; dropped on any failure. *)
+    on collations), its keys copied by {!table} at a later version of the target's cluster under the
+    copy's ids, as both tables are described at those versions, checked against TiDB's checksum,
+    its id allocators moved past the source's, renamed; dropped on any failure. *)

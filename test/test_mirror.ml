@@ -15,7 +15,10 @@ type other = { collations : agreement; ids : agreement; definition : agreement }
 
 type place = Here | There of other [@@deriving sexp_of]
 
-type case = { place : place; changing : agreement; partitions : int; allocators : (string * int64) list; sums : sums; failing : failing }
+(* What the source's GC says of the copy's version: held, passed it already, or passed it meanwhile. *)
+type holding = Held | Passed_before | Lapsed [@@deriving sexp_of]
+
+type case = { place : place; changing : agreement; partitions : int; allocators : (string * int64) list; sums : sums; failing : failing; holding : holding }
 [@@deriving sexp_of]
 
 let gen =
@@ -38,8 +41,8 @@ let gen =
     and* failing =
       oneof_weighted
         [ (5, return Never); (1, return At_create); (1, return At_described); (1, return At_keys); (1, return At_checksum); (1, return At_rebase); (1, return At_rename) ]
-    in
-    return { place; changing; partitions; allocators; sums; failing })
+    and* holding = oneof_weighted [ (6, return Held); (1, return Passed_before); (1, return Lapsed) ] in
+    return { place; changing; partitions; allocators; sums; failing; holding })
 
 let name database table : Quiver_core.Schema.Name.t = { database = Support.ident database; table = Support.ident table }
 let source = name "d" "src" and target = name "e" "dst" and service = name "e" "q_model"
@@ -62,7 +65,7 @@ let described ~id ~column ~state ~partitions : Info.t =
 type ran = Source_ran of Quiver_mysql.Statement.t | Target_ran of Quiver_mysql.Statement.t
 
 let run case =
-  let executed = ref [] and keyed = ref [] and asked = ref [] and source_clock = ref 100L and target_clock = ref 5000L in
+  let executed = ref [] and keyed = ref [] and asked = ref [] and holding = ref None and source_clock = ref 100L and target_clock = ref 5000L in
   let refused = Error (`Region (Region.Malformed [ Some "refused" ])) in
   let cell text = Some text in
   let there = match case.place with Here -> None | There there -> Some there in
@@ -95,7 +98,7 @@ let run case =
       server = Result.get_ok (Quiver_mysql.Server.of_version_string "8.0.11-TiDB-v8.5.8");
       described =
         (fun table ~at ->
-          asked := (table, at) :: !asked;
+          asked := (table, at, !holding) :: !asked;
           let state : Info.state = match case.changing with Agree -> Public | Differ -> Changing in
           match case.failing with At_described -> refused | _ -> Ok (described ~id ~column ~state ~partitions:case.partitions));
     }
@@ -118,8 +121,18 @@ let run case =
       name = (fun () -> "q_model");
       keys =
         (fun plan ~version ~commit_ts ->
-          keyed := (Renumber.tables plan, version, commit_ts) :: !keyed;
+          keyed := (Renumber.tables plan, version, commit_ts, !holding) :: !keyed;
           match case.failing with At_keys -> refused | _ -> Ok copied);
+      kept =
+        (fun ~version work ->
+          let passed = Error (`Pd (Pd.Gc_passed { version; least = Int64.succ version })) in
+          match case.holding with
+          | Passed_before -> passed
+          | Held | Lapsed ->
+              holding := Some version;
+              let result = work () in
+              holding := None;
+              Result.bind result (fun result -> match case.holding with Lapsed -> passed | Held | Passed_before -> Ok result));
     }
   in
   let result = Mirror.through session ~source ~target in
@@ -165,13 +178,15 @@ let copies =
       in
       let ordered =
         match (keyed, case.place) with
-        | [ (tables, version, commit_ts) ], Here -> tables = physical && Int64.compare version commit_ts < 0
-        | [ (tables, version, commit_ts) ], There _ -> tables = physical && Int64.compare version 1000L < 0 && Int64.compare commit_ts 5000L > 0
+        | [ (tables, version, commit_ts, held) ], Here -> tables = physical && Int64.compare version commit_ts < 0 && held = Some version
+        | [ (tables, version, commit_ts, held) ], There _ ->
+            tables = physical && Int64.compare version 1000L < 0 && Int64.compare commit_ts 5000L > 0 && held = Some version
         | _ -> false
       in
       let described_at =
         match (asked, keyed) with
-        | [ (first, at); (second, later) ], [ (_, version, commit_ts) ] -> first = source && at = version && second = service && later = commit_ts
+        | [ (first, at, held); (second, later, _) ], [ (_, version, commit_ts, _) ] ->
+            first = source && at = version && held = Some version && second = service && later = commit_ts
         | _, _ -> false
       in
       let dropped = match List.rev executed with last :: _ -> last = ran (Drop_table service) | [] -> false in
@@ -180,15 +195,19 @@ let copies =
           result = Error (`Mirror (Mirror.Collations_differ { source = "True"; target = "False" })) && executed = [] && keyed = []
       | _, There { definition = Differ; _ } -> result = Error (`Mirror (Mirror.Definition source)) && executed = [] && keyed = []
       | _ when failing = At_create -> result = refused && executed = [ ran create ] && keyed = []
+      | Error (`Pd (Pd.Gc_passed _)), _ when case.holding = Passed_before -> dropped && keyed = [] && asked = []
+      | _ when case.holding = Passed_before -> false
       | _ when failing = At_described -> result = refused && dropped && keyed = []
       | _ when case.changing = Differ -> result = Error (`Renumber (Renumber.Changing "a")) && dropped && keyed = []
       | Ok got, _ ->
-          failing = Never && case.sums = Same && (not unknown) && got = copied && ordered && described_at
+          case.holding = Held && failing = Never && case.sums = Same && (not unknown) && got = copied && ordered && described_at
           && show executed = show (List.map ran ((create :: rebases) @ [ Rename_table { from = service; into = target } ]))
       | Error error, _ ->
           let expected_error =
             match (failing, case.sums) with
-            | At_keys, _ | At_checksum, _ -> error = `Region (Region.Malformed [ Some "refused" ])
+            | At_keys, _ -> error = `Region (Region.Malformed [ Some "refused" ])
+            | _ when case.holding = Lapsed -> ( match error with `Pd (Pd.Gc_passed _) -> true | _ -> false)
+            | At_checksum, _ -> error = `Region (Region.Malformed [ Some "refused" ])
             | _, (Fewer_keys | Other_crc) ->
                 let target : Mirror.copied =
                   { copied with keys = (if case.sums = Fewer_keys then copied.keys - 1 else copied.keys); checksum = (if case.sums = Other_crc then 1L else copied.checksum) }

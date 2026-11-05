@@ -196,6 +196,42 @@ value quiver_tls_mutual(value certificate, value key, value peers)
   CAMLreturn(quiver_context(ctx));
 }
 
+/* A client offering only the ALPN protocol h2, TLS 1.2 or 1.3. [trust] as for
+   [quiver_tls_client]; [identity] is the constant [Anonymous] or the block
+   [Presenting { certificate; key }] of PEM files. Returns [Ok context] or the
+   constant constructor of [Tls.unusable], as [quiver_tls_mutual] does, 4 for
+   the trusted certificates. */
+value quiver_tls_http2(value trust, value identity)
+{
+  CAMLparam2(trust, identity);
+  static const unsigned char h2[] = {2, 'h', '2'};
+  SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+  int failure = -1;
+  if (ctx == NULL) CAMLreturn(quiver_error(0));
+  SSL_CTX_set_mode(ctx, SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER | SSL_MODE_AUTO_RETRY);
+  if (!SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION)
+      || !SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION)
+      || SSL_CTX_set_alpn_protos(ctx, h2, sizeof(h2)) != 0)
+    failure = 0;
+  else if (Is_block(identity)
+           && SSL_CTX_use_certificate_chain_file(ctx, String_val(Field(identity, 0))) <= 0)
+    failure = 1;
+  else if (Is_block(identity)
+           && SSL_CTX_use_PrivateKey_file(ctx, String_val(Field(identity, 1)), SSL_FILETYPE_PEM) <= 0)
+    failure = 2;
+  else if (Is_block(identity) && !SSL_CTX_check_private_key(ctx))
+    failure = 3;
+  else if (!(Is_block(trust)
+                 ? SSL_CTX_load_verify_locations(ctx, String_val(Field(trust, 0)), NULL) == 1
+                 : quiver_system_roots(ctx)))
+    failure = 4;
+  if (failure >= 0) {
+    SSL_CTX_free(ctx);
+    CAMLreturn(quiver_error(failure));
+  }
+  CAMLreturn(quiver_context(ctx));
+}
+
 /* Returns [Ok session] or [Error 0]. */
 value quiver_tls_session(value context, value fd)
 {
@@ -384,6 +420,23 @@ static X509 *quiver_peer(struct quiver_session *session)
   pthread_mutex_unlock(&session->lock);
   caml_leave_blocking_section();
   return certificate;
+}
+
+/* The ALPN protocol the server chose, or "". */
+value quiver_tls_alpn(value v)
+{
+  CAMLparam1(v);
+  struct quiver_session *session = Session_val(v);
+  const unsigned char *data = NULL;
+  unsigned int length = 0;
+  char chosen[256];
+  caml_enter_blocking_section();
+  pthread_mutex_lock(&session->lock);
+  SSL_get0_alpn_selected(session->ssl, &data, &length);
+  if (data != NULL) memcpy(chosen, data, length);
+  pthread_mutex_unlock(&session->lock);
+  caml_leave_blocking_section();
+  CAMLreturn(caml_alloc_initialized_string(data == NULL ? 0 : length, chosen));
 }
 
 value quiver_tls_verify_result(value v)

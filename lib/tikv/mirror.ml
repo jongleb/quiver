@@ -3,6 +3,7 @@ open Base.Result.Let_syntax
 type sizes = { scan : int; job : int; batch : int }
 type stores = Imported | Untouched
 type settings = { timeout : Core.Time_ns.Span.t; sizes : sizes; workers : int; stores : stores }
+type reached = { link : Quiver_mysql.Link.t; security : Http2.security }
 type copied = { keys : int; bytes : int; checksum : int64 } [@@deriving sexp_of ~portable]
 
 type error =
@@ -100,18 +101,19 @@ let reader pd stores ~start ~stop ~version ~limit =
      }
       : _ Read.store)
 
-let range ~source ~target ~timeout ~version ~commit_ts ~sizes ~plan (into, { start; stop }) =
-  let%bind source_pd = Pd.connect ~timeout source in
+let range ~source ~target ~version ~commit_ts ~sizes ~plan (into, { start; stop }) =
+  let source_address, source_dial = source and target_address, target_dial = target in
+  let%bind source_pd = Pd.connect source_dial source_address in
   let%bind pd =
     Result.map_error
       (fun error ->
         Pd.close source_pd;
         error)
-      (Pd.connect ~timeout target)
+      (Pd.connect target_dial target_address)
   in
-  let stores = Stores.create ~timeout and random = Random.State.make_self_init () in
+  let source_stores = Stores.create source_dial and stores = Stores.create target_dial and random = Random.State.make_self_init () in
   let copied =
-    let%bind read = reader source_pd stores ~start ~stop ~version ~limit:sizes.scan in
+    let%bind read = reader source_pd source_stores ~start ~stop ~version ~limit:sizes.scan in
     let target_start, target_stop = Codec.table into in
     let%bind target_regions = learned pd ~start:target_start ~stop:(Before target_stop) in
     let write : _ Ingest.store =
@@ -164,6 +166,7 @@ let range ~source ~target ~timeout ~version ~commit_ts ~sizes ~plan (into, { sta
     let%bind () = flush () in
     Ok { keys = !keys; bytes = !bytes; checksum = !checksum }
   in
+  Stores.close source_stores;
   Stores.close stores;
   Pd.close source_pd;
   Pd.close pd;
@@ -176,11 +179,11 @@ let pd_of link =
   | row :: _ -> Error (`Region (Region.Malformed (Array.to_list row)))
   | [] -> Error (`Region (Region.Malformed []))
 
-let described link (name : Quiver_core.Schema.Name.t) ~at ~timeout =
+let described link (name : Quiver_core.Schema.Name.t) ~at ~dial =
   let%bind table = Region.table_id link name in
   let%bind address = pd_of link in
-  let%bind pd = Pd.connect ~timeout address in
-  let stores = Stores.create ~timeout in
+  let%bind pd = Pd.connect dial address in
+  let stores = Stores.create dial in
   let pairs ~start ~stop =
     let got = ref [] in
     let%bind read = reader pd stores ~start ~stop ~version:at ~limit:256 in
@@ -209,17 +212,19 @@ let described link (name : Quiver_core.Schema.Name.t) ~at ~timeout =
   Pd.close pd;
   info
 
-let table ~from ~into:onto ~plan ~version ~commit_ts { timeout; sizes; workers; stores = tuning } =
+let table ~(from : reached) ~(into : reached) ~plan ~version ~commit_ts { timeout; sizes; workers; stores = tuning } =
   let tables = Renumber.tables plan in
-  let%bind source_address = pd_of from in
-  let%bind target_address = pd_of onto in
-  let%bind source_pd = Pd.connect ~timeout source_address in
+  let source_dial : Http2.dial = { timeout; security = from.security }
+  and target_dial : Http2.dial = { timeout; security = into.security } in
+  let%bind source_address = pd_of from.link in
+  let%bind target_address = pd_of into.link in
+  let%bind source_pd = Pd.connect source_dial source_address in
   let%bind pd =
     Result.map_error
       (fun error ->
         Pd.close source_pd;
         error)
-      (Pd.connect ~timeout target_address)
+      (Pd.connect target_dial target_address)
   in
   let%bind held =
     Result.map_error
@@ -237,14 +242,14 @@ let table ~from ~into:onto ~plan ~version ~commit_ts { timeout; sizes; workers; 
   let regions = List.concat held in
   let whole = List.concat (List.map2 (fun (source, into) regions -> List.map (fun part -> (into, part)) (ranges ~source regions)) tables held) in
   let parts = Int.max 1 (((4 * workers) + List.length whole - 1) / Int.max 1 (List.length whole)) in
-  let stores = Stores.create ~timeout in
+  let source_stores = Stores.create source_dial and stores = Stores.create target_dial in
   let divided =
     List.concat_map
       (fun (into, (part : range)) ->
         let edge direction ~start ~stop =
           Option.bind (Region.find regions start) (fun (region : Region.t) ->
               match
-                Result.bind (Stores.connection stores region.address) (fun connection ->
+                Result.bind (Stores.connection source_stores region.address) (fun connection ->
                     Kv.scan connection region.context ~direction ~start ~stop:(Before stop) ~version ~limit:1)
               with
               | Ok (Pairs [ pair ]) -> Some pair.key
@@ -297,6 +302,7 @@ let table ~from ~into:onto ~plan ~version ~commit_ts { timeout; sizes; workers; 
     match made with [] -> Ok () | _ :: _ -> Result.map ignore (Pd.scatter pd (List.sort_uniq Int64.compare made))
   in
   let tikv = Pd.stores pd in
+  Stores.close source_stores;
   Stores.close stores;
   Pd.close source_pd;
   Pd.close pd;
@@ -305,7 +311,7 @@ let table ~from ~into:onto ~plan ~version ~commit_ts { timeout; sizes; workers; 
     Quiver_core.Concurrent.spread ~workers
       (Iarray.of_list divided)
       (fun part ->
-        (range ~source:source_address ~target:target_address ~timeout ~version ~commit_ts ~sizes ~plan part
+        (range ~source:(source_address, source_dial) ~target:(target_address, target_dial) ~version ~commit_ts ~sizes ~plan part
           : (copied, failure) result))
   in
   let%bind copied =
@@ -314,7 +320,7 @@ let table ~from ~into:onto ~plan ~version ~commit_ts { timeout; sizes; workers; 
     | Imported ->
         Import.held ~every:(Core.Time_ns.Span.of_int_sec 300)
           (fun mode ->
-            let stores = Stores.create ~timeout in
+            let stores = Stores.create target_dial in
             let switched =
               Base.List.fold_result tikv ~init:() ~f:(fun () address ->
                   let%bind connection = Stores.connection stores address in
@@ -348,6 +354,7 @@ type 'e session = {
   cluster : unit cluster;
   name : unit -> string;
   keys : Renumber.t -> version:int64 -> commit_ts:int64 -> (copied, 'e) result;
+  kept : version:int64 -> (unit -> (copied, 'e) result) -> (copied, 'e) result;
 }
 
 let through session ~source ~target =
@@ -396,11 +403,14 @@ let through session ~source ~target =
         | [] -> malformed [||])
   in
   let copied =
-    let%bind commit_ts = tso target_side in
-    let%bind here = source_side.described source ~at:version in
-    let%bind there = target_side.described service ~at:commit_ts in
-    let%bind plan = Renumber.make ~source:here ~target:there in
-    let%bind copied = session.keys plan ~version ~commit_ts in
+    let%bind copied =
+      session.kept ~version (fun () ->
+          let%bind commit_ts = tso target_side in
+          let%bind here = source_side.described source ~at:version in
+          let%bind there = target_side.described service ~at:commit_ts in
+          let%bind plan = Renumber.make ~source:here ~target:there in
+          session.keys plan ~version ~commit_ts)
+    in
     let%bind sums = target_side.query (Checksum service) in
     let%bind () =
       match sums with
@@ -444,23 +454,35 @@ let through session ~source ~target =
   let () = match copied with Ok _ -> () | Error _ -> ignore (target_side.execute (Drop_table service)) in
   copied
 
-let copy link ~into ~source ~target settings =
+let copy (from : reached) ~into ~source ~target settings =
   let random = Random.State.make_self_init () in
-  let side link =
+  let side ({ link; security } : reached) =
     {
       query = Quiver_mysql.Link.run_query link;
       execute = Quiver_mysql.Link.run_statement link;
       server = Quiver_mysql.Link.server link;
-      described = (fun table ~at -> described link table ~at ~timeout:settings.timeout);
+      described = (fun table ~at -> described link table ~at ~dial:{ timeout = settings.timeout; security });
     }
   in
-  let onto, cluster = match into with Same_cluster -> (link, Same_cluster) | Other_cluster onto -> (onto, Other_cluster ()) in
+  let onto, cluster = match into with Same_cluster -> (from, Same_cluster) | Other_cluster onto -> (onto, Other_cluster ()) in
+  let hex () = String.init 16 (fun _ -> "0123456789abcdef".[Random.State.int random 16]) in
   through
     {
-      source_side = side link;
+      source_side = side from;
       target_side = side onto;
       cluster;
-      name = (fun () -> "q_" ^ String.init 16 (fun _ -> "0123456789abcdef".[Random.State.int random 16]));
-      keys = (fun plan ~version ~commit_ts -> table ~from:link ~into:onto ~plan ~version ~commit_ts settings);
+      name = (fun () -> "q_" ^ hex ());
+      keys = (fun plan ~version ~commit_ts -> table ~from ~into:onto ~plan ~version ~commit_ts settings);
+      kept =
+        (fun ~version work ->
+          let%bind address = pd_of from.link in
+          let service = "quiver_mirror_" ^ hex () and dial : Http2.dial = { timeout = settings.timeout; security = from.security } in
+          Pd.held ~every:(Core.Time_ns.Span.of_int_sec 60)
+            (fun hold ->
+              let%bind pd = Pd.connect dial address in
+              let kept = Pd.keep pd ~service hold version in
+              Pd.close pd;
+              kept)
+            work);
     }
     ~source ~target

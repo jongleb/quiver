@@ -8,7 +8,10 @@ type error =
   | Undecodable of { region : int64; key : string }
   | Leaderless of int64
   | Gap of string
+  | Gc_passed of { version : int64; least : int64 }
 [@@deriving sexp_of ~portable]
+
+type hold = Hold_for of Core.Time_ns.Span.t | Let_go
 
 type t = { connection : Http2.t; cluster : int64; stores : (int64 * string) list; tikv : string list }
 
@@ -48,8 +51,8 @@ let call connection ~cluster ~name fill =
 
 let fields text (pos, len) ~init ~f = Proto.fold text ~pos ~len ~init ~f
 
-let connect ~timeout address =
-  let stores = Stores.create ~timeout in
+let connect dial address =
+  let stores = Stores.create dial in
   let connected =
     let%bind first = Stores.connection stores address in
     let%bind cluster, members = call first ~cluster:0L ~name:"GetMembers" ignore in
@@ -64,7 +67,7 @@ let connect ~timeout address =
     in
     let%bind url = Option.to_result ~none:(`Pd No_leader) (Base.List.last urls) in
     let%bind leader =
-      match Base.String.chop_prefix url ~prefix:"http://" with
+      match Base.List.find_map [ "http://"; "https://" ] ~f:(fun prefix -> Base.String.chop_prefix url ~prefix) with
       | None -> Error (`Pd (Url url))
       | Some hostport -> Stores.connection stores (Option.value ~default:hostport (Base.String.chop_suffix hostport ~suffix:"/"))
     in
@@ -218,6 +221,36 @@ let scatter t regions =
   in
   Proto.fold response ~pos:0 ~len:(String.length response) ~init:[] ~f:(fun failed field value ->
       match field with 3 -> Result.map (fun ids -> List.rev_append ids failed) (Proto.numbers response field value) | _ -> Ok failed)
+
+let keep t ~service hold version =
+  let ttl = match hold with Hold_for span -> Int64.of_float (Float.ceil (Core.Time_ns.Span.to_sec span)) | Let_go -> 0L in
+  let%bind _, response =
+    call t.connection ~cluster:t.cluster ~name:"UpdateServiceGCSafePoint" (fun buffer ->
+        Proto.bytes buffer 2 service;
+        Proto.uint buffer 3 ttl;
+        Proto.uint buffer 4 version)
+  in
+  match hold with
+  | Let_go -> Ok ()
+  | Hold_for _ ->
+      let%bind least =
+        Proto.fold response ~pos:0 ~len:(String.length response) ~init:0L ~f:(fun least field value ->
+            match field with 4 -> Proto.number field value | _ -> Ok least)
+      in
+      if Int64.unsigned_compare least version <= 0 then Ok () else Error (`Pd (Gc_passed { version; least }))
+
+let held ~every ask work =
+  let span = Core.Time_ns.Span.scale every 3. in
+  let let_go () = ignore (ask Let_go) in
+  match ask (Hold_for span) with
+  | Error error ->
+      let_go ();
+      Error error
+  | Ok () ->
+      let result = Quiver_core.Concurrent.meanwhile ~every (fun () -> ignore (ask (Hold_for span))) work in
+      let checked = Result.bind result (fun result -> Result.map (fun () -> result) (ask (Hold_for span))) in
+      let_go ();
+      checked
 
 let stores t = t.tikv
 

@@ -27,6 +27,15 @@ val mutual :
 (** TLS 1.3 only: this side presents the PEM [certificate] chain and [key], and
     a peer must present a certificate chaining to [peers]. *)
 
+(** What a client shows a server of itself. *)
+type identity =
+  | Anonymous
+  | Presenting of { certificate : string; key : string }  (** PEM files: a chain and its key. *)
+
+val http2 : trust -> identity -> (context, unusable) result
+(** A client of TLS 1.2 or 1.3 offering only the ALPN protocol h2, as gRPC servers expect;
+    [Peers] when the trusted certificates cannot be loaded. *)
+
 type session : value mod contended portable
 (** One connection; each call takes the session's lock, so threads may share it.
 *)
@@ -85,6 +94,9 @@ val shutdown : session -> unit outcome
 val verified : session -> (unit, string) result
 (** Whether the peer chain and the expected name checked out, with OpenSSL's
     reason when not. *)
+
+val protocol : session -> string option
+(** The ALPN protocol the server chose. *)
 
 val fingerprint : session -> string option
 (** SHA-256 of the peer certificate. *)

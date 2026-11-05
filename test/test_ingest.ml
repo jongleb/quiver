@@ -527,7 +527,7 @@ let stores () =
   Unix.bind listener (ADDR_INET (Unix.inet6_addr_loopback, 0));
   Unix.listen listener 4;
   let port = match Unix.getsockname listener with ADDR_INET (_, port) -> port | ADDR_UNIX _ -> Alcotest.fail "not TCP" in
-  let stores = Stores.create ~timeout:(Core.Time_ns.Span.of_int_sec 5) in
+  let stores = Stores.create { timeout = Core.Time_ns.Span.of_int_sec 5; security = Cleartext } in
   let address = Printf.sprintf "[::1]:%d" port in
   let first = Stores.connection stores address in
   let again = Stores.connection stores address in

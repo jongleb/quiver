@@ -29,6 +29,11 @@ val both :
 (** Runs the first on a thread of its own, or after the second when the system
     gives no thread, and the second on the caller's thread. *)
 
+val meanwhile :
+  'a. every:Core.Time_ns.Span.t -> (unit -> unit) @ portable -> (unit -> 'a) @ local once -> 'a
+(** Runs the work on the caller's thread and, while it runs, the other on a thread of its own
+    [every] so often, after the first wait; not at all when the system gives no thread. *)
+
 val spread :
   ('a : value mod contended portable) ('b : value mod contended portable).
   workers:int -> 'a iarray -> ('a -> 'b) @ portable -> 'b list

@@ -684,7 +684,7 @@ let () =
                  | Quiver_load.Load.cause ]]
                  error))
   in
-  let mirror (conn : Quiver_mysql.Provider.conn_config) other database into tables workers stores =
+  let mirror (conn : Quiver_mysql.Provider.conn_config) security other database into tables workers stores =
     let open Base.Result.Let_syntax in
     let connect (conn : Quiver_mysql.Provider.conn_config) =
       Quiver_mysql.Link.connect ~local_data:Without_local_data conn.route ~timeouts:conn.timeouts ~user:conn.user
@@ -699,12 +699,14 @@ let () =
       let%bind link = connect conn in
       let copied =
         let%bind onto =
-          Option.fold other ~none:(Ok Quiver_tikv.Mirror.Same_cluster) ~some:(fun other ->
-              Result.map (fun onto -> Quiver_tikv.Mirror.Other_cluster onto) (connect other))
+          Option.fold other ~none:(Ok Quiver_tikv.Mirror.Same_cluster) ~some:(fun (other, security) ->
+              Result.map
+                (fun link -> Quiver_tikv.Mirror.Other_cluster { Quiver_tikv.Mirror.link; security })
+                (connect other))
         in
         let copied =
           let%bind link = tidb link in
-          let%bind target = match onto with Same_cluster -> Ok link | Other_cluster onto -> tidb onto in
+          let%bind target = match onto with Same_cluster -> Ok link | Other_cluster onto -> tidb onto.link in
           let%bind tables =
             match tables with
             | _ :: _ -> Ok tables
@@ -722,7 +724,7 @@ let () =
           Base.List.fold_result tables ~init:() ~f:(fun () table ->
               let started = Quiver_core.Stopwatch.start () in
               let%bind copied =
-                Quiver_tikv.Mirror.copy link ~into:onto ~source:{ database; table } ~target:{ database = into; table }
+                Quiver_tikv.Mirror.copy { link; security } ~into:onto ~source:{ database; table } ~target:{ database = into; table }
                   {
                     timeout = conn.timeouts.connecting;
                     sizes = { scan = 1024; job = 16 lsl 20; batch = 16 lsl 10 };
@@ -735,7 +737,7 @@ let () =
                 (Quiver_core.Stopwatch.elapsed started);
               Ok ())
         in
-        let () = match onto with Same_cluster -> () | Other_cluster onto -> Quiver_mysql.Link.close onto in
+        let () = match onto with Same_cluster -> () | Other_cluster onto -> Quiver_mysql.Link.close onto.link in
         copied
       in
       Quiver_mysql.Link.close link;
@@ -757,6 +759,14 @@ let () =
               Format.eprintf "hint: the table's schema or partitions are being changed; copy it once the change is done@."
           | `Renumber (Quiver_tikv.Renumber.Global_index _) ->
               Format.eprintf "hint: a global index names partitions in its values, which mirror does not move; quiver copy copies the table through SQL@."
+          | `Transport (Quiver_mysql.Transport.Io _ | Tls _) ->
+              Format.eprintf
+                "hint: if PD or a TiKV store ended the connection, the cluster may have TLS between its \
+                 components: give --cluster-ca, and --cluster-cert with --cluster-key when it asks clients for \
+                 a certificate (--to-cluster-* for another target cluster)@."
+          | `Pd (Quiver_tikv.Pd.Gc_passed _) ->
+              Format.eprintf
+                "hint: the source's GC may have removed versions the copy read (its hold on PD lapsed, as when PD was out of reach for minutes); the half-made copy was dropped, run it again@."
           | _ -> ()
         in
         failed
@@ -1628,6 +1638,55 @@ let () =
                the writes and no region is split by size, but compaction takes more threads and the \
                cluster's other writes may slow down meanwhile (on one machine running every store it \
                made copies slower), and a store left in it goes back by itself after ten minutes.")
+    and cluster side =
+      let named long = match side with `Source -> long | `Target -> "to-" ^ long in
+      let whose = match side with `Source -> "the source's" | `Target -> "the target's" in
+      let pem long ~doc = Arg.(value & opt (some file) None & described [ named long ] ~docv:"FILE" ~doc) in
+      Term.(
+        const (fun ca certificate key ->
+            let secured ca identity =
+              let refused (unusable : Quiver_openssl.Tls.unusable) =
+                let message =
+                  match unusable with
+                  | Context reason -> "TLS to PD and TiKV: " ^ reason
+                  | Certificate reason -> "--" ^ named "cluster-cert" ^ ": " ^ reason
+                  | Key reason -> "--" ^ named "cluster-key" ^ ": " ^ reason
+                  | Unmatching_keys -> "--" ^ named "cluster-cert" ^ " and its key do not match"
+                  | Peers reason -> "--" ^ named "cluster-ca" ^ ": " ^ reason
+                in
+                `Msg message
+              in
+              Result.map_error refused
+                (Result.map
+                   (fun context -> Quiver_tikv.Http2.Secured context)
+                   (Quiver_openssl.Tls.http2 (Ca_file ca) identity))
+            in
+            match (ca, certificate, key) with
+            | None, None, None -> Ok Quiver_tikv.Http2.Cleartext
+            | Some ca, None, None -> secured ca Anonymous
+            | Some ca, Some certificate, Some key -> secured ca (Presenting { certificate; key })
+            | Some _, Some _, None | Some _, None, Some _ ->
+                Error (`Msg ("--" ^ named "cluster-cert" ^ " and --" ^ named "cluster-key" ^ " go together"))
+            | None, (Some _ | None), (Some _ | None) ->
+                Error (`Msg ("--" ^ named "cluster-cert" ^ " and its key go with --" ^ named "cluster-ca")))
+        $ pem "cluster-ca"
+            ~doc:
+              ("PEM file of the CAs " ^ whose
+             ^ " PD and TiKV certificates lead to, as their security.ca-path: they are then reached over \
+                TLS, their chains and host names checked; without it, in the clear")
+        $ pem "cluster-cert"
+            ~doc:("PEM certificate chain this side presents to " ^ whose ^ " PD and TiKV, as their security.cert-path asks of clients")
+        $ pem "cluster-key" ~doc:("PEM key of the $(b,--" ^ named "cluster-cert" ^ ") certificate"))
+    in
+    let target =
+      Term.(
+        term_result
+          (const (fun other security ->
+               match (other, security) with
+               | Some other, security -> Ok (Some (other, security))
+               | None, Quiver_tikv.Http2.Cleartext -> Ok None
+               | None, Secured _ -> Error (`Msg "--to-cluster-ca names another cluster's CAs, which goes with --to-host"))
+          $ other_server $ term_result (cluster `Target)))
     in
     Cmd.v
       (Cmd.info "mirror"
@@ -1638,7 +1697,7 @@ let () =
             checksum. Into another cluster the two must agree on new collations, and the copy is \
             made by the source's definition; where its columns and indexes have other ids, as \
             after the source's ALTERs, keys and rows are written under the copy's")
-      Term.(const mirror $ server `Source $ other_server $ database $ into $ tables $ workers $ stores)
+      Term.(const mirror $ server `Source $ term_result (cluster `Source) $ target $ database $ into $ tables $ workers $ stores)
   in
   let copy_cmd =
     let open Cmdliner in

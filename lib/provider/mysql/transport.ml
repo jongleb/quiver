@@ -132,6 +132,27 @@ let write t ?(pos = 0) ?len text =
   in
   go pos
 
+let handshake t context expectations =
+  let tls reason = `Transport (Tls reason) in
+  let%bind session = Result.map_error tls (Quiver_openssl.Tls.session context t.fd) in
+  let%bind () =
+    Result.map_error tls
+      (Base.List.fold_result expectations ~init:() ~f:(fun () (expectation, name) ->
+           Quiver_openssl.Tls.expect session expectation name))
+  in
+  match Quiver_openssl.Tls.connect session with
+  | Want_read | Want_write -> Error (`Transport (Timed_out t.timeout))
+  | Closed | Lost -> Error (tls lost)
+  | Failed reason -> Error (tls reason)
+  | Done () ->
+      t.channel <- Secure session;
+      Ok session
+
+let named host : (Quiver_openssl.Tls.expectation * string) list =
+  match Quiver_openssl.Tls.naming host with
+  | Ip -> [ (Ip, host) ]
+  | Host | Server_name -> [ (Server_name, host); (Host, host) ]
+
 let start_tls t ~host authority =
   let check =
     match (authority, host) with
@@ -143,52 +164,34 @@ let start_tls t ~host authority =
     | System_roots | Pinned _ -> System_roots
     | Ca_file file -> Ca_file (File_path.to_string file)
   in
-  let expectations : (Quiver_openssl.Tls.expectation * string) list =
-    match (check, Quiver_openssl.Tls.naming host) with
-    | (`Validity | `Pinned _), _ -> []
-    | `Chain, Ip -> [ (Ip, host) ]
-    | `Chain, (Host | Server_name) -> [ (Server_name, host); (Host, host) ]
-  in
-  let tls reason = `Transport (Tls reason) in
-  let%bind session =
-    Result.map_error tls
-      (Result.bind (Quiver_openssl.Tls.client trust) (fun context ->
-           Quiver_openssl.Tls.session context t.fd))
-  in
-  let%bind () =
-    Result.map_error tls
-      (Base.List.fold_result expectations ~init:() ~f:(fun () (expectation, name) ->
-           Quiver_openssl.Tls.expect session expectation name))
-  in
-  match Quiver_openssl.Tls.connect session with
-  | Want_read | Want_write -> Error (`Transport (Timed_out t.timeout))
-  | Closed | Lost -> Error (tls lost)
-  | Failed reason -> Error (tls reason)
-  | Done () -> (
-      t.channel <- Secure session;
-      match check with
-      | `Pinned fingerprint -> (
-          match
-            Fingerprint.check fingerprint
-              ~digest:
-                (Option.value ~default:""
-                   (Quiver_openssl.Tls.fingerprint session))
-          with
-          | `Pinned -> Ok Trusted
-          | `Different ->
-              Ok
-                (Unproven
-                   (Format.asprintf "certificate is not the pinned %a"
-                      Fingerprint.pp fingerprint)))
-      | `Validity -> (
-          match Quiver_openssl.Tls.validity session with
-          | Within_dates -> Ok Loopback
-          | Outside_dates | No_certificate ->
-              Error (`Transport Expired_certificate))
-      | `Chain -> (
-          match Quiver_openssl.Tls.verified session with
-          | Ok () -> Ok Trusted
-          | Error reason -> Ok (Unproven reason)))
+  let%bind context = Result.map_error (fun reason -> `Transport (Tls reason)) (Quiver_openssl.Tls.client trust) in
+  let expectations = match check with `Validity | `Pinned _ -> [] | `Chain -> named host in
+  let%bind session = handshake t context expectations in
+  match check with
+  | `Pinned fingerprint -> (
+      match
+        Fingerprint.check fingerprint
+          ~digest:(Option.value ~default:"" (Quiver_openssl.Tls.fingerprint session))
+      with
+      | `Pinned -> Ok Trusted
+      | `Different ->
+          Ok (Unproven (Format.asprintf "certificate is not the pinned %a" Fingerprint.pp fingerprint)))
+  | `Validity -> (
+      match Quiver_openssl.Tls.validity session with
+      | Within_dates -> Ok Loopback
+      | Outside_dates | No_certificate -> Error (`Transport Expired_certificate))
+  | `Chain -> (
+      match Quiver_openssl.Tls.verified session with
+      | Ok () -> Ok Trusted
+      | Error reason -> Ok (Unproven reason))
+
+let secure t ~host context =
+  let%bind session = handshake t context (named host) in
+  match Quiver_openssl.Tls.verified session with
+  | Ok () -> Ok `Trusted
+  | Error reason -> Ok (`Unproven reason)
+
+let protocol t = match t.channel with Plain -> None | Secure session -> Quiver_openssl.Tls.protocol session
 
 let set_timeout t timeout =
   let seconds = Core.Time_ns.Span.to_sec timeout in

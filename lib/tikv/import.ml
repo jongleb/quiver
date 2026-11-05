@@ -18,30 +18,7 @@ let held ~every switch work =
       back ();
       Error error
   | Ok () ->
-      let running = Portable.Atomic.make `Running and every = Core.Time_ns.Span.to_sec every in
-      let (), result =
-        Quiver_core.Concurrent.both
-          (fun () ->
-            let rec keep asked =
-              match Portable.Atomic.get running with
-              | `Done -> ()
-              | `Running ->
-                  Unix.sleepf (Float.min 0.05 every);
-                  let now = Unix.gettimeofday () in
-                  let asked =
-                    if now -. asked < every then asked
-                    else
-                      let () = ignore (switch Import) in
-                      now
-                  in
-                  keep asked
-            in
-            keep (Unix.gettimeofday ()))
-          (fun () ->
-            let result = work () in
-            Portable.Atomic.set running `Done;
-            result)
-      in
+      let result = Quiver_core.Concurrent.meanwhile ~every (fun () -> ignore (switch Import)) work in
       back ();
       Ok result
 

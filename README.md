@@ -627,12 +627,17 @@ quiver copy -h mariadb.example -B shop --to-host tidb.example --to-port 4000 \
 quiver mirror -h tidb.example -P 4000 -B shop --to-database shop_copy          # the same cluster
 quiver mirror -h tidb.example -P 4000 -B shop -T orders \
   --to-host other.example --to-port 4000 --to-database shop                    # another cluster
+quiver mirror -h tidb.example -P 4000 -B shop --to-database shop_copy \
+  --cluster-ca ca.crt --cluster-cert client.crt --cluster-key client.key       # TLS to PD and TiKV
 ```
 
 The copy is made under a name of its own (`CREATE TABLE … LIKE`, or the source's `SHOW CREATE
 TABLE` in another cluster). Its rows and indexes are read from TiKV at one TSO, region by region
 on `-w` workers, and imported through `ImportSST` under the copy's table id, at a version after
-it. TiDB's `ADMIN CHECKSUM TABLE` must equal quiver's own CRC64 of what it wrote; then the id
+it. While it reads, the source's GC is held at that TSO through a service safe point in PD, as
+dumpling and BR hold it, renewed every minute and asked once more after the reads: if GC may have
+passed the TSO meanwhile, the copy fails. TiDB's `ADMIN CHECKSUM TABLE` must equal quiver's own
+CRC64 of what it wrote; then the id
 allocators move past the source's and the copy is renamed. On any failure it is dropped.
 
 Both tables are described as TiKV keeps them at the versions read and written. Into another
@@ -643,7 +648,10 @@ written before a column was added with a default gets that default written in, a
 a default quiver does not write (JSON other than null, a `TIMESTAMP` of TiDB before 3.0, another
 character set) refuses the table, with nothing left behind, and `quiver copy` moves it through SQL.
 A partitioned table is copied partition by partition, each into the copy's partition of its name;
-one with a global index is refused. `--store-mode import` keeps every TiKV
+one with a global index is refused. Mirror reaches PD and every TiKV store directly. When the
+cluster has TLS between its components, `--cluster-ca`, `--cluster-cert` and `--cluster-key` name
+the files its `[security]` sections use; `--to-cluster-*` do the same for another target cluster.
+Their chains and host names are then checked, and h2 is required through ALPN. `--store-mode import` keeps every TiKV
 in import mode during the copy, as `IMPORT INTO` does; on one machine it made copies slower, so
 it is off by default.
 

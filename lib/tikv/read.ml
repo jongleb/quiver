@@ -73,10 +73,10 @@ let range store ~start ~stop ~limit ~f =
   in
   go start Known 0
 
-let table link name ~version ~timeout ~limit ~f =
+let table link name ~version ~dial ~limit ~f =
   let%bind table, regions = Region.of_table link name in
   let first, past = Codec.records table in
-  let known = ref regions and stores = Stores.create ~timeout in
+  let known = ref regions and stores = Stores.create dial in
   let store =
     {
       locate =

@@ -32,6 +32,33 @@ let both (type (a : value mod contended portable)) (first : unit -> a) second =
       let other = second () in
       (first (), other)
 
+let meanwhile ~every again work =
+  let running = Portable.Atomic.make `Running and every = Core.Time_ns.Span.to_sec every in
+  let (), result =
+    both
+      (fun () ->
+        let rec wait asked =
+          match Portable.Atomic.get running with
+          | `Done -> ()
+          | `Running ->
+              Unix.sleepf (Float.min 0.05 every);
+              let now = Unix.gettimeofday () in
+              let asked =
+                if now -. asked < every then asked
+                else
+                  let () = again () in
+                  now
+              in
+              wait asked
+        in
+        wait (Unix.gettimeofday ()))
+      (fun () ->
+        let result = work () in
+        Portable.Atomic.set running `Done;
+        result)
+  in
+  result
+
 let spread (type (a : value mod contended portable) (b : value mod contended portable))
     ~workers (items : a iarray) (work : a -> b) : b list =
   let next = Portable.Atomic.make 0 in

@@ -31,15 +31,21 @@ external make_mutual :
   string -> string -> string -> (context, refused) result @@ portable
   = "quiver_tls_mutual"
 
-let mutual ~certificate ~key ~peers =
-  Result.map_error
-    (function
-      | Refused_context -> Context (error ())
-      | Refused_certificate -> Certificate (error ())
-      | Refused_key -> Key (error ())
-      | Refused_pair -> Unmatching_keys
-      | Refused_peers -> Peers (error ()))
-    (make_mutual certificate key peers)
+let refusal = function
+  | Refused_context -> Context (error ())
+  | Refused_certificate -> Certificate (error ())
+  | Refused_key -> Key (error ())
+  | Refused_pair -> Unmatching_keys
+  | Refused_peers -> Peers (error ())
+
+let mutual ~certificate ~key ~peers = Result.map_error refusal (make_mutual certificate key peers)
+
+type identity = Anonymous | Presenting of { certificate : string; key : string }
+
+external make_http2 : trust -> identity -> (context, refused) result @@ portable
+  = "quiver_tls_http2"
+
+let http2 trust identity = Result.map_error refusal (make_http2 trust identity)
 
 type session : value mod contended portable
 
@@ -138,6 +144,10 @@ let verified session =
   match verify_result session with
   | 0 -> Ok ()
   | code -> Error (verify_message code)
+
+external alpn : session -> string @@ portable = "quiver_tls_alpn"
+
+let protocol session = match alpn session with "" -> None | chosen -> Some chosen
 
 external peer_sha256 : session -> string @@ portable = "quiver_tls_peer_sha256"
 

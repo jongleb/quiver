@@ -12,10 +12,16 @@ type error =
   | Reset of int
   | No_status
   | Exhausted
+  | Untrusted of string
+  | Not_h2 of string option
 [@@deriving sexp_of ~portable]
+
+type security = Cleartext | Secured of Quiver_openssl.Tls.context
+type dial = { timeout : Core.Time_ns.Span.t; security : security }
 
 type t = {
   transport : Quiver_mysql.Transport.t;
+  scheme : string;
   authority : string;
   input : Base_bigstring.t;
   mutable start : int;
@@ -58,8 +64,18 @@ let frame ~kind ~flags ~stream payload = header ~kind ~flags ~stream (String.len
 
 let u32 n = String.init 4 (fun i -> Char.chr ((n lsr (8 * (3 - i))) land 0xFF))
 
-let connect ~timeout ~host ~port =
+let connect { timeout; security } ~host ~port =
   let%bind transport = Quiver_mysql.Transport.connect ~timeout (Tcp { host; port }) in
+  let secured =
+    match security with
+    | Cleartext -> Ok "http"
+    | Secured context -> (
+        let%bind trust = Quiver_mysql.Transport.secure transport ~host context in
+        match (trust, Quiver_mysql.Transport.protocol transport) with
+        | `Unproven reason, _ -> Error (`Http2 (Untrusted reason))
+        | `Trusted, Some "h2" -> Ok "https"
+        | `Trusted, chosen -> Error (`Http2 (Not_h2 chosen)))
+  in
   let settings =
     String.concat ""
       (List.map
@@ -71,14 +87,15 @@ let connect ~timeout ~host ~port =
     ^ frame ~kind:4 ~flags:0 ~stream:0 settings
     ^ frame ~kind:8 ~flags:0 ~stream:0 (u32 (connection_receive_window - 65_535))
   in
-  match Quiver_mysql.Transport.write transport preface with
+  match Result.bind secured (fun scheme -> Result.map (fun () -> scheme) (Quiver_mysql.Transport.write transport preface)) with
   | Error _ as error ->
       Quiver_mysql.Transport.close transport;
       error
-  | Ok () ->
+  | Ok scheme ->
       Ok
         {
           transport;
+          scheme;
           authority = host ^ ":" ^ Int.to_string port;
           input = Base_bigstring.create (receive_frame + 9);
           start = 0;
@@ -284,7 +301,7 @@ let start t ~path ~headers =
   let block =
     let buffer = Buffer.create 256 in
     Hpack.encode buffer
-      ([ (":method", "POST"); (":scheme", "http"); (":path", path); (":authority", t.authority) ] @ headers);
+      ([ (":method", "POST"); (":scheme", t.scheme); (":path", path); (":authority", t.authority) ] @ headers);
     Buffer.contents buffer
   in
   let fragments =

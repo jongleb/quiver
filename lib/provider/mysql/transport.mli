@@ -47,6 +47,18 @@ val write : t -> ?pos:int -> ?len:int -> string -> (unit, [> `Transport of error
 val start_tls :
   t -> host:string -> authority -> (trust, [> `Transport of error ]) result @@ portable
 
+val secure :
+  t ->
+  host:string ->
+  Quiver_openssl.Tls.context ->
+  ([ `Trusted | `Unproven of string ], [> `Transport of error ]) result
+@@ portable
+(** TLS by this context, the server's chain and host name checked against its certificates;
+    [`Unproven] with OpenSSL's reason when they fail. *)
+
+val protocol : t -> string option @@ portable
+(** The ALPN protocol the server chose under TLS. *)
+
 val set_timeout : t -> Core.Time_ns.Span.t -> unit @@ portable
 val failure : t -> error option @@ portable
 val close : t -> unit @@ portable

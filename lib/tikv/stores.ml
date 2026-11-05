@@ -1,8 +1,8 @@
 open Base.Result.Let_syntax
 
-type t = { timeout : Core.Time_ns.Span.t; opened : (string, Http2.t) Hashtbl.t }
+type t = { dial : Http2.dial; opened : (string, Http2.t) Hashtbl.t }
 
-let create ~timeout = { timeout; opened = Hashtbl.create 4 }
+let create dial = { dial; opened = Hashtbl.create 4 }
 
 let connection t address =
   match Hashtbl.find_opt t.opened address with
@@ -16,7 +16,7 @@ let connection t address =
           match int_of_string_opt (String.sub address (colon + 1) (String.length address - colon - 1)) with
           | None -> Error (`Region (Region.Malformed [ Some address ]))
           | Some port ->
-              let%bind connection = Http2.connect ~timeout:t.timeout ~host ~port in
+              let%bind connection = Http2.connect t.dial ~host ~port in
               Hashtbl.replace t.opened address connection;
               Ok connection))
 

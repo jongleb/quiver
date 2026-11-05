@@ -4,13 +4,13 @@
 
 type t
 
-val create : timeout:Core.Time_ns.Span.t -> t
+val create : Http2.dial -> t
 
 val connection :
   t ->
   string ->
   ( Http2.t,
-    [> `Region of Region.error | `Transport of Quiver_mysql.Transport.error ] )
+    [> `Region of Region.error | `Http2 of Http2.error | `Transport of Quiver_mysql.Transport.error ] )
   result
 (** The connection to a store at [host:port] ([\[host\]:port] for IPv6). *)
 

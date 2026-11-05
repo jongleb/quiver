@@ -250,7 +250,7 @@ let session scenario client =
   let listener, port = listening () in
   let heard = Support.start (fun () -> serve listener scenario) in
   let result =
-    Result.bind (Http2.connect ~timeout:(Core.Time_ns.Span.of_int_sec 5) ~host:"127.0.0.1" ~port) (fun connection ->
+    Result.bind (Http2.connect { timeout = Core.Time_ns.Span.of_int_sec 5; security = Cleartext } ~host:"127.0.0.1" ~port) (fun connection ->
         let result = client connection in
         Http2.close connection;
         result)
@@ -399,7 +399,7 @@ let refusals () =
   let outcome ?(settings = "") ?(body = "") ?(next = `Alone) frames =
     let port, heard = raw ~settings frames in
     let result =
-      Result.bind (Http2.connect ~timeout:(Core.Time_ns.Span.of_int_sec 5) ~host:"127.0.0.1" ~port) (fun connection ->
+      Result.bind (Http2.connect { timeout = Core.Time_ns.Span.of_int_sec 5; security = Cleartext } ~host:"127.0.0.1" ~port) (fun connection ->
           let first = Http2.request connection ~path:"/p" ~headers:[] body in
           let second =
             match next with
@@ -489,8 +489,88 @@ let wide () =
   Alcotest.(check bool) "answered" true (Result.is_ok result);
   Alcotest.(check int) "a body in one frame once the server's settings are known" 100_000 heard.largest
 
+let secured () =
+  let exchange : exchange =
+    {
+      path = "/s";
+      headers = [];
+      body = "ping";
+      reply =
+        {
+          opening = Direct;
+          status = 200;
+          fields = [];
+          fragments = 1;
+          marks = Bare;
+          pieces = [ { noise = []; text = "pong"; padding = None } ];
+          trailers = None;
+        };
+    }
+  in
+  let scenario = { initial_window = 65_535; max_frame = 16_384; exchanges = [ exchange ] } in
+  let context identity =
+    match Quiver_openssl.Tls.http2 (Ca_file "tls/ca.crt") identity with
+    | Ok context -> context
+    | Error (_ : Quiver_openssl.Tls.unusable) -> Alcotest.fail "no context"
+  in
+  let through ?(alpn = "h2") ?(clients = "-") ?(identity = Quiver_openssl.Tls.Anonymous) certificate =
+    let listener, backend = listening () in
+    let heard = Support.start (fun () -> serve listener scenario) in
+    let front =
+      Unix.open_process_args_in "python3"
+        [| "python3"; "-I"; "tls_h2.py"; Int.to_string backend; "tls/" ^ certificate ^ ".crt"; "tls/" ^ certificate ^ ".key"; alpn; clients |]
+    in
+    let port = int_of_string (input_line front) in
+    let result =
+      Result.bind
+        (Http2.connect { timeout = Core.Time_ns.Span.of_int_sec 5; security = Secured (context identity) } ~host:"127.0.0.1" ~port)
+        (fun connection ->
+          let response = Http2.request connection ~path:"/s" ~headers:[] "ping" in
+          Http2.close connection;
+          response)
+    in
+    let (_ : Unix.process_status) = Unix.close_process_in front in
+    let heard = Support.join heard in
+    Unix.close listener;
+    (result, heard)
+  in
+  let answered (result, (heard : heard)) =
+    match result with
+    | Ok (response : Http2.response) -> Some (response.body, List.map (fun (headers, _) -> List.assoc_opt ":scheme" headers) heard.requests)
+    | Error _ -> None
+  in
+  let refused result = match fst result with Ok _ -> "answered" | Error error -> show error in
+  let pong = Some ("pong", [ Some "https" ]) in
+  Alcotest.(check (option (pair string (list (option string))))) "over TLS by the CA" pong (answered (through "node"));
+  Alcotest.(check string) "a chain to another CA" "(Untrusted\"unable to get local issuer certificate\")" (refused (through "stranger"));
+  Alcotest.(check bool) "a certificate for another name" true
+    (Base.String.is_prefix (refused (through "elsewhere")) ~prefix:"(Untrusted");
+  Alcotest.(check string) "a server choosing no ALPN protocol" "(Not_h2())" (refused (through ~alpn:"-" "node"));
+  Alcotest.(check bool) "a server asking for a certificate this side does not present" true
+    (Option.is_none (answered (through ~clients:"tls/ca.crt" "node")));
+  Alcotest.(check (option (pair string (list (option string))))) "and one it does" pong
+    (answered (through ~clients:"tls/ca.crt" ~identity:(Presenting { certificate = "tls/node.crt"; key = "tls/node.key" }) "node"));
+  let unusable trust identity =
+    match Quiver_openssl.Tls.http2 trust identity with
+    | Ok _ -> "usable"
+    | Error (Context _) -> "context"
+    | Error (Certificate _) -> "certificate"
+    | Error (Key _) -> "key"
+    | Error Unmatching_keys -> "unmatching"
+    | Error (Peers _) -> "peers"
+  in
+  Alcotest.(check (list string)) "unusable files"
+    [ "peers"; "certificate"; "key"; "key" ]
+    [
+      unusable (Ca_file "tls/missing.crt") Anonymous;
+      unusable (Ca_file "tls/ca.crt") (Presenting { certificate = "tls/missing.crt"; key = "tls/node.key" });
+      unusable (Ca_file "tls/ca.crt") (Presenting { certificate = "tls/node.crt"; key = "tls/missing.key" });
+      unusable (Ca_file "tls/ca.crt") (Presenting { certificate = "tls/node.crt"; key = "tls/stranger.key" });
+    ]
+
 let tests =
   [
+    Alcotest.test_case "over TLS: the server's chain, name and ALPN, this side's certificate" `Quick secured;
     Alcotest.test_case "broken frames and refusals" `Quick refusals;
     Alcotest.test_case "a response larger than the windows" `Quick large;
     Alcotest.test_case "frames as large as the server lets" `Quick wide;

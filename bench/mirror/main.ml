@@ -59,7 +59,7 @@ let () =
     (fun table ->
       let started = Unix.gettimeofday () in
       match
-        Quiver_tikv.Mirror.copy link ~into:Same_cluster ~source:(name table) ~target:(name (table ^ "_copy"))
+        Quiver_tikv.Mirror.copy { link; security = Cleartext } ~into:Same_cluster ~source:(name table) ~target:(name (table ^ "_copy"))
           {
             timeout = Core.Time_ns.Span.of_int_sec 30;
             sizes = { scan = 1024; job = 16 lsl 20; batch = 16 lsl 10 };

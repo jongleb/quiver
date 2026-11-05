@@ -1,7 +1,7 @@
 @@ portable
 
-(** A client of HTTP/2 over TCP without TLS, by prior knowledge (RFC 9113), one
-    request at a time on a connection. *)
+(** A client of HTTP/2 (RFC 9113) over TCP, by prior knowledge or under TLS, one request at a
+    time on a connection. *)
 
 type error =
   | Closed  (** The server closed the connection. *)
@@ -17,17 +17,31 @@ type error =
   | Reset of int  (** The server ended the stream with this error code. *)
   | No_status  (** A response without [:status]. *)
   | Exhausted  (** The connection used all its stream identifiers. *)
+  | Untrusted of string  (** OpenSSL's reason the server's chain or name failed. *)
+  | Not_h2 of string option  (** Under TLS, the server chose another ALPN protocol, or none. *)
 [@@deriving sexp_of ~portable]
+
+(** How a connection's bytes go. *)
+type security =
+  | Cleartext  (** h2c, by prior knowledge. *)
+  | Secured of Quiver_openssl.Tls.context
+      (** TLS offering h2, the server's chain and host name checked against the context's CAs. *)
+
+type dial = {
+  timeout : Core.Time_ns.Span.t;  (** Bounds every wait. *)
+  security : security;
+}
+(** How connections are opened. *)
 
 type t
 (** One connection; one thread uses it at a time. *)
 
 val connect :
-  timeout:Core.Time_ns.Span.t ->
+  dial ->
   host:string ->
   port:int ->
-  (t, [> `Transport of Quiver_mysql.Transport.error ]) result
-(** Opens it and sends this side's preface; [timeout] bounds every wait. *)
+  (t, [> `Http2 of error | `Transport of Quiver_mysql.Transport.error ]) result
+(** Opens it and sends this side's preface. *)
 
 type response = {
   status : int;

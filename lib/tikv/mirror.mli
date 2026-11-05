@@ -22,6 +22,12 @@ type settings = {
   stores : stores;
 }
 
+type reached = {
+  link : Quiver_mysql.Link.t;  (** Its TiDB. *)
+  security : Http2.security;  (** Of its PD and stores. *)
+}
+(** A cluster as this side reaches it. *)
+
 type copied = { keys : int; bytes : int; checksum : int64 } [@@deriving sexp_of ~portable]
 (** What was copied: keys, their bytes with the values', and the CRC64 XOR of them as TiKV's
     checksum of a table sums them. *)
@@ -52,8 +58,8 @@ val cuts : Region.t list -> string list -> (Region.t * string list) list
 (** Each region with the keys strictly inside it, the keys sorted: where it is to be split. *)
 
 val table :
-  from:Quiver_mysql.Link.t ->
-  into:Quiver_mysql.Link.t ->
+  from:reached ->
+  into:reached ->
   plan:Renumber.t ->
   version:int64 ->
   commit_ts:int64 ->
@@ -82,7 +88,7 @@ val described :
   Quiver_mysql.Link.t ->
   Quiver_core.Schema.Name.t ->
   at:int64 ->
-  timeout:Core.Time_ns.Span.t ->
+  dial:Http2.dial ->
   ( Info.t,
     [> `Mirror of error
     | `Info of Info.error
@@ -118,6 +124,8 @@ type 'e session = {
   name : unit -> string;  (** A table name no table has, for the copy while it is made. *)
   keys : Renumber.t -> version:int64 -> commit_ts:int64 -> (copied, 'e) result;
       (** The plan's keys as of [version] into the copy at [commit_ts]. *)
+  kept : version:int64 -> (unit -> (copied, 'e) result) -> (copied, 'e) result;
+      (** The work, which reads the source at [version], with GC of the source held from passing it. *)
 }
 (** How a copy reaches TiDB and TiKV. *)
 
@@ -129,8 +137,8 @@ val through :
 (** What {!copy} does, through the session. *)
 
 val copy :
-  Quiver_mysql.Link.t ->
-  into:Quiver_mysql.Link.t cluster ->
+  reached ->
+  into:reached cluster ->
   source:Quiver_core.Schema.Name.t ->
   target:Quiver_core.Schema.Name.t ->
   settings ->
@@ -153,6 +161,7 @@ val copy :
 @@ nonportable
 (** [source] as of now into a new table [target], in its cluster or another: made under a name of
     its own ([LIKE] it, or by its definition in the other cluster, where the two clusters must agree
-    on collations), its keys copied by {!table} at a later version of the target's cluster under the
+    on collations), its keys copied by {!table}, with the source's GC held at their version by
+    {!Pd.held}, at a later version of the target's cluster under the
     copy's ids, as both tables are described at those versions, checked against TiDB's checksum,
     its id allocators moved past the source's, renamed; dropped on any failure. *)

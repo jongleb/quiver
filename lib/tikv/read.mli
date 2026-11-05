@@ -37,7 +37,7 @@ val table :
   Quiver_mysql.Link.t ->
   Quiver_core.Schema.Name.t ->
   version:int64 ->
-  timeout:Core.Time_ns.Span.t ->
+  dial:Http2.dial ->
   limit:int ->
   f:
     (Kv.pair list ->

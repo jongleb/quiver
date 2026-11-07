@@ -13,6 +13,7 @@ type error =
   | Gap of string  (** No region starts at this key, where the last one ended. *)
   | Gc_passed of { version : int64; least : int64 }
       (** GC may already have passed the version: the least version the cluster keeps is later. *)
+  | No_timestamp  (** A [Tso] response without one. *)
 [@@deriving sexp_of ~portable]
 
 (** What GC is asked about a service's version. *)
@@ -49,6 +50,18 @@ val regions :
     | `Transport of Quiver_mysql.Transport.error ] )
   result
 (** The regions holding keys from [start] up to [stop], in key order, each from its first key. *)
+
+val tso :
+  t ->
+  ( int64,
+    [> `Pd of error
+    | `Proto of Proto.error
+    | `Grpc of Grpc.error
+    | `Http2 of Http2.error
+    | `Hpack of Hpack.error
+    | `Transport of Quiver_mysql.Transport.error ] )
+  result
+(** A timestamp from PD's oracle: later than every one it gave before. *)
 
 val scatter :
   t ->

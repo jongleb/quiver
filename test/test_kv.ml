@@ -65,19 +65,21 @@ let sub text (value : Proto.value) =
   match value with Delimited { pos; len } -> String.sub text pos len | Varint _ | Fixed64 _ | Fixed32 _ -> Alcotest.fail "not delimited"
 
 let request () =
-  let text = Kv.scan_request region ~direction:Forward ~start:"t\x80a" ~stop:(Before "t\x80b") ~version:449_000_000_000_000_000L ~limit:256 in
+  let settled : Kv.settled = { ignored = [ 5L; 6L ]; committed = [ 7L ] } in
+  let text = Kv.scan_request region settled ~direction:Forward ~start:"t\x80a" ~stop:(Before "t\x80b") ~version:449_000_000_000_000_000L ~limit:256 in
   let top = fields text in
   let context = sub text (List.assoc 1 top) in
   let context_fields = fields context in
   let numbers text = List.filter_map (fun (field, (value : Proto.value)) -> match value with Varint n -> Some (field, n) | _ -> None) (fields text) in
-  Alcotest.(check (list (pair int int64))) "region, priority low, not filling the cache" [ (1, 7L); (6, 1L); (8, 1L) ] (numbers context);
+  Alcotest.(check (list (pair int int64))) "region, priority low, not filling the cache, the settled transactions"
+    [ (1, 7L); (6, 1L); (8, 1L); (13, 5L); (13, 6L); (22, 7L) ] (numbers context);
   Alcotest.(check (list (pair int int64))) "epoch" [ (1, 3L); (2, 11L) ] (numbers (sub context (List.assoc 2 context_fields)));
   Alcotest.(check (list (pair int int64))) "peer" [ (1, 9L); (2, 2L) ] (numbers (sub context (List.assoc 3 context_fields)));
   Alcotest.(check string) "source" "quiver" (sub context (List.assoc 24 context_fields));
   Alcotest.(check string) "start" "t\x80a" (sub text (List.assoc 2 top));
   Alcotest.(check string) "end" "t\x80b" (sub text (List.assoc 7 top));
   Alcotest.(check (list (pair int int64))) "limit and version" [ (3, 256L); (4, 449_000_000_000_000_000L) ] (numbers text);
-  let backward = Kv.scan_request region ~direction:Backward ~start:"t\x80a" ~stop:(Before "t\x80b") ~version:9L ~limit:1 in
+  let backward = Kv.scan_request region Kv.nothing_settled ~direction:Backward ~start:"t\x80a" ~stop:(Before "t\x80b") ~version:9L ~limit:1 in
   let top = fields backward in
   Alcotest.(check (pair string string)) "backward: from the stop down to the start" ("t\x80b", "t\x80a")
     (sub backward (List.assoc 2 top), sub backward (List.assoc 7 top));
@@ -96,10 +98,25 @@ let response ?region_error ?error pairs =
       List.iter (fun pair -> Proto.bytes buffer 2 (pair_message pair)) pairs;
       Option.iter (Proto.bytes buffer 3) error)
 
+let show_scan reply = Base.Sexp.to_string ([%sexp_of: Kv.scan Kv.reply] reply)
+
+let lock_message ?(async = false) ?(min_commit = 0L) ?(secondaries = []) ?(primary = "p") ?(version = 99L) key =
+  message (fun buffer ->
+      Proto.bytes buffer 1 primary;
+      Proto.uint buffer 2 version;
+      Proto.bytes buffer 3 key;
+      Proto.uint buffer 4 3000L;
+      Proto.uint buffer 6 0L;
+      if async then Proto.uint buffer 8 1L;
+      if not (Int64.equal min_commit 0L) then Proto.uint buffer 9 min_commit;
+      List.iter (Proto.bytes buffer 10) secondaries)
+
+let locked_by ?(key = "k") () : Kv.lock = { primary = "p"; version = 99L; key; ttl = 3000L; min_commit_ts = 0L; protocol = Two_phase }
+
 let decoded () =
   let check name expected text =
-    Alcotest.(check string) name (Base.Sexp.to_string (Kv.sexp_of_scanned expected))
-      (match Kv.scanned text with Ok got -> Base.Sexp.to_string (Kv.sexp_of_scanned got) | Error (`Proto _) -> "not protobuf")
+    Alcotest.(check string) name (show_scan expected)
+      (match Kv.scanned text with Ok got -> show_scan got | Error (`Proto _) -> "not protobuf")
   in
   let peer = message (fun buffer -> Proto.uint buffer 1 4L; Proto.uint buffer 2 8L) in
   let inner field fill = message (fun buffer -> Proto.bytes buffer 1 "why"; Proto.bytes buffer field (message fill)) in
@@ -113,15 +130,30 @@ let decoded () =
   check "disk full, by its number" (Region_error (Other { kind = 15; message = "why" })) (response ~region_error:(inner 15 ignore) []);
   check "a message alone" (Region_error (Other { kind = 0; message = "m" }))
     (response ~region_error:(message (fun buffer -> Proto.bytes buffer 1 "m"; Proto.uint buffer 30 1L)) []);
-  let lock = message (fun buffer -> Proto.bytes buffer 1 "p"; Proto.uint buffer 2 99L; Proto.bytes buffer 3 "k"; Proto.uint buffer 4 3000L) in
-  check "locked" (Key_error (Locked { primary = "p"; version = 99L; key = "k"; ttl = 3000L }))
-    (response ~error:(message (fun buffer -> Proto.bytes buffer 1 lock)) []);
+  let lock = lock_message "k" in
+  let failing lock = message (fun buffer -> Proto.bytes buffer 1 lock) in
+  check "locked, for the whole scan" (Reply (Locks (locked_by (), []))) (response ~error:(failing lock) []);
   check "retryable" (Key_error (Retryable "again")) (response ~error:(message (fun buffer -> Proto.bytes buffer 2 "again")) []);
   check "abort" (Key_error (Abort "no")) (response ~error:(message (fun buffer -> Proto.bytes buffer 3 "no")) []);
-  check "a pair's error" (Key_error (Locked { primary = "p"; version = 99L; key = "k"; ttl = 3000L }))
+  check "a pair's lock" (Reply (Locks (locked_by (), [])))
     (message (fun buffer ->
          Proto.bytes buffer 2 (pair_message { key = "a"; value = "1" });
-         Proto.bytes buffer 2 (pair_message ~error:(message (fun buffer -> Proto.bytes buffer 1 lock)) { key = "b"; value = "" })));
+         Proto.bytes buffer 2 (pair_message ~error:(failing lock) { key = "b"; value = "" })));
+  check "every pair's lock, in key order" (Reply (Locks (locked_by ~key:"b" (), [ locked_by ~key:"d" () ])))
+    (message (fun buffer ->
+         Proto.bytes buffer 2 (pair_message { key = "a"; value = "1" });
+         Proto.bytes buffer 2 (pair_message ~error:(failing (lock_message "b")) { key = "b"; value = "" });
+         Proto.bytes buffer 2 (pair_message { key = "c"; value = "1" });
+         Proto.bytes buffer 2 (pair_message ~error:(failing (lock_message "d")) { key = "d"; value = "" })));
+  check "a pair's error other than a lock" (Key_error (Abort "no"))
+    (message (fun buffer ->
+         Proto.bytes buffer 2 (pair_message ~error:(failing (lock_message "b")) { key = "b"; value = "" });
+         Proto.bytes buffer 2 (pair_message ~error:(message (fun buffer -> Proto.bytes buffer 3 "no")) { key = "c"; value = "" })));
+  check "an async-commit primary lock" (Reply (Locks ({ (locked_by ()) with min_commit_ts = 77L; protocol = Async_commit [ "s1"; "s2" ] }, [])))
+    (response ~error:(failing (lock_message ~async:true ~min_commit:77L ~secondaries:[ "s1"; "s2" ] "k")) []);
+  check "secondaries of a lock not async are not kept" (Reply (Locks (locked_by (), [])))
+    (response ~error:(failing (lock_message ~secondaries:[ "s1" ] "k")) []);
+  check "the transaction not found" (Key_error Txn_not_found) (response ~error:(message (fun buffer -> Proto.bytes buffer 8 "")) []);
   check "the region error first" (Region_error Epoch_not_match)
     (response ~region_error:(inner 5 ignore) ~error:(message (fun buffer -> Proto.bytes buffer 2 "again")) [ { key = "a"; value = "1" } ]);
   Alcotest.(check bool) "a key of the wrong wire type" true
@@ -133,11 +165,27 @@ let pairs =
     QCheck2.Gen.(list_size (int_range 0 50) (pair (string_size ~gen:char (int_range 0 40)) (string_size ~gen:char (int_range 0 400))))
     (fun pairs ->
       let pairs = List.map (fun (key, value) -> { Kv.key; value }) pairs in
-      match Kv.scanned (response pairs) with Ok (Pairs got) -> got = pairs | Ok _ | Error _ -> false)
+      match Kv.scanned (response pairs) with Ok (Reply (Pairs got)) -> got = pairs | Ok _ | Error _ -> false)
 
 let reference text =
   let open Base.Result.Let_syntax in
   let fields (pos, len) ~init ~f = Proto.fold text ~pos ~len ~init ~f in
+  let lock slice : (Kv.lock, _) result =
+    let%bind lock, async, secondaries =
+      fields slice ~init:({ Kv.primary = ""; version = 0L; key = ""; ttl = 0L; min_commit_ts = 0L; protocol = Two_phase }, false, [])
+        ~f:(fun (lock, async, secondaries) field value ->
+          match field with
+          | 1 -> Result.map (fun primary -> ({ lock with primary }, async, secondaries)) (Proto.contents text field value)
+          | 2 -> Result.map (fun version -> ({ lock with version }, async, secondaries)) (Proto.number field value)
+          | 3 -> Result.map (fun key -> ({ lock with key }, async, secondaries)) (Proto.contents text field value)
+          | 4 -> Result.map (fun ttl -> ({ lock with ttl }, async, secondaries)) (Proto.number field value)
+          | 8 -> Result.map (fun flag -> (lock, not (Int64.equal flag 0L), secondaries)) (Proto.number field value)
+          | 9 -> Result.map (fun min_commit_ts -> ({ lock with min_commit_ts }, async, secondaries)) (Proto.number field value)
+          | 10 -> Result.map (fun key -> (lock, async, secondaries @ [ key ])) (Proto.contents text field value)
+          | _ -> Ok (lock, async, secondaries))
+    in
+    Ok (if async then { lock with protocol = Async_commit secondaries } else lock)
+  in
   let key_error slice : (Kv.key_error, _) result =
     let%bind first =
       fields slice ~init:None ~f:(fun first field value -> match first with Some _ -> Ok first | None -> Ok (Some (field, value)))
@@ -146,17 +194,10 @@ let reference text =
     | None -> Ok (Kv.Other_key_error 0)
     | Some (1, value) ->
         let%bind slice = Proto.slice 1 value in
-        Result.map
-          (fun lock -> Kv.Locked lock)
-          (fields slice ~init:{ Kv.primary = ""; version = 0L; key = ""; ttl = 0L } ~f:(fun lock field value ->
-               match field with
-               | 1 -> Result.map (fun primary -> { lock with primary }) (Proto.contents text field value)
-               | 2 -> Result.map (fun version -> { lock with version }) (Proto.number field value)
-               | 3 -> Result.map (fun key -> { lock with key }) (Proto.contents text field value)
-               | 4 -> Result.map (fun ttl -> { lock with ttl }) (Proto.number field value)
-               | _ -> Ok lock))
+        Result.map (fun lock -> Kv.Locked lock) (lock slice)
     | Some (2, value) -> Result.map (fun reason -> Kv.Retryable reason) (Proto.contents text 2 value)
     | Some (3, value) -> Result.map (fun reason -> Kv.Abort reason) (Proto.contents text 3 value)
+    | Some (8, _) -> Ok Kv.Txn_not_found
     | Some (field, _) -> Ok (Kv.Other_key_error field)
   in
   let%bind region, pairs, error =
@@ -173,20 +214,27 @@ let reference text =
                   | _, 1 -> Result.map (fun slice -> `Failed slice) (Proto.slice field value)
                   | _ -> Ok pair)
             in
-            Ok (region, pair :: pairs, error)
+            Ok (region, pairs @ [ pair ], error)
         | 3 -> Result.map (fun slice -> (region, pairs, Some slice)) (Proto.slice field value)
         | _ -> Ok (region, pairs, error))
   in
   match (region, error) with
   | Some (pos, len), _ -> Result.map (fun error -> Kv.Region_error error) (Kv.region_error text ~pos ~len)
-  | None, Some slice -> Result.map (fun error -> Kv.Key_error error) (key_error slice)
-  | None, None ->
-      let rec collect acc = function
-        | [] -> Ok (Kv.Pairs acc)
-        | `Pair (key, value) :: rest -> collect ({ Kv.key; value } :: acc) rest
-        | `Failed slice :: _ -> Result.map (fun error -> Kv.Key_error error) (key_error slice)
-      in
-      collect [] pairs
+  | None, Some slice ->
+      Result.map (fun (error : Kv.key_error) -> match error with Locked lock -> Kv.Reply (Kv.Locks (lock, [])) | error -> Kv.Key_error error) (key_error slice)
+  | None, None -> (
+      let failed = List.filter_map (function `Failed slice -> Some slice | `Pair _ -> None) pairs in
+      let%bind backwards = Base.Result.all (List.map key_error (List.rev failed)) in
+      let errors = List.rev backwards in
+      match errors with
+      | [] -> Ok (Kv.Reply (Kv.Pairs (List.filter_map (function `Pair (key, value) -> Some { Kv.key; value } | `Failed _ -> None) pairs)))
+      | _ :: _ -> (
+          match List.find_opt (function Kv.Locked _ -> false | _ -> true) errors with
+          | Some error -> Ok (Kv.Key_error error)
+          | None -> (
+              match List.filter_map (function Kv.Locked lock -> Some lock | _ -> None) errors with
+              | first :: rest -> Ok (Kv.Reply (Kv.Locks (first, rest)))
+              | [] -> Ok (Kv.Key_error (Other_key_error 0)))))
 
 let rec raw_varint buffer n =
   if n >= 0 && n < 0x80 then Buffer.add_char buffer (Char.chr n)
@@ -254,19 +302,19 @@ let fast_path =
     messages
     (fun text ->
       let show result =
-        match result with Ok scanned -> Base.Sexp.to_string (Kv.sexp_of_scanned scanned) | Error (`Proto error) -> Base.Sexp.to_string (Proto.sexp_of_error error)
+        match result with Ok scanned -> show_scan scanned | Error (`Proto error) -> Base.Sexp.to_string (Proto.sexp_of_error error)
       in
       show (Kv.scanned text) = show (reference text))
 
 let scan () =
   let pairs = List.init 3000 (fun i -> { Kv.key = Printf.sprintf "t\x80%08d" i; value = String.make (i mod 300) 'v' }) in
-  let request = Kv.scan_request region ~direction:Forward ~start:"t\x80" ~stop:(Before "t\x81") ~version:42L ~limit:5000 in
+  let request = Kv.scan_request region Kv.nothing_settled ~direction:Forward ~start:"t\x80" ~stop:(Before "t\x81") ~version:42L ~limit:5000 in
   let reply : Test_http2.reply = { (reply ~trailers:[ ("grpc-status", "0") ] (framed (response pairs))) with fragments = 2 } in
   let scenario : Test_http2.scenario =
     { initial_window = 65_535; max_frame = 16_384; exchanges = [ { path = "/tikvpb.Tikv/KvScan"; headers = []; body = framed request; reply } ] }
   in
   let result, heard, _ =
-    Test_http2.session scenario (fun connection -> Kv.scan connection region ~direction:Forward ~start:"t\x80" ~stop:(Before "t\x81") ~version:42L ~limit:5000)
+    Test_http2.session scenario (fun connection -> Kv.scan connection region Kv.nothing_settled ~direction:Forward ~start:"t\x80" ~stop:(Before "t\x81") ~version:42L ~limit:5000)
   in
   Alcotest.(check (list string)) "faults" [] heard.faults;
   Alcotest.(check bool) "the request as gRPC asks"
@@ -278,7 +326,95 @@ let scan () =
         && List.assoc_opt "content-type" headers = Some "application/grpc"
         && List.assoc_opt "te" headers = Some "trailers"
     | _ -> false);
-  Alcotest.(check bool) "every pair" true (match result with Ok (Pairs got) -> got = pairs | Ok _ | Error _ -> false)
+  Alcotest.(check bool) "every pair" true (match result with Ok (Reply (Pairs got)) -> got = pairs | Ok _ | Error _ -> false)
+
+let statuses () =
+  let numbers text = List.filter_map (fun (field, (value : Proto.value)) -> match value with Varint n -> Some (field, n) | _ -> None) (fields text) in
+  let check_of current missing sync : Kv.check = { primary = "pk"; version = 400L; caller = 900L; current; missing; sync } in
+  let text = Kv.check_request region (check_of (At 1000L) Leave_if_missing As_locked) in
+  let top = fields text in
+  Alcotest.(check (list (pair int int64))) "the region" [ (1, 7L) ] (numbers (sub text (List.assoc 1 top)));
+  Alcotest.(check string) "the primary key" "pk" (sub text (List.assoc 2 top));
+  Alcotest.(check (list (pair int int64))) "start, caller, now, the primary verified" [ (3, 400L); (4, 900L); (5, 1000L); (9, 1L) ] (numbers text);
+  Alcotest.(check (list (pair int int64))) "past every TTL, rolled back if missing, as sync commit"
+    [ (3, 400L); (4, 900L); (5, -1L); (6, 1L); (7, 1L); (9, 1L) ]
+    (numbers (Kv.check_request region (check_of Past_every_ttl Rollback_if_missing Sync_commit_forced)));
+  let show reply = Base.Sexp.to_string ([%sexp_of: Kv.status Kv.reply] reply) in
+  let checked name expected fill =
+    Alcotest.(check string) name (show expected)
+      (match Kv.checked (message fill) with Ok got -> show got | Error (`Proto _) -> "not protobuf")
+  in
+  checked "committed" (Reply (Committed 950L)) (fun buffer -> Proto.uint buffer 4 950L);
+  List.iter
+    (fun action -> checked (Printf.sprintf "rolled back, action %Ld" action) (Reply Rolled_back) (fun buffer -> Proto.uint buffer 5 action))
+    [ 0L; 1L; 2L ];
+  checked "rolled back, no action at all" (Reply Rolled_back) ignore;
+  checked "a pessimistic action, neither" (Reply (Unsettled 5)) (fun buffer -> Proto.uint buffer 5 5L);
+  checked "alive, pushed" (Reply (Uncommitted { ttl = 3000L; pushed = Pushed; min_commit_ts = 901L; protocol = Two_phase }))
+    (fun buffer ->
+      Proto.uint buffer 3 3000L;
+      Proto.uint buffer 5 3L;
+      Proto.bytes buffer 6 (lock_message ~min_commit:901L "pk"));
+  checked "alive, not pushed" (Reply (Uncommitted { ttl = 3000L; pushed = Not_pushed; min_commit_ts = 0L; protocol = Two_phase }))
+    (fun buffer ->
+      Proto.uint buffer 3 3000L;
+      Proto.bytes buffer 6 (lock_message "pk"));
+  checked "alive, async commit" (Reply (Uncommitted { ttl = 3000L; pushed = Not_pushed; min_commit_ts = 905L; protocol = Async_commit [ "s1"; "s2" ] }))
+    (fun buffer ->
+      Proto.uint buffer 3 3000L;
+      Proto.bytes buffer 6 (lock_message ~async:true ~min_commit:905L ~secondaries:[ "s1"; "s2" ] "pk"));
+  checked "alive, its lock not told" (Reply (Uncommitted { ttl = 20L; pushed = Not_pushed; min_commit_ts = 0L; protocol = Two_phase }))
+    (fun buffer -> Proto.uint buffer 3 20L);
+  checked "not found" (Key_error Txn_not_found) (fun buffer -> Proto.bytes buffer 2 (message (fun buffer -> Proto.bytes buffer 8 "")));
+  checked "a region error first" (Region_error Epoch_not_match)
+    (fun buffer ->
+      Proto.bytes buffer 1 (message (fun buffer -> Proto.bytes buffer 5 ""));
+      Proto.bytes buffer 2 (message (fun buffer -> Proto.bytes buffer 8 "")));
+  let text = Kv.secondaries_request region ~version:400L [ "s1"; "s2" ] in
+  let top = fields text in
+  Alcotest.(check (list (pair int int64))) "secondaries: the region" [ (1, 7L) ] (numbers (sub text (List.assoc 1 top)));
+  Alcotest.(check (list string)) "secondaries: the keys in order" [ "s1"; "s2" ]
+    (List.filter_map (fun (field, value) -> if field = 2 then Some (sub text value) else None) top);
+  Alcotest.(check (list (pair int int64))) "secondaries: the start" [ (3, 400L) ] (numbers text);
+  let show reply = Base.Sexp.to_string ([%sexp_of: Kv.secondaries Kv.reply] reply) in
+  let found name expected fill =
+    Alcotest.(check string) name (show expected)
+      (match Kv.secondaries_checked (message fill) with Ok got -> show got | Error (`Proto _) -> "not protobuf")
+  in
+  let secondary key : Kv.lock = { (locked_by ~key ()) with min_commit_ts = 903L; protocol = Async_commit [] } in
+  found "the locks, in order" (Reply (Locks_found [ secondary "s1"; secondary "s2" ]))
+    (fun buffer ->
+      Proto.bytes buffer 3 (lock_message ~async:true ~min_commit:903L "s1");
+      Proto.bytes buffer 3 (lock_message ~async:true ~min_commit:903L "s2"));
+  found "none" (Reply (Locks_found [])) ignore;
+  found "committed" (Reply (Committed_secondary 910L)) (fun buffer -> Proto.uint buffer 4 910L);
+  found "a key error" (Key_error (Abort "no")) (fun buffer -> Proto.bytes buffer 2 (message (fun buffer -> Proto.bytes buffer 3 "no")))
+
+let calls () =
+  let check : Kv.check = { primary = "pk"; version = 400L; caller = 900L; current = At 1000L; missing = Leave_if_missing; sync = As_locked } in
+  let answered path body response : Test_http2.exchange = { path; headers = []; body = framed body; reply = reply ~trailers:[ ("grpc-status", "0") ] (framed response) } in
+  let scenario : Test_http2.scenario =
+    {
+      initial_window = 65_535;
+      max_frame = 16_384;
+      exchanges =
+        [
+          answered "/tikvpb.Tikv/KvCheckTxnStatus" (Kv.check_request region check) (message (fun buffer -> Proto.uint buffer 4 950L));
+          answered "/tikvpb.Tikv/KvCheckSecondaryLocks" (Kv.secondaries_request region ~version:400L [ "s" ]) (message (fun buffer -> Proto.uint buffer 4 960L));
+        ];
+    }
+  in
+  let result, heard, _ =
+    Test_http2.session scenario (fun connection ->
+        Result.bind (Kv.check connection region check) (fun status ->
+            Result.map (fun secondaries -> (status, secondaries)) (Kv.check_secondaries connection region ~version:400L [ "s" ])))
+  in
+  Alcotest.(check (list string)) "faults" [] heard.faults;
+  Alcotest.(check (list (option string))) "each call on its path"
+    [ Some "/tikvpb.Tikv/KvCheckTxnStatus"; Some "/tikvpb.Tikv/KvCheckSecondaryLocks" ]
+    (List.map (fun (headers, _) -> List.assoc_opt ":path" headers) heard.requests);
+  Alcotest.(check bool) "each answer read" true
+    (match result with Ok (Reply (Committed 950L), Reply (Committed_secondary 960L)) -> true | Ok _ | Error _ -> false)
 
 let splits () =
   let text = Kv.split_request region [ "t\x80a"; "t\x80b" ] in
@@ -301,6 +437,8 @@ let tests =
     Alcotest.test_case "a scan request carries the region, range and version" `Quick request;
     Alcotest.test_case "scan responses: pairs, region errors, key errors" `Quick decoded;
     Alcotest.test_case "a scan over HTTP/2 brings every pair" `Quick scan;
+    Alcotest.test_case "transaction status: requests and responses" `Quick statuses;
+    Alcotest.test_case "transaction status over HTTP/2" `Quick calls;
     QCheck_alcotest.to_alcotest pairs;
     QCheck_alcotest.to_alcotest fast_path;
   ]

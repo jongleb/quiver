@@ -335,6 +335,52 @@ let keep () =
     (result = Ok [ Ok (); Ok (); Error (`Pd (Pd.Gc_passed { version = 1000L; least = 1001L })); Ok () ]
     && List.map snd heard.requests = List.map (fun (exchange : Test_http2.exchange) -> exchange.body) scenario.exchanges)
 
+let tso () =
+  let listener, port = Test_http2.listening () in
+  let stamp ?(header = header 42L) physical logical =
+    ok
+      (message (fun buffer ->
+           Proto.bytes buffer 1 header;
+           Proto.uint buffer 2 1L;
+           Proto.bytes buffer 3 (message (fun buffer -> Proto.uint buffer 1 physical; Proto.uint buffer 2 logical))))
+  in
+  let asked = request 42L (fun buffer -> Proto.uint buffer 2 1L) in
+  let scenario : Test_http2.scenario =
+    {
+      initial_window = 65_535;
+      max_frame = 16_384;
+      exchanges =
+        [
+          exchange "GetMembers" (request 0L ignore) (ok (members port));
+          exchange "GetAllStores" (request 42L (fun buffer -> Proto.uint buffer 2 1L)) (ok stores);
+          exchange "Tso" asked (stamp 1_700_000_000_123L 77L);
+          exchange "Tso" asked (ok (message (fun buffer -> Proto.bytes buffer 1 (header 42L))));
+          exchange "Tso" asked (stamp ~header:(header ~refusal:(2L, "not leader") 42L) 1L 1L);
+        ];
+    }
+  in
+  let heard = Support.start (fun () -> Test_http2.serve listener scenario) in
+  let result =
+    Result.map
+      (fun pd ->
+        let results = List.init 3 (fun _ -> Pd.tso pd) in
+        Pd.close pd;
+        results)
+      (Pd.connect { timeout = Core.Time_ns.Span.of_int_sec 5; security = Cleartext } (Printf.sprintf "127.0.0.1:%d" port))
+  in
+  let heard = Support.join heard in
+  Unix.close listener;
+  Alcotest.(check (list string)) "faults" [] heard.faults;
+  Alcotest.(check bool) "physical milliseconds over 18 bits of logical, none, refused" true
+    (result
+     = Ok
+         [
+           Ok (Int64.logor (Int64.shift_left 1_700_000_000_123L 18) 77L);
+           Error (`Pd Pd.No_timestamp);
+           Error (`Pd (Pd.Refused { kind = 2; message = "not leader" }));
+         ]
+    && List.map snd heard.requests = List.map (fun (exchange : Test_http2.exchange) -> exchange.body) scenario.exchanges)
+
 let held () =
   let run ~every ~refuse work =
     let log = Portable.Atomic.make [] and finished = Portable.Atomic.make `Running in
@@ -401,6 +447,7 @@ let tests =
   [
     Alcotest.test_case "a version held from GC, refused once GC may have passed it, let go" `Quick keep;
     Alcotest.test_case "a version held while the work runs, checked after it" `Quick held;
+    Alcotest.test_case "a timestamp from PD's oracle" `Quick tso;
     Alcotest.test_case "PD's refusals and broken answers" `Quick refusals;
     Alcotest.test_case "a follower sends the client to the leader" `Quick follower;
     Alcotest.test_case "the leader's URL in the clear or under TLS" `Quick urls;

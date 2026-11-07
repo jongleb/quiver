@@ -58,12 +58,6 @@ type t =
       (** The table's [AUTO_INCREMENT] column, if it has one. *)
   | Clustering of Quiver_core.Schema.Name.t
   | Table_id of Quiver_core.Schema.Name.t  (** TiDB: the table's [TIDB_TABLE_ID]. *)
-  | Table_regions of int64
-      (** TiDB: id, bounds in hex of their order-keeping form, and epoch of each region holding
-          some of the table's keys; a region once for each of the table's ranges it holds. *)
-  | Region_peers of int64 * int64 list
-      (** TiDB: each region's peers, their stores, whether each leads (1 or 0) and the store's
-          address. *)
   | Pd_instances  (** TiDB: [host:port] of each PD server. *)
   | New_collations  (** TiDB: whether the cluster was made with the new collation framework, as [True] or [False]. *)
   | Next_row_ids of Quiver_core.Schema.Name.t

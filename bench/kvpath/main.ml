@@ -37,8 +37,8 @@ let () =
     (fun i ->
       let () =
         match Quiver_tikv.Kv.scanned texts.(i mod 8) with
-        | Ok (Pairs _) when scan_only -> ()
-        | Ok (Pairs pairs) ->
+        | Ok (Reply (Pairs _)) when scan_only -> ()
+        | Ok (Reply (Pairs pairs)) ->
             List.iter
               (fun (pair : Quiver_tikv.Kv.pair) ->
                 let key = match Quiver_tikv.Renumber.key plan pair.key with Some key -> key | None -> exit 1 in

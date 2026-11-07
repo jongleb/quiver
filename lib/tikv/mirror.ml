@@ -81,12 +81,16 @@ let cuts regions keys =
     regions
 
 let locate pd known ~start ~stop ~unheld (freshness : Read.freshness) key =
-  let%bind () =
-    match freshness with
-    | Known -> Ok ()
-    | Afresh -> Result.map (fun regions -> known := regions) (learned pd ~start ~stop:(Before stop))
-  in
-  Option.to_result ~none:(unheld key) (Region.find !known key)
+  if String.compare key start < 0 || String.compare stop key <= 0 then
+    Result.bind (learned pd ~start:key ~stop:(Before (key ^ "\x00"))) (fun regions ->
+        Option.to_result ~none:(unheld key) (Region.find regions key))
+  else
+    let%bind () =
+      match freshness with
+      | Known -> Ok ()
+      | Afresh -> Result.map (fun regions -> known := regions) (learned pd ~start ~stop:(Before stop))
+    in
+    Option.to_result ~none:(unheld key) (Region.find !known key)
 
 let reader pd stores ~start ~stop ~version ~limit =
   let%bind regions = learned pd ~start ~stop:(Before stop) in
@@ -94,9 +98,18 @@ let reader pd stores ~start ~stop ~version ~limit =
     ({
        locate = locate pd (ref regions) ~start ~stop ~unheld:(fun key -> `Read (Read.Unheld key));
        scan =
-         (fun region ~start ~stop ->
+         (fun region settled ~start ~stop ->
            let%bind connection = Stores.connection stores region.address in
-           Kv.scan connection region.context ~direction:Forward ~start ~stop ~version ~limit);
+           Kv.scan connection region.context settled ~direction:Forward ~start ~stop ~version ~limit);
+       check =
+         (fun region check ->
+           let%bind connection = Stores.connection stores region.address in
+           Kv.check connection region.context check);
+       secondaries =
+         (fun region ~version keys ->
+           let%bind connection = Stores.connection stores region.address in
+           Kv.check_secondaries connection region.context ~version keys);
+       now = (fun () -> Pd.tso pd);
        pause = (fun span -> Unix.sleepf (Core.Time_ns.Span.to_sec span));
      }
       : _ Read.store)
@@ -144,7 +157,7 @@ let range ~source ~target ~version ~commit_ts ~sizes ~plan (into, { start; stop 
       delivered
     in
     let%bind () =
-      Read.range read ~start ~stop:(Before stop) ~limit:sizes.scan ~f:(fun pairs ->
+      Read.range read ~version ~start ~stop:(Before stop) ~limit:sizes.scan ~f:(fun pairs ->
           let%bind () =
             Base.List.fold_result pairs ~init:() ~f:(fun () (pair : Kv.pair) ->
                 Option.fold ~none:(Ok ())
@@ -188,7 +201,7 @@ let described link (name : Quiver_core.Schema.Name.t) ~at ~dial =
     let got = ref [] in
     let%bind read = reader pd stores ~start ~stop ~version:at ~limit:256 in
     let%bind () =
-      Read.range read ~start ~stop:(Before stop) ~limit:256 ~f:(fun pairs ->
+      Read.range read ~version:at ~start ~stop:(Before stop) ~limit:256 ~f:(fun pairs ->
           got := List.rev_append pairs !got;
           Ok ())
     in
@@ -250,10 +263,10 @@ let table ~(from : reached) ~(into : reached) ~plan ~version ~commit_ts { timeou
           Option.bind (Region.find regions start) (fun (region : Region.t) ->
               match
                 Result.bind (Stores.connection source_stores region.address) (fun connection ->
-                    Kv.scan connection region.context ~direction ~start ~stop:(Before stop) ~version ~limit:1)
+                    Kv.scan connection region.context Kv.nothing_settled ~direction ~start ~stop:(Before stop) ~version ~limit:1)
               with
-              | Ok (Pairs [ pair ]) -> Some pair.key
-              | Ok (Pairs _ | Region_error _ | Key_error _) | Error _ -> None)
+              | Ok (Reply (Pairs [ pair ])) -> Some pair.key
+              | Ok (Reply (Pairs _ | Locks _) | Region_error _ | Key_error _) | Error _ -> None)
         in
         let rec kinds from cuts =
           match edge Forward ~start:from ~stop:part.stop with

@@ -43,8 +43,6 @@ type t =
   | Auto_increment of Quiver_core.Schema.Name.t
   | Clustering of Quiver_core.Schema.Name.t
   | Table_id of Quiver_core.Schema.Name.t
-  | Table_regions of int64
-  | Region_peers of int64 * int64 list
   | Pd_instances
   | New_collations
   | Next_row_ids of Quiver_core.Schema.Name.t
@@ -306,16 +304,6 @@ let sql = function
       [%string
         "SELECT TIDB_TABLE_ID FROM information_schema.TABLES WHERE TABLE_SCHEMA = \
          %{text (database :> string)} AND TABLE_NAME = %{text (table :> string)}"]
-  | Table_regions table ->
-      [%string
-        "SELECT REGION_ID, START_KEY, END_KEY, EPOCH_CONF_VER, EPOCH_VERSION FROM \
-         information_schema.TIKV_REGION_STATUS WHERE TABLE_ID = %{table#Int64}"]
-  | Region_peers (first, rest) ->
-      let ids = String.concat ", " (List.map Int64.to_string (first :: rest)) in
-      [%string
-        "SELECT p.REGION_ID, p.PEER_ID, p.STORE_ID, p.IS_LEADER, s.ADDRESS FROM \
-         information_schema.TIKV_REGION_PEERS p JOIN information_schema.TIKV_STORE_STATUS s ON s.STORE_ID = \
-         p.STORE_ID WHERE p.REGION_ID IN (%{ids})"]
   | Pd_instances -> "SELECT INSTANCE FROM information_schema.CLUSTER_INFO WHERE TYPE = 'pd'"
   | New_collations -> "SELECT VARIABLE_VALUE FROM mysql.tidb WHERE VARIABLE_NAME = 'new_collation_enabled'"
   | Next_row_ids name -> [%string "SHOW TABLE %{qualified name} NEXT_ROW_ID"]

@@ -9,6 +9,7 @@ type error =
   | Leaderless of int64
   | Gap of string
   | Gc_passed of { version : int64; least : int64 }
+  | No_timestamp
 [@@deriving sexp_of ~portable]
 
 type hold = Hold_for of Core.Time_ns.Span.t | Let_go
@@ -221,6 +222,22 @@ let scatter t regions =
   in
   Proto.fold response ~pos:0 ~len:(String.length response) ~init:[] ~f:(fun failed field value ->
       match field with 3 -> Result.map (fun ids -> List.rev_append ids failed) (Proto.numbers response field value) | _ -> Ok failed)
+
+let tso t =
+  let%bind _, response = call t.connection ~cluster:t.cluster ~name:"Tso" (fun buffer -> Proto.uint buffer 2 1L) in
+  let%bind stamp =
+    Proto.fold response ~pos:0 ~len:(String.length response) ~init:None ~f:(fun stamp field value ->
+        match field with 3 -> Result.map Option.some (Proto.slice field value) | _ -> Ok stamp)
+  in
+  let%bind pos, len = Option.to_result ~none:(`Pd No_timestamp) stamp in
+  let%bind physical, logical =
+    Proto.fold response ~pos ~len ~init:(0L, 0L) ~f:(fun (physical, logical) field value ->
+        match field with
+        | 1 -> Result.map (fun physical -> (physical, logical)) (Proto.number field value)
+        | 2 -> Result.map (fun logical -> (physical, logical)) (Proto.number field value)
+        | _ -> Ok (physical, logical))
+  in
+  Ok (Int64.logor (Int64.shift_left physical 18) logical)
 
 let keep t ~service hold version =
   let ttl = match hold with Hold_for span -> Int64.of_float (Float.ceil (Core.Time_ns.Span.to_sec span)) | Let_go -> 0L in

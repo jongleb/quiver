@@ -40,7 +40,7 @@ dumped 48211907 rows in 312 chunks into ./shop
 Global_read_lock held for 41ms
 ```
 
-Documentation of every command and of the masking language: <https://jongleb.github.io/quiver/>
+Documentation of every command and of the masking language: <https://jongleb.github.io/quiver/cli.html>
 (`quiver docs DIR` writes the same site from the binary at hand).
 
 ## Why quiver

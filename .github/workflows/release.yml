@@ -2,7 +2,8 @@ name: Release
 
 # A tag v<version> (the version in dune-project) builds the binaries and
 # publishes the GitHub release, the container image, the Homebrew formula and
-# the AUR package. Running it by hand only builds and keeps the artifacts.
+# the AUR package. Running it by hand rebuilds the artifacts and, when the
+# package signing key is available, republishes the site without making a release.
 on:
   push:
     tags: ["v*"]
@@ -209,9 +210,9 @@ jobs:
             ghcr.io/${{ github.repository }}:${{ needs.version.outputs.version }}
             ghcr.io/${{ github.repository }}:latest
 
-  # The apt and dnf repositories on GitHub Pages, signed with the key in
-  # PACKAGES_SIGNING_KEY (armored, no passphrase). Without a tag or a key the
-  # repositories are only built, with a throwaway key.
+  # The site, documentation and apt and dnf repositories on GitHub Pages,
+  # signed with PACKAGES_SIGNING_KEY (armored, no passphrase). Without the key
+  # the repositories are only built, with a throwaway key.
   repository:
     needs: [version, linux]
     runs-on: ubuntu-24.04
@@ -221,6 +222,16 @@ jobs:
       KEY: ${{ secrets.PACKAGES_SIGNING_KEY }}
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: |
+          npm ci
+          npm run check
+          npm test
+        working-directory: web
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -231,25 +242,28 @@ jobs:
         run: |
           if [ -n "$KEY" ]; then
             echo "$KEY" | gpg --batch --import
-            echo "publish=$GITHUB_REF_TYPE" >> "$GITHUB_OUTPUT"
+            echo "publish=true" >> "$GITHUB_OUTPUT"
           else
             echo "::warning::PACKAGES_SIGNING_KEY is not set; the repositories are not published"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
             gpg --batch --passphrase '' --quick-gen-key "quiver test" ed25519 sign never
           fi
           echo "id=$(gpg --list-secret-keys --with-colons | awk -F: '$1 == "fpr" { print $10; exit }')" >> "$GITHUB_OUTPUT"
       - run: packaging/repository.sh dist site ${{ steps.key.outputs.id }}
-      # The documentation, from the release binary itself, at the root of the same site.
+      # Keep the generated documentation at its existing /cli.html and /masking.html URLs.
       - run: |
           tar -xzf dist/quiver-*-x86_64-unknown-linux-gnu.tar.gz -C "$RUNNER_TEMP"
           "$RUNNER_TEMP"/quiver-*-x86_64-unknown-linux-gnu/quiver docs site
-      - if: steps.key.outputs.publish == 'tag'
+      # Overlay the landing page without removing package repositories or documentation.
+      - run: cp -a web/dist/. site/
+      - if: steps.key.outputs.publish == 'true'
         uses: actions/upload-pages-artifact@v3
         with:
           path: site
 
   pages:
-    needs: [release, repository]
-    if: needs.repository.outputs.publish == 'tag'
+    needs: repository
+    if: needs.repository.outputs.publish == 'true'
     runs-on: ubuntu-24.04
     permissions:
       pages: write

@@ -39,4 +39,20 @@ test("the page exposes navigation and an accessible install action", () => {
   assert.match(html, /data-copy-command/);
   assert.match(html, /aria-live="polite"/);
   assert.match(html, /execCommand\([`'"]copy[`'"]\)/);
+  assert.match(html, /href="\/quiver\/_astro\/[^"]+\.css"/);
+  assert.match(html, /href="https:\/\/jongleb\.github\.io\/quiver\/cli\.html"/);
+});
+
+test("the release workflow overlays the landing page while preserving docs and package repositories", () => {
+  const workflow = readFileSync(
+    new URL("../../.github/workflows/release.yml", import.meta.url),
+    "utf8",
+  );
+
+  assert.match(workflow, /working-directory: web/);
+  assert.match(workflow, /npm ci/);
+  assert.match(workflow, /npm test/);
+  assert.match(workflow, /quiver docs site/);
+  assert.match(workflow, /cp -a web\/dist\/\. site\//);
+  assert.match(workflow, /needs: repository/);
 });

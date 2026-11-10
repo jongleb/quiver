@@ -1,0 +1,79 @@
+name: Site
+
+# Publish the product site without rebuilding Quiver. Existing documentation
+# and package repositories are regenerated from the latest release assets.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "web/**"
+      - "packaging/repository.sh"
+      - ".github/workflows/site.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  site:
+    runs-on: ubuntu-24.04
+    env:
+      KEY: ${{ secrets.PACKAGES_SIGNING_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: |
+          npm ci
+          npm run check
+          npm test
+        working-directory: web
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir dist
+          gh release download \
+            --pattern "*.deb" \
+            --pattern "*.rpm" \
+            --pattern "quiver-*-x86_64-unknown-linux-gnu.tar.gz" \
+            --pattern SHA256SUMS \
+            --dir dist
+          cd dist
+          sha256sum --ignore-missing --check SHA256SUMS
+      - run: sudo apt-get update && sudo apt-get install -y apt-utils createrepo-c rpm
+      - id: key
+        run: |
+          if [ -z "$KEY" ]; then
+            echo "::error::PACKAGES_SIGNING_KEY is required to preserve the package repositories"
+            exit 1
+          fi
+          echo "$KEY" | gpg --batch --import
+          echo "id=$(gpg --list-secret-keys --with-colons | awk -F: '$1 == "fpr" { print $10; exit }')" >> "$GITHUB_OUTPUT"
+      - run: packaging/repository.sh dist site ${{ steps.key.outputs.id }}
+      - run: |
+          tar -xzf dist/quiver-*-x86_64-unknown-linux-gnu.tar.gz -C "$RUNNER_TEMP"
+          "$RUNNER_TEMP"/quiver-*-x86_64-unknown-linux-gnu/quiver docs site
+      - run: cp -a web/dist/. site/
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  pages:
+    needs: site
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4

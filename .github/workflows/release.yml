@@ -2,8 +2,7 @@ name: Release
 
 # A tag v<version> (the version in dune-project) builds the binaries and
 # publishes the GitHub release, the container image, the Homebrew formula and
-# the AUR package. Running it by hand rebuilds the artifacts and, when the
-# package signing key is available, republishes the site without making a release.
+# the AUR package. Running it by hand only builds and keeps the artifacts.
 on:
   push:
     tags: ["v*"]
@@ -211,8 +210,8 @@ jobs:
             ghcr.io/${{ github.repository }}:latest
 
   # The site, documentation and apt and dnf repositories on GitHub Pages,
-  # signed with PACKAGES_SIGNING_KEY (armored, no passphrase). Without the key
-  # the repositories are only built, with a throwaway key.
+  # signed with PACKAGES_SIGNING_KEY (armored, no passphrase). Without a tag or
+  # the key the repositories are only built, with a throwaway key.
   repository:
     needs: [version, linux]
     runs-on: ubuntu-24.04
@@ -242,10 +241,10 @@ jobs:
         run: |
           if [ -n "$KEY" ]; then
             echo "$KEY" | gpg --batch --import
-            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "publish=$GITHUB_REF_TYPE" >> "$GITHUB_OUTPUT"
           else
             echo "::warning::PACKAGES_SIGNING_KEY is not set; the repositories are not published"
-            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "publish=none" >> "$GITHUB_OUTPUT"
             gpg --batch --passphrase '' --quick-gen-key "quiver test" ed25519 sign never
           fi
           echo "id=$(gpg --list-secret-keys --with-colons | awk -F: '$1 == "fpr" { print $10; exit }')" >> "$GITHUB_OUTPUT"
@@ -256,14 +255,14 @@ jobs:
           "$RUNNER_TEMP"/quiver-*-x86_64-unknown-linux-gnu/quiver docs site
       # Overlay the landing page without removing package repositories or documentation.
       - run: cp -a web/dist/. site/
-      - if: steps.key.outputs.publish == 'true'
+      - if: steps.key.outputs.publish == 'tag'
         uses: actions/upload-pages-artifact@v3
         with:
           path: site
 
   pages:
-    needs: repository
-    if: needs.repository.outputs.publish == 'true'
+    needs: [release, repository]
+    if: needs.repository.outputs.publish == 'tag'
     runs-on: ubuntu-24.04
     permissions:
       pages: write

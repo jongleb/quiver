@@ -43,16 +43,17 @@ test("the page exposes navigation and an accessible install action", () => {
   assert.match(html, /href="https:\/\/jongleb\.github\.io\/quiver\/cli\.html"/);
 });
 
-test("the release workflow overlays the landing page while preserving docs and package repositories", () => {
-  const workflow = readFileSync(
-    new URL("../../.github/workflows/release.yml", import.meta.url),
-    "utf8",
-  );
+test("the site workflow overlays the landing page while preserving docs and package repositories", () => {
+  const workflowFile = new URL("../../.github/workflows/site.yml", import.meta.url);
+  assert.ok(existsSync(workflowFile), ".github/workflows/site.yml must exist");
+
+  const workflow = readFileSync(workflowFile, "utf8");
 
   assert.match(workflow, /working-directory: web/);
   assert.match(workflow, /npm ci/);
   assert.match(workflow, /npm test/);
+  assert.match(workflow, /gh release download/);
   assert.match(workflow, /quiver docs site/);
   assert.match(workflow, /cp -a web\/dist\/\. site\//);
-  assert.match(workflow, /needs: repository/);
+  assert.match(workflow, /actions\/deploy-pages@v4/);
 });

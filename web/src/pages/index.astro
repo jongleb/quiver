@@ -1,0 +1,70 @@
+---
+import Correctness from "../components/Correctness.astro";
+import FastPaths from "../components/FastPaths.astro";
+import Hero from "../components/Hero.astro";
+import Install from "../components/Install.astro";
+import Masking from "../components/Masking.astro";
+import Performance from "../components/Performance.astro";
+import Pipeline from "../components/Pipeline.astro";
+import SiteLayout from "../layouts/SiteLayout.astro";
+---
+
+<SiteLayout>
+  <header class="site-header">
+    <a class="brand" href="#top" aria-label="Quiver home">
+      <svg aria-hidden="true" viewBox="0 0 64 64">
+        <defs>
+          <linearGradient id="brand-ring" x1="0" y1="1" x2="1" y2="0">
+            <stop offset="0" stop-color="#5b92d2"></stop>
+            <stop offset="1" stop-color="#a9ccf2"></stop>
+          </linearGradient>
+          <linearGradient id="brand-fire" x1="0" x2="1">
+            <stop offset="0" stop-color="#ffc15e"></stop>
+            <stop offset="1" stop-color="#ec6813"></stop>
+          </linearGradient>
+        </defs>
+        <path
+          d="M42.5 30.5A17 17 0 1 1 33.4 21.5"
+          fill="none"
+          stroke="url(#brand-ring)"
+          stroke-width="7"
+        ></path>
+        <path
+          d="M9 49 47 11m-9-2 11 1-1 11"
+          fill="none"
+          stroke="url(#brand-fire)"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          stroke-width="5"
+        ></path>
+      </svg>
+      <span>quiver</span>
+    </a>
+    <nav aria-label="Primary">
+      <a href="#pipeline">Pipeline</a>
+      <a href="#performance">Performance</a>
+      <a href="#tidb">TiDB</a>
+      <a href="#masking">Masking</a>
+    </nav>
+    <a class="header-cta" href="#install">Install <span aria-hidden="true">↘</span></a>
+  </header>
+
+  <main id="main-content">
+    <Hero />
+    <Pipeline />
+    <Performance />
+    <FastPaths />
+    <Masking />
+    <Correctness />
+    <Install />
+  </main>
+
+  <footer class="site-footer">
+    <p>Built to move data. Built to prove it arrived.</p>
+    <div>
+      <a href="https://github.com/jongleb/quiver">GitHub</a>
+      <a href="https://jongleb.github.io/quiver/">Documentation</a>
+      <span>AGPL-3.0-or-later</span>
+    </div>
+  </footer>
+</SiteLayout>

@@ -1,0 +1,105 @@
+<section class="pipeline-section section-shell" id="pipeline" aria-labelledby="pipeline-title">
+  <div class="section-heading">
+    <p class="eyebrow"><span></span> The data plane</p>
+    <h2 id="pipeline-title">Not another dump utility.<br /><em>A complete route.</em></h2>
+    <p>
+      One source read becomes files, a direct copy or a secure multi-hop stream.
+      Every stage has its own cores. Every slow edge gets work, not sympathy.
+    </p>
+  </div>
+
+  <div class="pipeline-map" aria-label="Quiver data pipeline">
+    <div class="pipeline-source">
+      <small>SOURCE</small>
+      <div class="database-shape">
+        <span></span>
+        <strong>MySQL</strong>
+        <em>one snapshot</em>
+      </div>
+      <p>socket buffer</p>
+    </div>
+    <div class="pipeline-arrow" aria-hidden="true"><i></i><i></i><i></i></div>
+    <div class="pipeline-stage readers">
+      <small>STAGE 01</small>
+      <strong>Readers</strong>
+      <p>binary rows → columnar batches</p>
+      <div class="stage-bars"><i></i><i></i><i></i><i></i></div>
+    </div>
+    <div class="pipeline-arrow compact" aria-hidden="true"><i></i><i></i></div>
+    <div class="pipeline-stage renderers">
+      <small>STAGE 02</small>
+      <strong>Renderers</strong>
+      <p>mask · SQL · CSV · zstd</p>
+      <div class="stage-bars"><i></i><i></i><i></i></div>
+    </div>
+    <div class="pipeline-arrow compact" aria-hidden="true"><i></i><i></i></div>
+    <div class="pipeline-targets">
+      <article><small>FILES</small><strong>mydumper layout</strong><span>xxh3 checked</span></article>
+      <article><small>SERVER</small><strong>direct copy</strong><span>no staging files</span></article>
+      <article><small>WIRE</small><strong>many streams</strong><span>mutual TLS 1.3</span></article>
+    </div>
+  </div>
+
+  <div class="mechanics-grid">
+    <article class="mechanic-card straggler-card">
+      <div class="card-index">01 / NO STRAGGLERS</div>
+      <h3>Nobody waits alone.</h3>
+      <p>
+        A chunk is not owned by one reader until the bitter end. Quiver reads
+        it in half-second key steps; as soon as another reader finishes its
+        work, it claims the next unread step from the heavy chunk. The long tail
+        is split while data is still moving.
+      </p>
+      <div class="lane-chart" aria-label="Readers join a heavy chunk to finish sooner">
+        <div class="chart-axis"><span>0.00s</span><span>0.48s</span><span>1.18s</span></div>
+        <div class="reader-lane"><b>R0</b><i class="work cool"></i><i class="assist a"></i></div>
+        <div class="reader-lane"><b>R1</b><i class="work cool short"></i><i class="assist b"></i></div>
+        <div class="reader-lane"><b>R2</b><i class="work hot"></i></div>
+        <div class="join-marker"><span>readers join</span></div>
+      </div>
+    </article>
+
+    <article class="mechanic-card network-card">
+      <div class="card-index">02 / SELF-TUNING WIRE</div>
+      <h3>The link sets the pace.</h3>
+      <p>
+        Every second Quiver measures throughput, grows streams only when they
+        help, and moves zstd between none, fast, 1 and 3.
+      </p>
+      <div class="stream-meter" aria-label="Streams and compression adapt to throughput">
+        <div class="meter-labels"><span>streams</span><strong>4 → 8 → 16</strong></div>
+        <div class="stream-lines">
+          <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+        </div>
+        <div class="throughput">
+          <span>throughput</span>
+          <svg viewBox="0 0 320 70" role="img" aria-label="Throughput rises as streams are added">
+            <path d="M0 62 C45 60 54 45 88 47 S130 35 160 38 S204 14 244 18 S280 8 320 10"></path>
+            <path class="fill" d="M0 62 C45 60 54 45 88 47 S130 35 160 38 S204 14 244 18 S280 8 320 10 L320 70 L0 70Z"></path>
+          </svg>
+        </div>
+        <div class="compression-ladder">
+          <span>none</span><span>fast</span><span class="active">zstd 1</span><span>zstd 3</span>
+        </div>
+      </div>
+    </article>
+
+    <article class="mechanic-card resilience-card">
+      <div class="card-index">03 / ACKNOWLEDGED</div>
+      <h3>A broken stream is a reroute.</h3>
+      <p>
+        Frames carry two checksums and wait for acknowledgement. If a stream
+        breaks, its unacknowledged frames move to the survivors.
+      </p>
+      <div class="frame-reroute" aria-label="Frames reroute around a failed stream">
+        <div class="frame-source">QW</div>
+        <div class="frame-tracks">
+          <span><i>04</i><i>07</i><i>10</i></span>
+          <span class="failed"><i>05</i><b>×</b><i>08</i></span>
+          <span><i>06</i><i>09</i><i>11</i></span>
+        </div>
+        <div class="frame-target">ACK</div>
+      </div>
+    </article>
+  </div>
+</section>

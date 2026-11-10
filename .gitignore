@@ -13,3 +13,6 @@ _build_ox_release/
 /dist/
 _build_dist/
 _build_ox_static/
+web/node_modules/
+web/dist/
+web/.astro/

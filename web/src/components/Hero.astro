@@ -1,0 +1,84 @@
+<section class="hero section-shell" id="top" aria-labelledby="hero-title">
+  <div class="hero-copy">
+    <p class="eyebrow"><span></span> Parallel consistent data mover</p>
+    <h1 id="hero-title">One snapshot.<br /><em>Every path.</em></h1>
+    <p class="hero-lede">
+      Dump, copy, stream and mask MySQL, MariaDB and TiDB through one
+      high-throughput pipeline—without staging the world.
+    </p>
+    <div class="hero-actions">
+      <a class="button button-primary" href="#install">Start moving data</a>
+      <a class="button button-ghost" href="#pipeline">
+        See the data plane <span aria-hidden="true">↓</span>
+      </a>
+    </div>
+    <div class="support-line" aria-label="Supported database versions">
+      <span><i class="db-dot mysql"></i>MySQL 8.0 · 8.4</span>
+      <span><i class="db-dot maria"></i>MariaDB 10.11 · 11.4 · 11.8</span>
+      <span><i class="db-dot tidb"></i>TiDB 8.5</span>
+    </div>
+  </div>
+
+  <div class="hero-machine" aria-label="One consistent snapshot flows to files, servers and the network">
+    <div class="machine-grid" aria-hidden="true"></div>
+    <div class="snapshot-core">
+      <div class="core-rings">
+        <span></span><span></span><span></span>
+      </div>
+      <strong>01</strong>
+      <small>SNAPSHOT</small>
+    </div>
+    <div class="route route-files">
+      <span class="route-pulse"></span>
+      <div><small>OUTPUT / 01</small><strong>files</strong><em>SQL · CSV · zstd</em></div>
+    </div>
+    <div class="route route-server">
+      <span class="route-pulse"></span>
+      <div><small>OUTPUT / 02</small><strong>live server</strong><em>copy · load</em></div>
+    </div>
+    <div class="route route-wire">
+      <span class="route-pulse"></span>
+      <div><small>OUTPUT / 03</small><strong>the wire</strong><em>agent → relay → collect</em></div>
+    </div>
+    <div class="telemetry">
+      <span>readers <b>08</b></span>
+      <span>sessions <b>16</b></span>
+      <span>lock <b>41ms</b></span>
+    </div>
+  </div>
+
+  <div class="hero-terminal">
+    <div class="terminal-bar">
+      <span></span><span></span><span></span>
+      <p>quiver — zsh</p>
+      <small>LIVE RUN</small>
+    </div>
+    <pre><code><span class="prompt">$</span> quiver dump -h db.example -B shop --compress zstd -o ./shop
+<span class="result">dumped 48,211,907 rows in 312 chunks into ./shop</span>
+<span class="muted">8 readers · 16 sessions · 4 renderers · 16 cores</span>
+<span class="accent">Global_read_lock held for 41ms</span></code></pre>
+  </div>
+
+  <div class="hero-proof" aria-label="Selected measured results">
+    <article>
+      <strong>1.36×</strong>
+      <span>faster dump</span>
+      <small>vs mydumper, measured setup</small>
+    </article>
+    <article>
+      <strong>2.8×</strong>
+      <span>faster thin link</span>
+      <small>adaptive multi-stream transport</small>
+    </article>
+    <article>
+      <strong>0</strong>
+      <span>allocations / cell</span>
+      <small>socket → Arrow-layout columns</small>
+    </article>
+    <article>
+      <strong>1</strong>
+      <span>consistent snapshot</span>
+      <small>many readers, one point in time</small>
+    </article>
+  </div>
+</section>

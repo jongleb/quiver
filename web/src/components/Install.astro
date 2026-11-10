@@ -1,0 +1,150 @@
+<section class="install-section" id="install" aria-labelledby="install-title">
+  <div class="install-glow" aria-hidden="true"></div>
+  <div class="section-shell">
+    <div class="install-heading">
+      <p class="eyebrow"><span></span> Ready when the source is</p>
+      <h2 id="install-title">Move the first<br /><em>48 million rows.</em></h2>
+      <p>
+        One release binary with OpenSSL and zstd built in. Available for Apple
+        silicon and modern x86_64 / arm64 Linux.
+      </p>
+    </div>
+
+    <div class="install-box">
+      <div class="command-tabs" role="tablist" aria-label="Installation method">
+        <button
+          id="tab-homebrew"
+          type="button"
+          role="tab"
+          aria-selected="true"
+          aria-controls="panel-homebrew"
+          data-command-tab="homebrew">Homebrew</button
+        >
+        <button
+          id="tab-shell"
+          type="button"
+          role="tab"
+          aria-selected="false"
+          aria-controls="panel-shell"
+          data-command-tab="shell">Install script</button
+        >
+        <button
+          id="tab-docker"
+          type="button"
+          role="tab"
+          aria-selected="false"
+          aria-controls="panel-docker"
+          data-command-tab="docker">Docker</button
+        >
+      </div>
+      <div class="command-panel" id="panel-homebrew" role="tabpanel" aria-labelledby="tab-homebrew" data-command-panel="homebrew">
+        <span>$</span><code>brew install jongleb/tap/quiver</code>
+      </div>
+      <div class="command-panel" id="panel-shell" role="tabpanel" aria-labelledby="tab-shell" data-command-panel="shell" hidden>
+        <span>$</span><code>curl -fsSL https://raw.githubusercontent.com/jongleb/quiver/main/install.sh | sh</code>
+      </div>
+      <div class="command-panel" id="panel-docker" role="tabpanel" aria-labelledby="tab-docker" data-command-panel="docker" hidden>
+        <span>$</span><code>docker run --rm ghcr.io/jongleb/quiver --help</code>
+      </div>
+      <button class="copy-command" type="button" data-copy-command>
+        <span>Copy command</span>
+        <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M8 8h11v11H8zM5 16H4V5h11v1"></path></svg>
+      </button>
+      <p class="copy-status" aria-live="polite"></p>
+    </div>
+
+    <div class="quick-start">
+      <article>
+        <span>01</span>
+        <code>quiver dump</code>
+        <p>Consistent MySQL-family data to checksummed SQL or CSV.</p>
+      </article>
+      <article>
+        <span>02</span>
+        <code>quiver copy</code>
+        <p>Source to live target, with no mandatory staging files.</p>
+      </article>
+      <article>
+        <span>03</span>
+        <code>quiver agent</code>
+        <p>Read near the source, stream over adaptive secure links.</p>
+      </article>
+      <article>
+        <span>04</span>
+        <code>quiver mirror</code>
+        <p>TiDB to TiDB as raw keys, checked store to store.</p>
+      </article>
+    </div>
+
+    <div class="final-links">
+      <a class="button button-primary" href="https://jongleb.github.io/quiver/">Read the full docs ↗</a>
+      <a class="button button-ghost" href="https://github.com/jongleb/quiver">Explore the source ↗</a>
+    </div>
+  </div>
+</section>
+
+<script>
+  for (const tab of document.querySelectorAll<HTMLButtonElement>("[data-command-tab]")) {
+    tab.addEventListener("click", () => {
+      const tabList = tab.closest('[role="tablist"]');
+      const installBox = tab.closest(".install-box");
+      const selectedCommand = tab.dataset.commandTab;
+
+      if (!tabList || !installBox || !selectedCommand) {
+        return;
+      }
+
+      for (const candidate of tabList.querySelectorAll<HTMLButtonElement>("[data-command-tab]")) {
+        candidate.setAttribute(
+          "aria-selected",
+          candidate.dataset.commandTab === selectedCommand ? "true" : "false",
+        );
+      }
+
+      for (const panel of installBox.querySelectorAll<HTMLElement>("[data-command-panel]")) {
+        panel.hidden = panel.dataset.commandPanel !== selectedCommand;
+      }
+
+      installBox.querySelector<HTMLElement>(".copy-status")?.replaceChildren();
+    });
+  }
+
+  document.querySelector<HTMLButtonElement>("[data-copy-command]")?.addEventListener("click", async (event) => {
+    const button = event.currentTarget;
+
+    if (!(button instanceof HTMLButtonElement)) {
+      return;
+    }
+
+    const installBox = button.closest(".install-box");
+    const activeCommand = installBox?.querySelector<HTMLElement>("[data-command-panel]:not([hidden]) code");
+    const status = installBox?.querySelector<HTMLElement>(".copy-status");
+
+    if (!activeCommand?.textContent || !status) {
+      return;
+    }
+
+    try {
+      await navigator.clipboard.writeText(activeCommand.textContent);
+      status.textContent = "Copied to clipboard.";
+      button.querySelector("span")?.replaceChildren("Copied");
+    } catch {
+      const selectionTarget = document.createElement("textarea");
+      selectionTarget.value = activeCommand.textContent;
+      selectionTarget.style.position = "fixed";
+      selectionTarget.style.opacity = "0";
+      document.body.append(selectionTarget);
+      selectionTarget.select();
+
+      if ((document as unknown as { execCommand(commandId: string): boolean }).execCommand("copy")) {
+        status.textContent = "Copied to clipboard.";
+        button.querySelector("span")?.replaceChildren("Copied");
+      } else {
+        status.textContent = "Copy failed. Select the command manually.";
+        button.querySelector("span")?.replaceChildren("Copy failed");
+      }
+
+      selectionTarget.remove();
+    }
+  });
+</script>

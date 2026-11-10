@@ -1,0 +1,109 @@
+<section class="masking-section" id="masking" aria-labelledby="masking-title">
+  <div class="section-shell">
+    <div class="section-heading split-heading">
+      <div>
+        <p class="eyebrow"><span></span> Safe production-shaped data</p>
+        <h2 id="masking-title">Keep relationships.<br /><em>Lose identities.</em></h2>
+      </div>
+      <p>
+        Mask on the render threads before values reach a file, the wire or the
+        target. Rules are type-checked against the schema before reading starts.
+      </p>
+    </div>
+
+    <div class="masking-console">
+      <div class="mask-code">
+        <div class="code-heading">
+          <span>policy.scm</span>
+          <small>TYPED · PREFLIGHTED</small>
+        </div>
+        <pre><code><span class="code-comment">; the same seed, every column, every run</span>
+<span class="code-fn">(permute</span> <span class="code-string">"shop.users.id"</span><span class="code-fn">)</span>
+<span class="code-fn">(references</span>
+  <span class="code-string">"shop.events.user_ref"</span>
+  <span class="code-string">"shop.users.id"</span><span class="code-fn">)</span>
+<span class="code-fn">(mask</span> <span class="code-string">"shop.users.name"</span> <span class="code-fn">(shape</span> value<span class="code-fn">))</span>
+<span class="code-fn">(permute</span> <span class="code-string">"shop.users.email"</span><span class="code-fn">)</span></code></pre>
+        <div class="masked-record">
+          <div>
+            <small>PRODUCTION</small>
+            <span>1</span><span>Mary Johnson</span><span>ivan.petrov1@mail.ru</span>
+          </div>
+          <i aria-hidden="true">→</i>
+          <div>
+            <small>MASKED</small>
+            <span>283289981</span><span>Clara Ctbcmze</span><span>dvjv.cainmk1@omkz.vx</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="relation-graph" aria-label="Key permutation spreads through foreign key relationships">
+        <div class="graph-heading">
+          <span>RELATION GRAPH</span>
+          <small>one keyed bijection</small>
+        </div>
+        <svg viewBox="0 0 680 410" role="img" aria-labelledby="relation-title relation-desc">
+          <title id="relation-title">Masked keys preserve foreign key relationships</title>
+          <desc id="relation-desc">
+            The users ID permutation propagates to orders, addresses, events, items and payments.
+          </desc>
+          <defs>
+            <marker id="graph-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M 0 0 L 10 5 L 0 10 z"></path>
+            </marker>
+          </defs>
+          <g class="graph-lines">
+            <path d="M215 118 C280 118 278 76 348 76"></path>
+            <path d="M215 126 C284 150 285 180 348 180"></path>
+            <path d="M215 134 C278 202 284 284 348 284"></path>
+            <path d="M486 180 C530 180 528 142 574 142"></path>
+            <path d="M486 188 C530 210 530 248 574 248"></path>
+          </g>
+          <g class="graph-node primary" transform="translate(58 84)">
+            <rect width="157" height="84" rx="14"></rect>
+            <text x="18" y="25">users</text>
+            <text class="field" x="18" y="50">id</text>
+            <text class="value" x="64" y="50">283289981</text>
+            <text class="tag" x="18" y="70">PERMUTED</text>
+          </g>
+          <g class="graph-node" transform="translate(348 38)">
+            <rect width="138" height="76" rx="14"></rect>
+            <text x="16" y="25">addresses</text>
+            <text class="field" x="16" y="50">user_id</text>
+            <text class="linked" x="114" y="50">✓</text>
+          </g>
+          <g class="graph-node" transform="translate(348 142)">
+            <rect width="138" height="76" rx="14"></rect>
+            <text x="16" y="25">orders</text>
+            <text class="field" x="16" y="50">user_id</text>
+            <text class="linked" x="114" y="50">✓</text>
+          </g>
+          <g class="graph-node" transform="translate(348 246)">
+            <rect width="138" height="76" rx="14"></rect>
+            <text x="16" y="25">events</text>
+            <text class="field" x="16" y="50">user_ref</text>
+            <text class="linked" x="114" y="50">✓</text>
+          </g>
+          <g class="graph-node small" transform="translate(574 106)">
+            <rect width="94" height="72" rx="14"></rect>
+            <text x="14" y="25">items</text>
+            <text class="field" x="14" y="49">order_id</text>
+          </g>
+          <g class="graph-node small" transform="translate(574 212)">
+            <rect width="94" height="72" rx="14"></rect>
+            <text x="14" y="25">payments</text>
+            <text class="field" x="14" y="49">order_id</text>
+          </g>
+          <text class="graph-caption" x="58" y="379">Every join still resolves. Real identifiers never leave the reader.</text>
+        </svg>
+      </div>
+    </div>
+
+    <div class="masking-features">
+      <article><strong>FF1 permutation</strong><span>Bijective, format-preserving, key-safe</span></article>
+      <article><strong>Foreign-key propagation</strong><span>Children, grandchildren, composites, self-references</span></article>
+      <article><strong>Fail before read</strong><span>Unknown rules, broken types and unsafe key actions are refused</span></article>
+      <article><strong>Typed policy language</strong><span>Finite S-expressions compiled against every selected column</span></article>
+    </div>
+  </div>
+</section>

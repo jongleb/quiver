@@ -1,0 +1,82 @@
+<section class="performance-section" id="performance" aria-labelledby="performance-title">
+  <div class="section-shell performance-layout">
+    <div class="performance-copy">
+      <p class="eyebrow"><span></span> Measured, not imagined</p>
+      <h2 id="performance-title">Speed from the shape<br />of the system.</h2>
+      <p>
+        Quiver does less translation, shares tail work and keeps stages on
+        separate cores. The gains below are measurements—not universal promises.
+      </p>
+      <div class="benchmark-method">
+        <span>TEST RIG</span>
+        <p>Apple M5 · MySQL 8.4 in Docker · 4 threads</p>
+        <p>1.3 GB · warm buffer pool · 3 runs</p>
+        <a href="https://github.com/jongleb/quiver/tree/main/bench">Inspect benchmark scripts ↗</a>
+      </div>
+    </div>
+
+    <div class="benchmark-board" aria-label="Quiver benchmark comparison with mydumper and myloader">
+      <div class="board-topline">
+        <span>WALL TIME / LOWER IS BETTER</span>
+        <div><i></i>quiver <i></i>comparison</div>
+      </div>
+      <article class="benchmark-row">
+        <div class="benchmark-label">
+          <strong>Dump to SQL</strong>
+          <span>mydumper</span>
+        </div>
+        <div class="bar-stack">
+          <div class="bench-bar quiver-bar" style="--bar-size: 74%">
+            <b>1.32s</b>
+          </div>
+          <div class="bench-bar comparison-bar" style="--bar-size: 100%">
+            <b>1.79s</b>
+          </div>
+        </div>
+        <strong class="benchmark-delta">1.36×</strong>
+      </article>
+      <article class="benchmark-row">
+        <div class="benchmark-label">
+          <strong>SQL + zstd</strong>
+          <span>mydumper</span>
+        </div>
+        <div class="bar-stack">
+          <div class="bench-bar quiver-bar" style="--bar-size: 95%">
+            <b>2.05s</b>
+          </div>
+          <div class="bench-bar comparison-bar" style="--bar-size: 100%">
+            <b>2.15s</b>
+          </div>
+        </div>
+        <strong class="benchmark-delta">36% <small>less client CPU</small></strong>
+      </article>
+      <article class="benchmark-row">
+        <div class="benchmark-label">
+          <strong>Load CSV</strong>
+          <span>myloader</span>
+        </div>
+        <div class="bar-stack">
+          <div class="bench-bar quiver-bar" style="--bar-size: 80%">
+            <b>18.0s</b>
+          </div>
+          <div class="bench-bar comparison-bar" style="--bar-size: 100%">
+            <b>22.5s</b>
+          </div>
+        </div>
+        <strong class="benchmark-delta">1.25×</strong>
+      </article>
+      <p class="board-note">
+        Narrow + wide rows, integer + string keys, BLOBs. Exact commands and
+        datasets live in <code>bench/</code>.
+      </p>
+    </div>
+  </div>
+
+  <div class="memory-ribbon" aria-label="Quiver allocation path">
+    <div class="section-shell">
+      <p><span>SOCKET BUFFER</span><i></i><span>ARROW-LAYOUT COLUMNS</span><i></i><span>TARGET</span></p>
+      <strong>0.05 <small>words allocated / row</small></strong>
+      <em>0 allocations per decoded cell</em>
+    </div>
+  </div>
+</section>

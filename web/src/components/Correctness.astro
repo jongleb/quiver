@@ -1,0 +1,64 @@
+<section class="correctness-section section-shell" id="correctness" aria-labelledby="correctness-title">
+  <div class="section-heading">
+    <p class="eyebrow"><span></span> Correctness is in the data path</p>
+    <h2 id="correctness-title">Checked, not hoped.</h2>
+    <p>
+      Quiver refuses work it cannot prove safe, carries the coordinates needed
+      for CDC handoff and verifies data at every boundary.
+    </p>
+  </div>
+
+  <div class="correctness-rail" aria-label="Quiver correctness guarantees">
+    <article>
+      <span>01</span>
+      <div>
+        <small>SNAPSHOT</small>
+        <strong>One point in time</strong>
+        <p>GTID / binlog position or TiDB TSO written to the manifest.</p>
+      </div>
+    </article>
+    <article>
+      <span>02</span>
+      <div>
+        <small>FIDELITY</small>
+        <strong>Exact JSON doubles</strong>
+        <p>Values MySQL would silently round-trip to a neighbour are rewritten exactly.</p>
+      </div>
+    </article>
+    <article>
+      <span>03</span>
+      <div>
+        <small>IN TRANSIT</small>
+        <strong>Two checksums / frame</strong>
+        <p>Payload and header xxh3 inside mutual TLS 1.3.</p>
+      </div>
+    </article>
+    <article>
+      <span>04</span>
+      <div>
+        <small>AT REST</small>
+        <strong>Manifest-verified</strong>
+        <p>Incomplete dumps never look finished; file loads resume after a crash.</p>
+      </div>
+    </article>
+  </div>
+
+  <div class="truth-panel">
+    <div>
+      <p class="card-index">THE CONTRACT</p>
+      <h3>Failure is a result,<br />not corrupted output.</h3>
+    </div>
+    <ul>
+      <li><span>✓</span>Lossy conversion? The chunk rolls back.</li>
+      <li><span>✓</span>Impossible consistency? The run never starts.</li>
+      <li><span>✓</span>Incomplete dump? No finished manifest.</li>
+      <li><span>✓</span>Unsupported object? Refused before target creation.</li>
+    </ul>
+    <div class="support-matrix">
+      <small>SUPPORTED RELEASE LINES</small>
+      <span><b>MySQL</b> 8.0 · 8.4</span>
+      <span><b>MariaDB</b> 10.11 · 11.4 · 11.8</span>
+      <span><b>TiDB</b> 8.5</span>
+    </div>
+  </div>
+</section>

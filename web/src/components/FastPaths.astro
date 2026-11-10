@@ -1,0 +1,91 @@
+<section class="fast-paths section-shell" aria-labelledby="fast-paths-title">
+  <div class="section-heading split-heading">
+    <div>
+      <p class="eyebrow"><span></span> Native fast paths</p>
+      <h2 id="fast-paths-title">Skip work that does<br /><em>not move data.</em></h2>
+    </div>
+    <p>
+      Logical when compatibility demands it. Physical when the storage engine
+      exposes a safer, shorter route.
+    </p>
+  </div>
+
+  <article class="fast-path-card innodb-card">
+    <div class="fast-path-copy">
+      <p class="card-index">MYSQL 8.4 / OPTIONAL FAST PATH</p>
+      <h3>Build the B-tree<br />on every client core.</h3>
+      <p>
+        <code>--ingest tablespace</code> turns batches into InnoDB records,
+        pages and indexes beside the target. Quiver checks the file, then
+        MySQL imports the finished tablespace.
+      </p>
+      <div class="result-callout">
+        <strong>5–9×</strong>
+        <span>less time writing rows than <code>LOAD DATA</code> on the measured laptop</span>
+      </div>
+      <small>
+        Eligible MySQL/Percona 8.4 tables · local target datadir ·
+        <code>--binlog skip</code> required · unsupported tables fall back
+      </small>
+    </div>
+    <div class="innodb-visual" aria-label="LOAD DATA compared with client-built InnoDB tablespaces">
+      <div class="path-label"><span>THE USUAL PATH</span><b>serial pressure</b></div>
+      <div class="usual-path">
+        <span class="batch">batches</span>
+        <i></i>
+        <span class="server-work">server inserts every row<br /><em>index latch</em></span>
+        <i></i>
+        <span class="tree-shape slow"><b></b><b></b><b></b></span>
+      </div>
+      <div class="path-label accent-label"><span>QUIVER TABLESPACE</span><b>parallel build</b></div>
+      <div class="quiver-path">
+        <div class="parts"><span>01</span><span>02</span><span>03</span><span>04</span></div>
+        <i></i>
+        <span class="tree-shape ready"><b></b><b></b><b></b></span>
+        <i></i>
+        <span class="import-step">CHECK<br /><strong>IMPORT</strong></span>
+      </div>
+    </div>
+  </article>
+
+  <article class="fast-path-card tidb-card" id="tidb">
+    <div class="tidb-visual" aria-label="Quiver mirror moves keys directly from TiKV to TiKV">
+      <div class="tidb-contrast">
+        <span>IMPORT INTO … SELECT</span>
+        <p><b>TiKV</b><i></i><em>decode every row</em><i></i><b>TiDB</b><i></i><em>encode again</em><i></i><b>TiKV</b></p>
+      </div>
+      <div class="kv-route">
+        <div class="kv-store">
+          <small>SOURCE</small>
+          <strong>TiKV</strong>
+          <span>region 01</span><span>region 02</span><span>region 03</span>
+        </div>
+        <div class="kv-stream">
+          <i></i><i></i><i></i><i></i>
+          <p>table id swap<br /><strong>CRC64</strong></p>
+        </div>
+        <div class="kv-store target">
+          <small>TARGET</small>
+          <strong>TiKV</strong>
+          <span>Write</span><span>MultiIngest</span><span>ADMIN CHECKSUM</span>
+        </div>
+      </div>
+      <div class="mirror-result"><span>3M keys</span><strong>4.29–4.48s</strong><em>vs 10.06–10.25s</em><b>2.3×</b></div>
+    </div>
+    <div class="fast-path-copy">
+      <p class="card-index">TIDB 8.5 / STORE TO STORE</p>
+      <h3>Move keys.<br />Not interpretations.</h3>
+      <p>
+        <code>quiver mirror</code> scans rows and indexes from TiKV at one TSO,
+        swaps table IDs in one buffer and imports them into the target regions.
+        No SQL round-trip.
+      </p>
+      <ul class="proof-list">
+        <li><span>01</span>GC safe point held while the snapshot is read</li>
+        <li><span>02</span>A worker per region, target split and scattered first</li>
+        <li><span>03</span>Own CRC64 must equal TiDB <code>ADMIN CHECKSUM</code></li>
+      </ul>
+      <small>Measured on tiup playground 8.5.8, 3 TiKV, 4 workers. Global indexes are refused.</small>
+    </div>
+  </article>
+</section>

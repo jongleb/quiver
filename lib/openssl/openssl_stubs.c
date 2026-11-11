@@ -196,22 +196,21 @@ value quiver_tls_mutual(value certificate, value key, value peers)
   CAMLreturn(quiver_context(ctx));
 }
 
-/* A client offering only the ALPN protocol h2, TLS 1.2 or 1.3. [trust] as for
-   [quiver_tls_client]; [identity] is the constant [Anonymous] or the block
-   [Presenting { certificate; key }] of PEM files. Returns [Ok context] or the
-   constant constructor of [Tls.unusable], as [quiver_tls_mutual] does, 4 for
-   the trusted certificates. */
-value quiver_tls_http2(value trust, value identity)
+/* A client of TLS 1.2 or 1.3 for a cluster's components; each connection
+   offers its own ALPN protocol. [trust] as for [quiver_tls_client]; [identity]
+   is the constant [Anonymous] or the block [Presenting { certificate; key }] of
+   PEM files. Returns [Ok context] or the constant constructor of
+   [Tls.unusable], as [quiver_tls_mutual] does, 4 for the trusted
+   certificates. */
+value quiver_tls_cluster(value trust, value identity)
 {
   CAMLparam2(trust, identity);
-  static const unsigned char h2[] = {2, 'h', '2'};
   SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
   int failure = -1;
   if (ctx == NULL) CAMLreturn(quiver_error(0));
   SSL_CTX_set_mode(ctx, SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER | SSL_MODE_AUTO_RETRY);
   if (!SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION)
-      || !SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION)
-      || SSL_CTX_set_alpn_protos(ctx, h2, sizeof(h2)) != 0)
+      || !SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION))
     failure = 0;
   else if (Is_block(identity)
            && SSL_CTX_use_certificate_chain_file(ctx, String_val(Field(identity, 0))) <= 0)
@@ -258,8 +257,9 @@ value quiver_tls_session(value context, value fd)
 
 /* [expectation] is the constant constructor of [Tls.expectation]: 0 the
    certificate must name the host, 1 it must name the IP address, 2 the host is
-   sent in SNI. Returns 0 when OpenSSL took it, else -5. Called before the
-   handshake, while only the creating thread has the session. */
+   sent in SNI, 3 [name] is the only ALPN protocol offered (at most 255 bytes).
+   Returns 0 when OpenSSL took it, else -5. Called before the handshake, while
+   only the creating thread has the session. */
 value quiver_tls_expect(value v, value expectation, value name)
 {
   SSL *ssl = Session_val(v)->ssl;
@@ -271,6 +271,18 @@ value quiver_tls_expect(value v, value expectation, value name)
   case 1:
     taken = X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl), String_val(name));
     break;
+  case 3: {
+    unsigned char offered[256];
+    size_t length = caml_string_length(name);
+    if (length == 0 || length > 255) {
+      taken = 0;
+      break;
+    }
+    offered[0] = (unsigned char)length;
+    memcpy(offered + 1, String_val(name), length);
+    taken = SSL_set_alpn_protos(ssl, offered, length + 1) == 0;
+    break;
+  }
   default:
     taken = SSL_set_tlsext_host_name(ssl, String_val(name));
   }

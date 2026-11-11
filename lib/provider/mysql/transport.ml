@@ -150,8 +150,8 @@ let handshake t context expectations =
 
 let named host : (Quiver_openssl.Tls.expectation * string) list =
   match Quiver_openssl.Tls.naming host with
-  | Ip -> [ (Ip, host) ]
-  | Host | Server_name -> [ (Server_name, host); (Host, host) ]
+  | Ip_address -> [ (Ip, host) ]
+  | Host_name -> [ (Server_name, host); (Host, host) ]
 
 let start_tls t ~host authority =
   let check =
@@ -185,8 +185,8 @@ let start_tls t ~host authority =
       | Ok () -> Ok Trusted
       | Error reason -> Ok (Unproven reason))
 
-let secure t ~host context =
-  let%bind session = handshake t context (named host) in
+let secure t ~host ~protocol context =
+  let%bind session = handshake t context ((Protocol, protocol) :: named host) in
   match Quiver_openssl.Tls.verified session with
   | Ok () -> Ok `Trusted
   | Error reason -> Ok (`Unproven reason)

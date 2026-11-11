@@ -45,6 +45,7 @@ type t =
   | Table_id of Quiver_core.Schema.Name.t
   | Pd_instances
   | New_collations
+  | Placement_policies
   | Next_row_ids of Quiver_core.Schema.Name.t
   | Checksum of Quiver_core.Schema.Name.t
   | Base_tables of Quiver_core.Ident.t
@@ -306,6 +307,7 @@ let sql = function
          %{text (database :> string)} AND TABLE_NAME = %{text (table :> string)}"]
   | Pd_instances -> "SELECT INSTANCE FROM information_schema.CLUSTER_INFO WHERE TYPE = 'pd'"
   | New_collations -> "SELECT VARIABLE_VALUE FROM mysql.tidb WHERE VARIABLE_NAME = 'new_collation_enabled'"
+  | Placement_policies -> "SELECT POLICY_NAME FROM information_schema.PLACEMENT_POLICIES"
   | Next_row_ids name -> [%string "SHOW TABLE %{qualified name} NEXT_ROW_ID"]
   | Checksum name -> [%string "ADMIN CHECKSUM TABLE %{qualified name}"]
   | Base_tables database ->

@@ -427,7 +427,7 @@ module Make (S : Quiver_core.Sink_intf.S) = struct
   (** An agent's [Finish], for the thread that started the session to apply. *)
 
   (** What the control writer sends next. *)
-  type outgoing = Reply of Message.reply | Beat | Last
+  type outgoing = Reply of Message.reply @@ aliased many | Beat | Last
 
   type steering = {
     mutable channel : Channel.t;  (** The control connection now. *)

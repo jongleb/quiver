@@ -34,6 +34,17 @@ val meanwhile :
 (** Runs the work on the caller's thread and, while it runs, the other on a thread of its own
     [every] so often, after the first wait; not at all when the system gives no thread. *)
 
+val held :
+  ('mode : value mod contended portable) 'a 'e.
+  every:Core.Time_ns.Span.t ->
+  on:'mode ->
+  off:'mode ->
+  ('mode -> (unit, 'e) result) @ portable ->
+  (unit -> 'a) @ local once ->
+  ('a, 'e) result
+(** The work run with [on] asked before it and again [every] while it runs, and [off] after it
+    whatever it did; only the first refusal of [on] counts, and then the work does not run. *)
+
 val spread :
   ('a : value mod contended portable) ('b : value mod contended portable).
   workers:int -> 'a iarray -> ('a -> 'b) @ portable -> 'b list

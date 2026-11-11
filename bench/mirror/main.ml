@@ -65,6 +65,8 @@ let () =
             sizes = { scan = 1024; job = 16 lsl 20; batch = 16 lsl 10 };
             workers = int_of_string Sys.argv.(3);
             stores;
+            regions = Held;
+            placement = Kept_placement;
           }
       with
       | Ok copied ->
@@ -75,6 +77,7 @@ let () =
             (show
                ([%sexp_of:
                   [ `Mirror of Quiver_tikv.Mirror.error
+                  | `Placement of Quiver_tikv.Placement.error
                   | `Read of Quiver_tikv.Read.error
                   | `Info of Quiver_tikv.Info.error
                   | `Renumber of Quiver_tikv.Renumber.error
@@ -86,6 +89,7 @@ let () =
                   | `Transport of Quiver_mysql.Transport.error
                   | `Proto of Quiver_tikv.Proto.error
                   | `Grpc of Quiver_tikv.Grpc.error
+                  | `Http1 of Quiver_tikv.Http1.error
                   | `Http2 of Quiver_tikv.Http2.error
                   | `Hpack of Quiver_tikv.Hpack.error ]]
                   error)))

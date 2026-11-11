@@ -1,6 +1,7 @@
 # A TLS front for the fake HTTP/2 server of test_http2: one connection, its bytes passed on.
 # Arguments: the backend's port, the certificate and key it presents, the ALPN protocol it
 # accepts ("-" for none), the CAs a client certificate must chain to ("-" when none is asked).
+# After the handshake it prints the ALPN protocol chosen ("-" for none).
 import socket
 import ssl
 import sys
@@ -26,6 +27,7 @@ try:
 except (ssl.SSLError, OSError):
     upstream.close()
     sys.exit(0)
+print(tls.selected_alpn_protocol() or "-", flush=True)
 
 
 def pipe(source, sink):

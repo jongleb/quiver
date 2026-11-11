@@ -8,7 +8,6 @@ type error =
   | Partitions_differ of { source : string list; target : string list }
   | Rearranging
   | Global_index of string
-  | Old_row
   | Missing of string
   | Malformed of string
 [@@deriving sexp_of ~portable]
@@ -18,12 +17,17 @@ type columns = Kept | Moved of int option iarray
 
 (** What a row written before a column was added lacks in the copy. *)
 type need =
-  | Filled of { source : int; into : int; cell : string }  (** The column's default then, as a cell. *)
+  | Filled of { source : int; into : int; name : string; cell : string; datum : string option }
+      (** The column's default then, in a row of either format; [None] when this does not write it in the first. *)
   | Unfilled of { source : int; name : string }  (** A default this does not write. *)
 
 type t = {
   tables : (int64 * int64) iarray;  (** Each source id as its keys hold it, by that, with the copy's. *)
-  indexes : (int64 * int64) list; columns : columns; needed : need list }
+  indexes : (int64 * int64) list;
+  columns : columns;
+  needed : need list;
+  ranks : (int * int) list;  (** Each column id of the copy with its place among the copy's columns. *)
+}
 
 let tables t = List.map (fun (held, into) -> (Int64.logxor held Int64.min_int, into)) (Iarray.to_list t.tables)
 
@@ -76,7 +80,7 @@ let make ~(source : Info.t) ~(target : Info.t) =
                 Some
                   (Option.fold
                      ~none:(Unfilled { source = column.id; name = column.name })
-                     ~some:(fun cell -> Filled { source = column.id; into = other.id; cell })
+                     ~some:(fun cell -> Filled { source = column.id; into = other.id; name = column.name; cell; datum = Datum.of_cell column.kind cell })
                      (Cell.of_default column.kind default))
             | Origin _, Origin _ | Unset, _ -> None)
           pairs
@@ -93,7 +97,8 @@ let make ~(source : Info.t) ~(target : Info.t) =
         | own -> List.map2 (fun (from : Info.partition) (into : Info.partition) -> (from.id, into.id)) own (partitions target)
       in
       let held = List.map (fun (source, into) -> (Int64.logxor source Int64.min_int, into)) tables in
-      Ok { tables = Iarray.of_list (List.sort (fun (a, _) (b, _) -> Int64.compare a b) held); indexes; columns = moved; needed }
+      let ranks = List.mapi (fun rank (column : Info.column) -> (column.id, rank)) target.columns in
+      Ok { tables = Iarray.of_list (List.sort (fun (a, _) (b, _) -> Int64.compare a b) held); indexes; columns = moved; needed; ranks }
 
 (** What a key of the table is of. *)
 type kind = Row | Index | Other
@@ -141,8 +146,7 @@ let stop value row i =
 
 let row value =
   let length = String.length value in
-  if length >= 1 && (value.[0] = '\x08' || value.[0] = '\x00') then Error (`Renumber Old_row)
-  else if length < 6 || value.[0] <> '\x80' then malformed value
+  if length < 6 || value.[0] <> '\x80' then malformed value
   else
     let width = if Char.code value.[1] land 1 = 0 then 1 else 4 in
     let offset_width = if width = 1 then 2 else 4 in
@@ -238,23 +242,40 @@ let value t ~key value =
               ^ moved ^ String.make padded '\x00'
               ^ String.sub value (length - handle) handle)
   in
-  let filled row =
-    let lacking = List.filter (function Filled { source; _ } | Unfilled { source; _ } -> not (holds row source)) t.needed in
-    Option.fold
-      ~none:(Ok (List.filter_map (function Filled { into; cell; _ } -> Some (into, cell) | Unfilled _ -> None) lacking))
-      ~some:(fun name -> Error (`Renumber (Missing name)))
-      (List.find_map (function Unfilled { name; _ } -> Some name | Filled _ -> None) lacking)
+  let filled held form =
+    Base.List.fold_result (List.rev t.needed) ~init:[] ~f:(fun added need ->
+        match need with
+        | (Filled { source; _ } | Unfilled { source; _ }) when held source -> Ok added
+        | Filled { into; name; cell; datum; _ } ->
+            Option.fold ~none:(Error (`Renumber (Missing name))) ~some:(fun value -> Ok ((into, value) :: added)) (form cell datum)
+        | Unfilled { name; _ } -> Error (`Renumber (Missing name)))
   in
+  let first target =
+    let length = String.length value in
+    let rec pairs pos acc =
+      if pos >= length then Ok (List.rev acc)
+      else
+        match Option.bind (Datum.id value pos) (fun (id, at) -> Option.map (fun size -> (id, at, size)) (Datum.length value at)) with
+        | Some (id, at, size) -> pairs (at + size) ((id, at, size) :: acc)
+        | None -> malformed value
+    in
+    let%bind held = if String.equal value "\x00" then Ok [] else pairs 0 [] in
+    let%bind added = filled (fun source -> List.exists (fun (id, _, _) -> id = source) held) (fun _ datum -> datum) in
+    let kept = List.filter_map (fun (id, at, size) -> Option.map (fun into -> (into, String.sub value at size)) (target id)) held @ added in
+    let rank id = Option.value ~default:Int.max_int (List.assoc_opt id t.ranks) in
+    match (t.columns, added, List.stable_sort (fun (a, _) (b, _) -> Int.compare (rank a) (rank b)) kept) with
+    | Kept, [], _ -> Ok value
+    | _, _, [] -> Ok "\x00"
+    | _, _, kept -> Ok (String.concat "" (List.concat_map (fun (into, datum) -> [ Datum.of_id into; datum ]) kept))
+  in
+  let second target =
+    let%bind row = row value in
+    let%bind added = filled (holds row) (fun cell _ -> Some cell) in
+    match (t.columns, added) with Kept, [] -> Ok value | (Kept | Moved _), _ -> rewritten target value row added
+  in
+  let format = if String.length value > 0 && value.[0] = '\x80' then second else first in
   match (kind key, t.columns) with
-  | Row, Kept -> (
-      match t.needed with
-      | [] -> Ok value
-      | _ :: _ -> (
-          let%bind row = row value in
-          match%bind filled row with [] -> Ok value | _ :: _ as added -> rewritten Option.some value row added))
-  | Row, Moved map ->
-      let%bind row = row value in
-      let%bind added = filled row in
-      rewritten (moved map) value row added
+  | Row, Kept -> ( match t.needed with [] -> Ok value | _ :: _ -> format Option.some)
+  | Row, Moved map -> format (moved map)
   | Index, Moved map -> restored map value
   | Index, Kept | Other, _ -> Ok value

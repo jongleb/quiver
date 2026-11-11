@@ -15,11 +15,24 @@ type stores =
   | Imported  (** In TiKV's import mode: compaction never stalls writes, no region is split by size. *)
   | Untouched  (** As they are, for a cluster serving other work meanwhile. *)
 
+(** What PD does with the regions of the copy while keys are imported into them. *)
+type regions =
+  | Held  (** Nothing: no leader or replica moved, no merge (the label [schedule=deny]). *)
+  | Scheduled  (** As with any other region. *)
+
+(** Where a copy into another cluster puts its regions. *)
+type placement =
+  | Kept_placement  (** Under the source's placement policies, which the target must have. *)
+  | Default_placement  (** Without them, as the target places any table. *)
+[@@deriving sexp_of ~portable]
+
 type settings = {
   timeout : Core.Time_ns.Span.t;  (** Of connecting to PD and the stores, and of their silence. *)
   sizes : sizes;
   workers : int;  (** Threads copying a table at once, each with connections of its own. *)
   stores : stores;
+  regions : regions;
+  placement : placement;
 }
 
 type reached = {
@@ -39,6 +52,7 @@ type error =
       (** The clusters' [new_collation_enabled]: an index's keys would be encoded otherwise. *)
   | Definition of Quiver_core.Schema.Name.t  (** Its [SHOW CREATE TABLE] does not start with its name. *)
   | Undescribed of Quiver_core.Schema.Name.t  (** No description of the table under TiKV's meta keys. *)
+  | Unknown_policies of string * string list  (** Placement policies of the source the target lacks, by name in any case. *)
 [@@deriving sexp_of ~portable]
 
 (** Keys of the source from [start] up to [stop]. *)
@@ -75,6 +89,7 @@ val table :
     | `Transport of Quiver_mysql.Transport.error
     | `Proto of Proto.error
     | `Grpc of Grpc.error
+    | `Http1 of Http1.error
     | `Http2 of Http2.error
     | `Hpack of Hpack.error ] )
   result
@@ -100,6 +115,7 @@ val described :
     | `Transport of Quiver_mysql.Transport.error
     | `Proto of Proto.error
     | `Grpc of Grpc.error
+    | `Http1 of Http1.error
     | `Http2 of Http2.error
     | `Hpack of Hpack.error ] )
   result
@@ -121,6 +137,7 @@ type 'e session = {
   source_side : 'e side;
   target_side : 'e side;
   cluster : unit cluster;
+  placement : placement;  (** Of a copy into another cluster. *)
   name : unit -> string;  (** A table name no table has, for the copy while it is made. *)
   keys : Renumber.t -> version:int64 -> commit_ts:int64 -> (copied, 'e) result;
       (** The plan's keys as of [version] into the copy at [commit_ts]. *)
@@ -130,7 +147,7 @@ type 'e session = {
 (** How a copy reaches TiDB and TiKV. *)
 
 val through :
-  ([> `Mirror of error | `Region of Region.error | `Renumber of Renumber.error ] as 'e) session ->
+  ([> `Mirror of error | `Placement of Placement.error | `Region of Region.error | `Renumber of Renumber.error ] as 'e) session ->
   source:Quiver_core.Schema.Name.t ->
   target:Quiver_core.Schema.Name.t ->
   (copied, 'e) result
@@ -144,6 +161,7 @@ val copy :
   settings ->
   ( copied,
     [> `Mirror of error
+    | `Placement of Placement.error
     | `Info of Info.error
     | `Renumber of Renumber.error
     | `Read of Read.error
@@ -155,6 +173,7 @@ val copy :
     | `Transport of Quiver_mysql.Transport.error
     | `Proto of Proto.error
     | `Grpc of Grpc.error
+    | `Http1 of Http1.error
     | `Http2 of Http2.error
     | `Hpack of Hpack.error ] )
   result

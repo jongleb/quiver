@@ -13,7 +13,6 @@ type error =
   | Partitions_differ of { source : string list; target : string list }  (** None when not partitioned. *)
   | Rearranging  (** Partitions of either table being added, dropped, truncated, reorganized or exchanged. *)
   | Global_index of string  (** An index over every partition, whose values name partitions. *)
-  | Old_row  (** A row in TiDB's first format, whose column ids this does not move. *)
   | Missing of string
       (** A row written before this column was added, whose default then this does not write: the
           source reads the row with it, the copy would read it without. *)
@@ -34,6 +33,7 @@ val key : t -> string -> string option
 
 val value : t -> key:string -> string -> (string, [> `Renumber of error ]) result
 (** The value of this source key in the copy, the same string when no column id in it moves and
-    no default is written into it. A row written before a column was added gets the default the
+    no default is written into it; a row of TiDB's first format stays in it, its columns in the
+    copy's order. A row written before a column was added gets the default the
     column had then, which the copy, made with the column, lacks. A rewritten row has no checksum:
     TiDB writes one only when asked and reads none. *)

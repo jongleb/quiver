@@ -85,25 +85,25 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: /opt/opam
-          key: opam-${{ matrix.target }}-${{ hashFiles('quiver.opam') }}
-          restore-keys: opam-${{ matrix.target }}-
+          key: opam-ox54-${{ matrix.target }}-${{ hashFiles('quiver.opam') }}
+          restore-keys: opam-ox54-${{ matrix.target }}-
       - run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          if [ ! -x /opt/opam/ox/bin/ocamlopt ]; then
+          if [ ! -x /opt/opam/ox54/bin/ocamlopt ]; then
             rm -rf /opt/opam
             opam init --bare --disable-sandboxing --no-setup
-            opam switch create ox ocaml-variants.5.2.0+ox \
+            opam switch create ox54 ocaml-variants.5.4.0+ox \
               --repos ox=git+https://github.com/oxcaml/opam-repository.git,default
           fi
           opam update
-          PKG_CONFIG_PATH=/opt/deps/lib/pkgconfig opam install --switch=ox . --deps-only
-          opam switch set ox
+          PKG_CONFIG_PATH=/opt/deps/lib/pkgconfig opam install --switch=ox54 . --deps-only
+          opam switch set ox54
       # Saved even when a later step fails: building OxCaml takes half an hour.
       - if: always() && steps.opam.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: /opt/opam
-          key: opam-${{ matrix.target }}-${{ hashFiles('quiver.opam') }}
+          key: opam-ox54-${{ matrix.target }}-${{ hashFiles('quiver.opam') }}
       - run: packaging/package.sh ${{ matrix.target }} /opt/deps
       - run: |
           curl -fsSLo /tmp/nfpm.tar.gz \
@@ -137,7 +137,7 @@ jobs:
       - run: packaging/deps.sh ~/deps
       - uses: ocaml/setup-ocaml@v3
         with:
-          ocaml-compiler: "ocaml-variants.5.2.0+ox"
+          ocaml-compiler: "ocaml-variants.5.4.0+ox"
           opam-repositories: ${{ env.OXCAML_REPOSITORIES }}
       - run: PKG_CONFIG_PATH=~/deps/lib/pkgconfig opam install . --deps-only
       - run: packaging/package.sh aarch64-apple-darwin ~/deps

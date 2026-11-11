@@ -301,6 +301,112 @@ let keys =
                   else List.init partitions (fun i -> (Int64.of_int (80 + (((5 * i) + 2) mod 7)), Int64.of_int (400 + partitions - 1 - i))))
           && List.for_all (fun (from, into) -> Renumber.key plan (prefix from) = Some (prefix into)) (Renumber.tables plan))
 
+let uvarint n =
+  let buffer = Buffer.create 10 in
+  let rec go n =
+    if Int64.unsigned_compare n 0x80L < 0 then Buffer.add_char buffer (Char.chr (Int64.to_int n))
+    else (
+      Buffer.add_char buffer (Char.chr (Int64.to_int (Int64.logand n 0x7FL) lor 0x80));
+      go (Int64.shift_right_logical n 7))
+  in
+  go n;
+  Buffer.contents buffer
+
+let varint n = uvarint (if Int64.compare n 0L >= 0 then Int64.shift_left n 1 else Int64.lognot (Int64.shift_left n 1))
+let compact bytes = "\x02" ^ varint (Int64.of_int (String.length bytes)) ^ bytes
+
+(* Values of every kind a row of the first format may hold, as TiDB's [codec] writes them. *)
+let datum =
+  QCheck2.Gen.(
+    let int64 = oneof [ map Int64.of_int (int_range (-300) 300); map Int64.of_int int; return Int64.min_int; return Int64.max_int ] in
+    let eight = string_size ~gen:char (return 8) in
+    let groups bytes =
+      let rec go pos acc =
+        let chunk = String.sub bytes pos (Int.min 8 (String.length bytes - pos)) in
+        let pad = 8 - String.length chunk in
+        let acc = acc ^ chunk ^ String.make pad '\x00' in
+        if pad = 0 then go (pos + 8) (acc ^ "\xff") else acc ^ String.make 1 (Char.chr (0xff - pad))
+      in
+      go 0 ""
+    in
+    let json =
+      oneof
+        [
+          map (fun inner -> "\x01" ^ "\x00\x00\x00\x00" ^ (let size = String.length inner + 8 in String.init 4 (fun i -> Char.chr ((size lsr (8 * i)) land 0xff))) ^ inner) (string_size (int_range 0 20));
+          map (fun inner -> "\x03" ^ "\x01\x00\x00\x00" ^ (let size = String.length inner + 8 in String.init 4 (fun i -> Char.chr ((size lsr (8 * i)) land 0xff))) ^ inner) (string_size (int_range 0 20));
+          map (fun text -> "\x0c" ^ uvarint (Int64.of_int (String.length text)) ^ text) (string_size (int_range 0 200));
+          map (fun bytes -> "\x09" ^ bytes) eight;
+          map (fun bytes -> "\x0b" ^ bytes) eight;
+          map (fun bytes -> "\x0f" ^ bytes) eight;
+          return "\x04\x01";
+          map (fun text -> "\x0d\xfc" ^ uvarint (Int64.of_int (String.length text)) ^ text) (string_size (int_range 0 10));
+          map (fun bytes -> "\x11" ^ bytes) (string_size (return 12));
+        ]
+    in
+    oneof
+      [
+        map (fun n -> "\x08" ^ varint n) int64;
+        map (fun n -> "\x09" ^ uvarint n) int64;
+        map compact (string_size (int_range 0 300));
+        map (fun bytes -> "\x01" ^ groups bytes) (string_size (int_range 0 30));
+        map (fun (flag, bytes) -> String.make 1 flag ^ bytes) (pair (oneof_list [ '\x03'; '\x04'; '\x05'; '\x07' ]) eight);
+        map (fun (precision, frac) ->
+            let precision = Int.max precision frac in
+            let bin digits = (digits / 9 * 4) + [| 0; 1; 1; 2; 2; 3; 3; 4; 4; 4 |].(digits mod 9) in
+            "\x06" ^ String.make 1 (Char.chr precision) ^ String.make 1 (Char.chr frac) ^ String.make (bin (precision - frac) + bin frac) '\x55')
+          (pair (int_range 1 65) (int_range 0 30));
+        map (fun inner -> "\x0a" ^ inner) json;
+        map (fun count -> "\x14" ^ String.init 4 (fun i -> Char.chr ((count lsr (8 * i)) land 0xff)) ^ String.make (4 * count) '\x3f') (int_range 0 5);
+      ])
+
+let first_format =
+  QCheck2.Test.make ~count:3000
+    ~name:
+      "a row of the first format reads under the copy's ids, in the copy's order, with the defaults it was written \
+       before, without dropped columns when ids move, and stays when nothing in it moves"
+    ~print:(fun (case, rows) -> Base.Sexp.to_string_hum (sexp_of_case case) ^ "\n" ^ String.concat "\n" (List.map Hex_encode.to_hex rows))
+    QCheck2.Gen.(
+      let* case = gen in
+      let* data = list_size (return (List.length case.rows * (List.length case.columns + List.length case.dropped))) datum in
+      return (case, data))
+    (fun (case, data) ->
+      let source = info ~id:75L ~ids:(fun column -> column.source) ~origins:(fun column -> column.origin) case.columns
+      and target = info ~id:300L ~ids:(fun column -> column.target) ~origins:(fun _ -> Unset) case.columns in
+      let key = fst (Codec.records 75L) ^ "\x80\x00\x00\x00\x00\x00\x00\x01" in
+      let encoded pairs = match pairs with [] -> "\x00" | _ -> String.concat "" (List.map (fun (id, value) -> "\x08" ^ varint (Int64.of_int id) ^ value) pairs) in
+      match Renumber.make ~source ~target with
+      | Error _ -> false
+      | Ok plan ->
+          let kept = List.for_all (fun column -> column.source = column.target) case.columns in
+          let width = List.length case.columns + List.length case.dropped in
+          List.for_all
+            (fun (index, ((cells, dropped), _)) ->
+              let values = Array.of_list (List.filteri (fun i _ -> i >= index * width && i < (index + 1) * width) data) in
+              let value i (cell : cell) = match cell with Null -> Some "\x00" | Held _ -> Some values.(i) | Absent -> None in
+              let cells = List.combine case.columns cells in
+              let present = List.filter_map (fun (i, (column, cell)) -> Option.map (fun v -> (column, v)) (value i cell)) (List.mapi (fun i c -> (i, c)) cells) in
+              let gone = List.mapi (fun i (id, _) -> (id, values.(List.length case.columns + i))) dropped in
+              let row = encoded (List.map (fun (column, v) -> (column.source, v)) present @ gone) in
+              let lacking = List.filter_map (fun (column, cell) -> match (column.origin, cell) with Unwritable, Absent -> Some column.name | _ -> None) cells
+              and filled = List.exists (fun (column, cell) -> match (column.origin, cell) with Writable _, Absent -> true | _ -> false) cells in
+              match (Renumber.value plan ~key row, lacking) with
+              | Error (`Renumber (Renumber.Missing name)), _ :: _ -> List.mem name lacking
+              | Error _, _ | Ok _, _ :: _ -> false
+              | Ok moved, [] when kept && not filled -> moved == row
+              | Ok moved, [] ->
+                  let expected =
+                    List.filter_map
+                      (fun (column, cell) ->
+                        match (cell, column.origin) with
+                        | Absent, Writable text -> Some (column.target, compact text)
+                        | Absent, (Unset | Unwritable) -> None
+                        | (Null | Held _), _ -> Option.map (fun v -> (column.target, v)) (List.assoc_opt column present))
+                      cells
+                    @ if kept then gone else []
+                  in
+                  String.equal moved (encoded expected))
+            (List.mapi (fun i row -> (i, row)) case.rows))
+
 let refusals () =
   let column name id : Info.column = { name; id; state = Public; missing = Unset; kind = Bytes } in
   let table columns : Info.t = { id = 1L; columns; indexes = [ { name = "k"; id = 1L; state = Public; scope = Local } ]; handle = Row_number; layout = Whole } in
@@ -327,8 +433,10 @@ let refusals () =
   let plan = Result.get_ok (Renumber.make ~source:(table [ column "a" 2 ]) ~target:(table [ column "a" 1 ])) in
   let row = fst (Codec.records 1L) ^ "\x80\x00\x00\x00\x00\x00\x00\x01" in
   let value bytes = match Renumber.value plan ~key:row bytes with Ok _ -> "moved" | Error (`Renumber error) -> Base.Sexp.to_string (Renumber.sexp_of_error error) in
-  Alcotest.(check string) "a row of the first format" "Old_row" (value "\x08\x02\x03\x04");
-  Alcotest.(check string) "an empty row of the first format" "Old_row" (value "\x00");
+  Alcotest.(check string) "a row of the first format" "moved" (value "\x08\x04\x08\x04");
+  Alcotest.(check string) "an empty row of the first format" "moved" (value "\x00");
+  Alcotest.(check string) "a value of the first format cut short" "(Malformed 0804020A6162)" (value "\x08\x04\x02\x0a\x61\x62");
+  Alcotest.(check string) "an unknown flag" "(Malformed 0804FA)" (value "\x08\x04\xfa");
   Alcotest.(check string) "a row cut short" "(Malformed 800001000000020A)" (value "\x80\x00\x01\x00\x00\x00\x02\x0a")
 
 let padded () =
@@ -364,6 +472,28 @@ let defaults () =
         | Error (`Renumber error) -> Base.Sexp.to_string (Renumber.sexp_of_error error)
       in
       Alcotest.(check string) (name ^ ": the row written before gets the default as TiDB writes it") after (value before);
+      Alcotest.(check string) (name ^ ": the row written after stays") after (value after))
+    cases
+
+let first_defaults () =
+  let cases =
+    List.filter_map
+      (fun line -> match String.split_on_char '\t' line with [ name; table; before; after ] -> Some (name, table, before, after) | _ -> None)
+      (In_channel.with_open_bin "tikv/defaults-v1.tsv" In_channel.input_lines)
+  in
+  Alcotest.(check bool) "every case read" true (List.length cases >= 35);
+  List.iter
+    (fun (name, table, before, after) ->
+      let source = Result.get_ok (Info.of_json table) in
+      let target = { source with columns = List.map (fun (column : Info.column) -> { column with missing = Unset }) source.columns } in
+      let plan = Result.get_ok (Renumber.make ~source ~target) in
+      let key = fst (Codec.records source.id) ^ "\x80\x00\x00\x00\x00\x00\x00\x01" in
+      let value hex =
+        match Renumber.value plan ~key (Hex_encode.from_hex hex) with
+        | Ok value -> String.lowercase_ascii (Hex_encode.to_hex value)
+        | Error (`Renumber error) -> Base.Sexp.to_string (Renumber.sexp_of_error error)
+      in
+      Alcotest.(check string) (name ^ ": the row of the first format written before gets the default as TiDB writes it") after (value before);
       Alcotest.(check string) (name ^ ": the row written after stays") after (value after))
     cases
 
@@ -472,10 +602,12 @@ let tests =
   [
     Alcotest.test_case "defaults written into rows as TiDB 8.5 writes them" `Quick defaults;
     Alcotest.test_case "defaults it does not write, and edges" `Quick cells;
+    Alcotest.test_case "defaults written into rows of the first format as TiDB 8.5 writes them" `Quick first_defaults;
     QCheck_alcotest.to_alcotest widths;
     QCheck_alcotest.to_alcotest decimals;
     Alcotest.test_case "padding of an index value whose restored row narrows" `Quick padded;
     QCheck_alcotest.to_alcotest rows;
+    QCheck_alcotest.to_alcotest first_format;
     QCheck_alcotest.to_alcotest indexes;
     QCheck_alcotest.to_alcotest keys;
     Alcotest.test_case "refusals" `Quick refusals;

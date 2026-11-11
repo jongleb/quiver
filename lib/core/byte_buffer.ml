@@ -1,4 +1,4 @@
-type t = { mutable bs : Bytes.t @@ aliased; mutable len : int }
+type t = { mutable bs : Bytes.t; mutable len : int }
 
 let create ?(cap = 0) () = { bs = Bytes.create cap; len = 0 }
 let[@inline] length t = t.len

@@ -11,17 +11,6 @@ let switch_mode connection mode =
   let%bind response = Grpc.call connection ~path:"/import_sstpb.ImportSST/SwitchMode" request in
   Proto.fold response ~pos:0 ~len:(String.length response) ~init:() ~f:(fun () _ _ -> Ok ())
 
-let held ~every switch work =
-  let back () = ignore (switch Normal) in
-  match switch Import with
-  | Error error ->
-      back ();
-      Error error
-  | Ok () ->
-      let result = Quiver_core.Concurrent.meanwhile ~every (fun () -> ignore (switch Import)) work in
-      back ();
-      Ok result
-
 let meta job =
   let bound place span = Option.fold ~none:"" ~some:(fun span -> Codec.encode_bytes (Pairs.key span (place span))) span in
   let first = bound (fun _ -> 0) (Base.List.hd job.pairs) and last = bound (fun span -> Pairs.length span - 1) (Base.List.last job.pairs) in

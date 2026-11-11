@@ -33,6 +33,9 @@ type dial = {
 }
 (** How connections are opened. *)
 
+val address : string -> (string * int) option
+(** The host and port of [host:port], [\[host\]:port] for IPv6. *)
+
 type t
 (** One connection; one thread uses it at a time. *)
 

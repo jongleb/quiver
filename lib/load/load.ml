@@ -727,7 +727,7 @@ let run config ~dir target { keys; after; binlog; collations } ~objects:wanted ~
     | 1 -> add_keys link keys
     | _ -> Ok ()
   in
-  let tasks = Await.Await.Mpmc_queue.create ()
+  let tasks : task Base.Modes.Aliased_many.t Await.Await.Mpmc_queue.t = Await.Await.Mpmc_queue.create ()
   and reports = Await.Await.Mpmc_queue.create ()
   and course = Portable.Atomic.make Going in
   let (work @ portable) link =
@@ -739,10 +739,10 @@ let run config ~dir target { keys; after; binlog; collations } ~objects:wanted ~
             | Going -> (
                 match going () with Ok report -> report | Error failure -> Failed failure)
           in
-          Await.Await.Mpmc_queue.push reports report
+          Await.Await.Mpmc_queue.push reports { Base.Modes.Aliased_many.aliased_many = report }
         in
         let rec serve () =
-          match Await.Await.Mpmc_queue.pop Quiver_core.Blocking.await tasks with
+          match (Await.Await.Mpmc_queue.pop Quiver_core.Blocking.await tasks).aliased_many with
           | Stop -> Quiver_mysql.Link.close link
           | Create table ->
               report
@@ -810,12 +810,14 @@ let run config ~dir target { keys; after; binlog; collations } ~objects:wanted ~
   in
   let started = Base.List.count workers ~f:Result.is_ok in
   let phase items task =
-    List.iter (fun item -> Await.Await.Mpmc_queue.push tasks (task item)) items;
+    List.iter
+      (fun item -> Await.Await.Mpmc_queue.push tasks { Base.Modes.Aliased_many.aliased_many = task item })
+      items;
     let rec collect count created first =
       match count with
       | 0 -> Option.fold ~none:(Ok created) ~some:Result.error first
       | _ -> (
-          match Await.Await.Mpmc_queue.pop Quiver_core.Blocking.await reports with
+          match (Await.Await.Mpmc_queue.pop Quiver_core.Blocking.await reports).aliased_many with
           | Created table -> collect (count - 1) (table :: created) first
           | Filled _ | Ran -> collect (count - 1) created first
           | Failed failure ->
@@ -836,7 +838,7 @@ let run config ~dir target { keys; after; binlog; collations } ~objects:wanted ~
       if busy < started then
         Option.fold ~none:busy
           ~some:(fun (slot, file) ->
-            Await.Await.Mpmc_queue.push tasks (Fill (slot, file));
+            Await.Await.Mpmc_queue.push tasks { Base.Modes.Aliased_many.aliased_many = Fill (slot, file) };
             give (busy + 1))
           (Schedule.take schedule)
       else busy
@@ -845,7 +847,7 @@ let run config ~dir target { keys; after; binlog; collations } ~objects:wanted ~
       match busy with
       | 0 -> Option.fold ~none:(Ok ()) ~some:Result.error first
       | _ -> (
-          match Await.Await.Mpmc_queue.pop Quiver_core.Blocking.await reports with
+          match (Await.Await.Mpmc_queue.pop Quiver_core.Blocking.await reports).aliased_many with
           | Filled slot ->
               Schedule.release schedule slot;
               let busy = match first with None -> give (busy - 1) | Some _ -> busy - 1 in
@@ -881,7 +883,7 @@ let run config ~dir target { keys; after; binlog; collations } ~objects:wanted ~
         ()
   in
   Base.Fn.apply_n_times ~n:started
-    (fun () -> Await.Await.Mpmc_queue.push tasks Stop)
+    (fun () -> Await.Await.Mpmc_queue.push tasks { Base.Modes.Aliased_many.aliased_many = Stop })
     ();
   let finished =
     let%bind () = Result.map_error (function #failure as failure -> failure) loaded in

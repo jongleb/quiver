@@ -8,5 +8,5 @@ val[@zero_alloc] int : Byte_buffer.t @ local -> int -> unit
 val[@zero_alloc] padded : Byte_buffer.t @ local -> width:int -> int -> unit
 val[@zero_alloc] two : Byte_buffer.t @ local -> int -> unit
 val[@zero_alloc] clock : Byte_buffer.t @ local -> hours:int -> minutes:int -> seconds:int -> unit
-val[@zero_alloc] int64 : Byte_buffer.t @ local -> int64# -> unit
-val[@zero_alloc] uint64 : Byte_buffer.t @ local -> int64# -> unit
+val[@zero_alloc] int64 : Byte_buffer.t @ local -> int64_u -> unit
+val[@zero_alloc] uint64 : Byte_buffer.t @ local -> int64_u -> unit

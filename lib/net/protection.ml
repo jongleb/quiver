@@ -69,13 +69,12 @@ let connected t ~host fd =
       Unix.set_nonblock fd;
       Ok { fd; channel = Plain; notice = Atomic.make Unsent }
   | Mutual context -> (
+      let expectation : Quiver_openssl.Tls.expectation =
+        match Quiver_openssl.Tls.naming host with Ip_address -> Ip | Host_name -> Host
+      in
       match
         Result.bind (Quiver_openssl.Tls.session context fd) (fun session ->
-            Result.map
-              (fun () -> session)
-              (Quiver_openssl.Tls.expect session
-                 (Quiver_openssl.Tls.naming host)
-                 host))
+            Result.map (fun () -> session) (Quiver_openssl.Tls.expect session expectation host))
       with
       | Error reason -> Error (`Protection (Handshake reason))
       | Ok session -> secure fd session ~start:Quiver_openssl.Tls.connect)

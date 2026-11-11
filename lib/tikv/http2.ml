@@ -64,13 +64,21 @@ let frame ~kind ~flags ~stream payload = header ~kind ~flags ~stream (String.len
 
 let u32 n = String.init 4 (fun i -> Char.chr ((n lsr (8 * (3 - i))) land 0xFF))
 
+let address text =
+  Option.bind (String.rindex_opt text ':') (fun colon ->
+      let host = String.sub text 0 colon in
+      let host =
+        Option.value ~default:host (Option.bind (Base.String.chop_prefix host ~prefix:"[") (Base.String.chop_suffix ~suffix:"]"))
+      in
+      Option.map (fun port -> (host, port)) (int_of_string_opt (String.sub text (colon + 1) (String.length text - colon - 1))))
+
 let connect { timeout; security } ~host ~port =
   let%bind transport = Quiver_mysql.Transport.connect ~timeout (Tcp { host; port }) in
   let secured =
     match security with
     | Cleartext -> Ok "http"
     | Secured context -> (
-        let%bind trust = Quiver_mysql.Transport.secure transport ~host context in
+        let%bind trust = Quiver_mysql.Transport.secure transport ~host ~protocol:"h2" context in
         match (trust, Quiver_mysql.Transport.protocol transport) with
         | `Unproven reason, _ -> Error (`Http2 (Untrusted reason))
         | `Trusted, Some "h2" -> Ok "https"

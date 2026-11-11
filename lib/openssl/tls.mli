@@ -32,9 +32,9 @@ type identity =
   | Anonymous
   | Presenting of { certificate : string; key : string }  (** PEM files: a chain and its key. *)
 
-val http2 : trust -> identity -> (context, unusable) result
-(** A client of TLS 1.2 or 1.3 offering only the ALPN protocol h2, as gRPC servers expect;
-    [Peers] when the trusted certificates cannot be loaded. *)
+val cluster : trust -> identity -> (context, unusable) result
+(** A client of TLS 1.2 or 1.3 for a cluster's components, each connection offering its own
+    protocol ([Protocol]); [Peers] when the trusted certificates cannot be loaded. *)
 
 type session : value mod contended portable
 (** One connection; each call takes the session's lock, so threads may share it.
@@ -47,12 +47,15 @@ type expectation =
   | Host  (** The certificate names this host. *)
   | Ip  (** The certificate names this IP address. *)
   | Server_name  (** The host is sent in SNI. *)
+  | Protocol  (** The only ALPN protocol offered, by its name. *)
 
 val expect : session -> expectation -> string -> (unit, string) result
 (** Before the handshake. *)
 
-val naming : string -> expectation
-(** [Ip] for an IPv4 or IPv6 address, else [Host]. *)
+(** How a peer is reached. *)
+type naming = Host_name | Ip_address
+
+val naming : string -> naming
 
 (** How one call into OpenSSL ended. *)
 type 'a outcome =

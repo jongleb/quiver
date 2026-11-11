@@ -173,7 +173,7 @@ type connections = {
   control : session Await.Capsule.Await.With_mutex.t;
       (** Takes the lock while the sessions open their snapshots. *)
   sessions : session Await.Capsule.Await.With_mutex.t iarray;
-  idle : session Await.Capsule.Await.With_mutex.t Await.Await.Mpmc_queue.t;
+  idle : session Await.Capsule.Await.With_mutex.t Base.Modes.Aliased_many.t Await.Await.Mpmc_queue.t;
       (** Every connection no query holds, for introspection and planning. *)
 }
 
@@ -277,7 +277,7 @@ let connect config (wanted : Quiver_core.Provider_intf.sessions) =
             let idle = Await.Await.Mpmc_queue.create () in
             List.iter
               (fun (connection : session Await.Capsule.Await.With_mutex.t) ->
-                Await.Await.Mpmc_queue.push idle connection)
+                Await.Await.Mpmc_queue.push idle { Base.Modes.Aliased_many.aliased_many = connection })
               (control :: sessions);
             Ok
               {
@@ -298,14 +298,14 @@ let disconnect { control; sessions; _ } =
   Iarray.iter hang_up sessions
 
 let fetch connections query =
-  let held =
+  let { Base.Modes.Aliased_many.aliased_many = held } =
     Await.Await.Mpmc_queue.pop Quiver_core.Blocking.await connections.idle
   in
   let rows =
     Quiver_core.Guarded.hold held (fun { conn; _ } ->
         Result.map (List.map Array.to_list) (client_failure (Conn.rows conn query)))
   in
-  Await.Await.Mpmc_queue.push connections.idle held;
+  Await.Await.Mpmc_queue.push connections.idle { Base.Modes.Aliased_many.aliased_many = held };
   rows
 
 let supports : type lvl.

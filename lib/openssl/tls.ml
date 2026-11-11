@@ -42,10 +42,10 @@ let mutual ~certificate ~key ~peers = Result.map_error refusal (make_mutual cert
 
 type identity = Anonymous | Presenting of { certificate : string; key : string }
 
-external make_http2 : trust -> identity -> (context, refused) result @@ portable
-  = "quiver_tls_http2"
+external make_cluster : trust -> identity -> (context, refused) result @@ portable
+  = "quiver_tls_cluster"
 
-let http2 trust identity = Result.map_error refusal (make_http2 trust identity)
+let cluster trust identity = Result.map_error refusal (make_cluster trust identity)
 
 type session : value mod contended portable
 
@@ -56,7 +56,7 @@ external make_session :
 let session context fd =
   Result.map_error (fun Openssl -> error ()) (make_session context fd)
 
-type expectation = Host | Ip | Server_name
+type expectation = Host | Ip | Server_name | Protocol
 
 type 'a outcome =
   | Done of 'a
@@ -75,10 +75,12 @@ let outcome code ~done_ =
   | code when code < 0 -> Failed (error ())
   | code -> Done (done_ code)
 
+type naming = Host_name | Ip_address
+
 let naming host =
   match Unix.inet_addr_of_string host with
-  | _ -> Ip
-  | exception Failure _ -> Host
+  | _ -> Ip_address
+  | exception Failure _ -> Host_name
 
 external expect_code : session -> expectation -> string -> int @@ portable
   = "quiver_tls_expect"

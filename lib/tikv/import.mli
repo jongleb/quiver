@@ -16,12 +16,6 @@ val switch_mode :
     | `Transport of Quiver_mysql.Transport.error ] )
   result
 
-val held :
-  every:Core.Time_ns.Span.t -> (mode -> (unit, 'e) result) @ portable -> (unit -> 'a) @ local once -> ('a, 'e) result
-(** The work run with the stores asked into import mode before it, again [every] while it runs (a
-    store goes back by itself when not asked for ten minutes) and back to normal after it; only the
-    first refusal counts, the stores' own timeout ends the mode the others failed to. *)
-
 type sst
 (** A file a store wrote, as it describes it. *)
 

@@ -40,7 +40,7 @@ type rendered = {
 type framed = { text : string; length : int; raw : int }
 
 (** What a data connection's sender receives. *)
-type outgoing = Frame of framed | Stop
+type outgoing = Frame of framed @@ aliased many | Stop
 
 (** Whether a data connection's sender found its window full since the last
     ack. *)
@@ -98,9 +98,9 @@ type tally = {
 
 (** What the control writer does next. *)
 type outbound =
-  | Send of Message.control  (** Counted, kept until the collector heard it. *)
+  | Send of Message.control @@ aliased many  (** Counted, kept until the collector heard it. *)
   | Beat
-  | Broke of { generation : int; error : error }
+  | Broke of { generation : int; error : error @@ aliased many }
       (** The reader of that control connection lost it. *)
   | Leave  (** The last: the session ends. *)
 

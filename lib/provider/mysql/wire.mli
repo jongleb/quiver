@@ -54,7 +54,7 @@ module Cursor : sig
   val[@zero_alloc] uint16 : reader -> int @@ portable
   val[@zero_alloc] uint24 : reader -> int
   val[@zero_alloc] uint32 : reader -> int @@ portable
-  val[@zero_alloc] int64 : reader -> int64# @@ portable
+  val[@zero_alloc] int64 : reader -> int64_u @@ portable
   val[@zero_alloc] lenenc_int : reader -> int @@ portable
   val[@zero_alloc] skip : reader -> int -> unit @@ portable
   val[@zero_alloc] take : reader -> int -> int @@ portable

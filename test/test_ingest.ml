@@ -419,7 +419,10 @@ let held () =
       match mode with Import.Import when refuse asked -> Error `Refused | Import | Normal -> Ok ()
     in
     let started = Unix.gettimeofday () in
-    let result = Import.held ~every:(Core.Time_ns.Span.of_sec every) switch (fun () -> work (fun () -> List.rev (Portable.Atomic.get log))) in
+    let result =
+      Quiver_core.Concurrent.held ~every:(Core.Time_ns.Span.of_sec every) ~on:Import.Import ~off:Normal switch (fun () ->
+          work (fun () -> List.rev (Portable.Atomic.get log)))
+    in
     (result, List.rev (Portable.Atomic.get log), Unix.gettimeofday () -. started)
   in
   let show modes = String.concat " " (List.map (function Import.Import -> "import" | Normal -> "normal") modes) in

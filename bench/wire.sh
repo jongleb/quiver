@@ -20,7 +20,7 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 results="$root/bench/results/$(date +%Y%m%d-%H%M%S)-wire-${WIRE:-tls}-rtt$rtt"
 out=${TMPDIR:-/tmp}/quiver-wire
 mkdir -p "$results"
-switch=${QUIVER_SWITCH:-quiver-ox52}
+switch=${QUIVER_SWITCH:-quiver-ox}
 (cd "$root" && opam exec --switch="$switch" -- dune build --build-dir _build_ox_release --profile release ./bin/main.exe)
 quiver="$root/_build_ox_release/default/bin/main.exe"
 case ${WIRE:-tls} in

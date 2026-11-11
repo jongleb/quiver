@@ -34,13 +34,13 @@ type any : value mod many portable = Any : 'a t -> any
 
 val create : Ltype.t -> any
 val recycle : any -> Ltype.t -> any
-val[@zero_alloc] repr : 'a t @ local -> 'a repr @@ portable
-val ltype : _ t @ local -> Ltype.t @@ portable
-val[@zero_alloc] length : _ t @ local -> int @@ portable
+val[@zero_alloc] repr : 'a t @ local -> 'a repr
+val ltype : _ t @ local -> Ltype.t
+val[@zero_alloc] length : _ t @ local -> int
 val byte_size : _ t @ local -> int
 val[@zero_alloc] add : 'a t @ local -> 'a -> (unit, [> `Column of error ]) result
 val[@zero_alloc] add_int64 :
-  int64 t @ local -> int64# -> (unit, [> `Column of error ]) result
+  int64 t @ local -> int64_u -> (unit, [> `Column of error ]) result
 
 val[@zero_alloc] add_float :
   float t @ local -> float# -> (unit, [> `Column of error ]) result
@@ -53,16 +53,16 @@ val[@zero_alloc] add_bigstring :
   (unit, [> `Column of error ]) result
 
 val[@zero_alloc] add_null : _ t @ local -> unit
-val[@zero_alloc] presence : _ t @ local -> int -> presence @@ portable
-val get : 'a t @ local -> int -> 'a @@ portable
-val[@zero_alloc] get_int64 : int64 t @ local -> int -> int64# @@ portable
-val[@zero_alloc] get_float : float t @ local -> int -> float# @@ portable
-val[@zero_alloc] text_length : string t @ local -> int -> int @@ portable
-val[@zero_alloc] text_bytes : string t @ local -> Bytes.t @@ portable
-val[@zero_alloc] text_offset : string t @ local -> int -> int @@ portable
+val[@zero_alloc] presence : _ t @ local -> int -> presence
+val get : 'a t @ local -> int -> 'a
+val[@zero_alloc] get_int64 : int64 t @ local -> int -> int64_u
+val[@zero_alloc] get_float : float t @ local -> int -> float#
+val[@zero_alloc] text_length : string t @ local -> int -> int
+val[@zero_alloc] text_bytes : string t @ local -> Bytes.t
+val[@zero_alloc] text_offset : string t @ local -> int -> int
 val clear : _ t @ local -> unit
 
-val encode : _ t @ local -> Byte_buffer.t @ local -> unit @@ portable
+val encode : _ t @ local -> Byte_buffer.t @ local -> unit
 (** Appends the column's buffers as they lie in memory, in native byte order:
     validity, data or offsets, then the bytes the offsets point into. *)
 

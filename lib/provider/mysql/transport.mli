@@ -50,11 +50,12 @@ val start_tls :
 val secure :
   t ->
   host:string ->
+  protocol:string ->
   Quiver_openssl.Tls.context ->
   ([ `Trusted | `Unproven of string ], [> `Transport of error ]) result
 @@ portable
-(** TLS by this context, the server's chain and host name checked against its certificates;
-    [`Unproven] with OpenSSL's reason when they fail. *)
+(** TLS by this context offering only the ALPN [protocol], the server's chain and host name
+    checked against its certificates; [`Unproven] with OpenSSL's reason when they fail. *)
 
 val protocol : t -> string option @@ portable
 (** The ALPN protocol the server chose under TLS. *)

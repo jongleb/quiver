@@ -50,11 +50,13 @@ let () =
       ("hpack", Test_hpack.tests);
       ("proto", Test_proto.tests);
       ("http2", Test_http2.tests);
+      ("http1", Test_http1.tests);
       ("kv", Test_kv.tests);
       ("tikv read", Test_tikv_read.tests);
       ("tikv ingest", Test_ingest.tests);
       ("tikv pd", Test_pd.tests);
       ("tikv mirror", Test_mirror.tests);
+      ("tikv placement", Test_placement.tests);
       ("tikv info", Test_info.tests);
       ("tikv renumber", Test_renumber.tests);
     ]

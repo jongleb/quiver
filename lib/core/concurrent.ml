@@ -59,6 +59,17 @@ let meanwhile ~every again work =
   in
   result
 
+let held ~every ~on ~off ask work =
+  let release () = ignore (ask off) in
+  match ask on with
+  | Error error ->
+      release ();
+      Error error
+  | Ok () ->
+      let result = meanwhile ~every (fun () -> ignore (ask on)) work in
+      release ();
+      Ok result
+
 let spread (type (a : value mod contended portable) (b : value mod contended portable))
     ~workers (items : a iarray) (work : a -> b) : b list =
   let next = Portable.Atomic.make 0 in

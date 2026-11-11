@@ -13,7 +13,7 @@ out=${BENCH_OUT:-${TMPDIR:-/tmp}/quiver-bench}
 results="$root/bench/results/$(date +%Y%m%d-%H%M%S)-t$threads"
 mkdir -p "$results"
 # Release builds use a flambda switch (-O3 in the release profile, see /dune).
-switch=${QUIVER_SWITCH:-quiver-ox52}
+switch=${QUIVER_SWITCH:-quiver-ox}
 (cd "$root" && opam exec --switch="$switch" -- dune build --build-dir _build_ox_release --profile release ./bin/main.exe)
 quiver="$root/_build_ox_release/default/bin/main.exe dump -P 33200 -p quiver -B bench -t $threads"
 mydumper="mydumper -h 127.0.0.1 -P 33200 -u root -p quiver -B bench -t $threads --complete-insert --rows 1000000 --sync-thread-lock-mode FTWRL"

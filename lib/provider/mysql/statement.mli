@@ -48,6 +48,7 @@ type t =
       (** The table under this name, the rest of its definition as [SHOW CREATE TABLE] gives it after the name. *)
   | Rebase of { table : Quiver_core.Schema.Name.t; allocator : allocator; next : int64 }
       (** TiDB: the allocator hands out ids from [next] on. *)
+  | Analyze_table of Quiver_core.Schema.Name.t  (** Its statistics gathered anew. *)
   | Drop_indexes of { table : Quiver_core.Schema.Name.t; indexes : Quiver_core.Ident.t list }
   | Scatter_regions
       (** TiDB: regions the session splits are spread over the stores before the split returns. *)

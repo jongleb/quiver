@@ -13,7 +13,7 @@ out=${BENCH_OUT:-${TMPDIR:-/tmp}/quiver-bench-load}
 results="$root/bench/results/$(date +%Y%m%d-%H%M%S)-load-t$threads"
 rm -rf "$out"
 mkdir -p "$results" "$out"
-switch=${QUIVER_SWITCH:-quiver-ox52}
+switch=${QUIVER_SWITCH:-quiver-ox}
 (cd "$root" && opam exec --switch="$switch" -- dune build --build-dir _build_ox_release --profile release ./bin/main.exe)
 quiver="$root/_build_ox_release/default/bin/main.exe"
 connection="-P 33200 -p quiver"

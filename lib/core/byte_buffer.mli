@@ -2,7 +2,7 @@
 
 (** A growable byte buffer whose bytes and length hot paths write directly. *)
 
-type t = { mutable bs : Bytes.t @@ aliased; mutable len : int }
+type t = { mutable bs : Bytes.t; mutable len : int }
 
 val create : ?cap:int -> unit -> t @ unique
 val[@zero_alloc] length : t @ local -> int

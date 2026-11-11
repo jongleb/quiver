@@ -10,8 +10,18 @@ type sums = Same | Fewer_keys | Other_crc [@@deriving sexp_of]
 (* Whether the other cluster agrees with the source. *)
 type agreement = Agree | Differ [@@deriving sexp_of]
 
+(* Whether the other cluster has a placement policy the source's definition names. *)
+type presence = Present | Present_otherwise_cased | Absent [@@deriving sexp_of]
+
 (* Where the copy goes, and what the other cluster says. *)
-type other = { collations : agreement; ids : agreement; definition : agreement } [@@deriving sexp_of]
+type other = {
+  collations : agreement;
+  ids : agreement;
+  definition : agreement;
+  policies : (string * presence) list;
+  placement : Mirror.placement;
+}
+[@@deriving sexp_of]
 
 type place = Here | There of other [@@deriving sexp_of]
 
@@ -28,7 +38,12 @@ let gen =
       oneof
         [
           return Here;
-          map3 (fun collations ids definition -> There { collations; ids; definition }) agreement agreement agreement;
+          (let* collations = agreement and* ids = agreement and* definition = agreement in
+           let* policies =
+             list_size (int_range 0 3)
+               (pair (oneof_list [ "p1"; "p 2"; "p`q" ]) (oneof_weighted [ (3, return Present); (1, return Present_otherwise_cased); (1, return Absent) ]))
+           and* placement = oneof_list [ Mirror.Kept_placement; Default_placement ] in
+           return (There { collations; ids; definition; policies; placement }));
         ]
     and* changing = oneof_weighted [ (6, return Agree); (1, return Differ) ]
     and* partitions = oneof_weighted [ (5, return 0); (1, int_range 1 4) ]
@@ -43,6 +58,14 @@ let gen =
         [ (5, return Never); (1, return At_create); (1, return At_described); (1, return At_keys); (1, return At_checksum); (1, return At_rebase); (1, return At_rename) ]
     and* holding = oneof_weighted [ (6, return Held); (1, return Passed_before); (1, return Lapsed) ] in
     return { place; changing; partitions; allocators; sums; failing; holding })
+
+let body = " (\n  `a` int COMMENT 'it''s \\\\ /*T![placement] PLACEMENT POLICY=`decoy` */'\n) ENGINE=InnoDB"
+
+let clauses policies =
+  String.concat ""
+    (List.map
+       (fun (name, _) -> " /*T![placement] PLACEMENT POLICY=`" ^ Base.String.substr_replace_all name ~pattern:"`" ~with_:"``" ^ "` */")
+       policies)
 
 let name database table : Quiver_core.Schema.Name.t = { database = Support.ident database; table = Support.ident table }
 let source = name "d" "src" and target = name "e" "dst" and service = name "e" "q_model"
@@ -69,7 +92,7 @@ let run case =
   let refused = Error (`Region (Region.Malformed [ Some "refused" ])) in
   let cell text = Some text in
   let there = match case.place with Here -> None | There there -> Some there in
-  let side ~here ~clock ~collation ~column ~id ~allocators ~tables : _ Mirror.side =
+  let side ~here ~clock ~collation ~column ~id ~allocators ~tables ~policies : _ Mirror.side =
     {
       query =
         (fun query ->
@@ -79,8 +102,19 @@ let run case =
               clock := Int64.add !clock 7L;
               Ok [ [| cell "tidb-binlog"; cell (Int64.to_string !clock) |] ]
           | Show_create (Table _) ->
-              let definition = match there with Some { definition = Differ; _ } -> "CREATE VIEW `src` AS SELECT 1" | Some _ | None -> "CREATE TABLE `src` (\n  `a` int\n)" in
+              let definition =
+                match there with
+                | Some { definition = Differ; _ } -> "CREATE VIEW `src` AS SELECT 1"
+                | Some { policies; _ } -> "CREATE TABLE `src`" ^ body ^ clauses policies
+                | None -> "CREATE TABLE `src`" ^ body
+              in
               Ok [ [| cell "src"; cell definition |] ]
+          | Placement_policies ->
+              Ok
+                (List.filter_map
+                   (fun (name, presence) ->
+                     match presence with Present -> Some [| cell name |] | Present_otherwise_cased -> Some [| cell (String.uppercase_ascii name) |] | Absent -> None)
+                   policies)
           | Checksum table when not (List.mem table tables) -> refused
           | Checksum _ when case.failing = At_checksum -> refused
           | Checksum _ ->
@@ -104,20 +138,21 @@ let run case =
     }
   in
   let source_side = side ~here:(fun statement -> Source_ran statement) ~clock:source_clock ~collation:"True" ~column:1 ~id:75L ~allocators:case.allocators
-      ~tables:(match there with None -> [ source; service ] | Some _ -> [ source ]) in
+      ~tables:(match there with None -> [ source; service ] | Some _ -> [ source ]) ~policies:[] in
   let target_side, cluster =
     match there with
     | None -> (source_side, Mirror.Same_cluster)
     | Some there ->
         let collation = match there.collations with Agree -> "TRUE" | Differ -> "False"
         and column = match there.ids with Agree -> 1 | Differ -> 2 in
-        (side ~here:(fun statement -> Target_ran statement) ~clock:target_clock ~collation ~column ~id:300L ~allocators:[] ~tables:[ service ], Other_cluster ())
+        (side ~here:(fun statement -> Target_ran statement) ~clock:target_clock ~collation ~column ~id:300L ~allocators:[] ~tables:[ service ] ~policies:there.policies, Other_cluster ())
   in
   let session : _ Mirror.session =
     {
       source_side;
       target_side;
       cluster;
+      placement = (match there with Some there -> there.placement | None -> Kept_placement);
       name = (fun () -> "q_model");
       keys =
         (fun plan ~version ~commit_ts ->
@@ -166,7 +201,17 @@ let copies =
           ]
       in
       let create : Quiver_mysql.Statement.t =
-        match case.place with Here -> Create_like { table = service; like = source } | There _ -> Create_table { table = service; body = " (\n  `a` int\n)" }
+        match case.place with
+        | Here -> Create_like { table = service; like = source }
+        | There { placement = Kept_placement; policies; _ } -> Create_table { table = service; body = body ^ clauses policies }
+        | There { placement = Default_placement; _ } -> Create_table { table = service; body }
+      in
+      let missing =
+        match case.place with
+        | There { placement = Kept_placement; policies; _ } ->
+            let present name = List.exists (fun (other, presence) -> other = name && presence <> Absent) policies in
+            List.fold_left (fun missing (name, _) -> if present name || List.mem name missing then missing else missing @ [ name ]) [] policies
+        | There { placement = Default_placement; _ } | Here -> []
       in
       let refused = Error (`Region (Region.Malformed [ Some "refused" ])) in
       let failing = match (case.failing, rebases) with At_rebase, [] -> Never | failing, _ -> failing in
@@ -194,6 +239,8 @@ let copies =
       | _, There { collations = Differ; _ } ->
           result = Error (`Mirror (Mirror.Collations_differ { source = "True"; target = "False" })) && executed = [] && keyed = []
       | _, There { definition = Differ; _ } -> result = Error (`Mirror (Mirror.Definition source)) && executed = [] && keyed = []
+      | _, There _ when missing <> [] ->
+          result = Error (`Mirror (Mirror.Unknown_policies (List.hd missing, List.tl missing))) && executed = [] && keyed = []
       | _ when failing = At_create -> result = refused && executed = [ ran create ] && keyed = []
       | Error (`Pd (Pd.Gc_passed _)), _ when case.holding = Passed_before -> dropped && keyed = [] && asked = []
       | _ when case.holding = Passed_before -> false

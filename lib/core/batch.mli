@@ -24,12 +24,12 @@ val seal : t @ unique -> (sealed, [> `Batch of error ]) result @ unique
 val unseal : sealed @ once unique -> t @ unique
 (** The batch again, to be refilled. *)
 
-val sealed_columns : sealed @ local -> Column.any Iarray.t @ local @@ portable
-val sealed_rows : sealed @ local -> int @@ portable
-val sealed_byte_size : sealed @ local -> int @@ portable
+val sealed_columns : sealed @ local -> Column.any Iarray.t @ local
+val sealed_rows : sealed @ local -> int
+val sealed_byte_size : sealed @ local -> int
 val reshape : t @ local -> Ltype.t list -> unit
 
-val encode : sealed @ local -> Byte_buffer.t @ local -> unit @@ portable
+val encode : sealed @ local -> Byte_buffer.t @ local -> unit
 (** Appends the row count and every column's buffers, in native byte order. *)
 
 val decode :

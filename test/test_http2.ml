@@ -509,7 +509,7 @@ let secured () =
   in
   let scenario = { initial_window = 65_535; max_frame = 16_384; exchanges = [ exchange ] } in
   let context identity =
-    match Quiver_openssl.Tls.http2 (Ca_file "tls/ca.crt") identity with
+    match Quiver_openssl.Tls.cluster (Ca_file "tls/ca.crt") identity with
     | Ok context -> context
     | Error (_ : Quiver_openssl.Tls.unusable) -> Alcotest.fail "no context"
   in
@@ -551,7 +551,7 @@ let secured () =
   Alcotest.(check (option (pair string (list (option string))))) "and one it does" pong
     (answered (through ~clients:"tls/ca.crt" ~identity:(Presenting { certificate = "tls/node.crt"; key = "tls/node.key" }) "node"));
   let unusable trust identity =
-    match Quiver_openssl.Tls.http2 trust identity with
+    match Quiver_openssl.Tls.cluster trust identity with
     | Ok _ -> "usable"
     | Error (Context _) -> "context"
     | Error (Certificate _) -> "certificate"

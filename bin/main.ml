@@ -684,7 +684,7 @@ let () =
                  | Quiver_load.Load.cause ]]
                  error))
   in
-  let mirror (conn : Quiver_mysql.Provider.conn_config) security other database into tables workers stores =
+  let mirror (conn : Quiver_mysql.Provider.conn_config) security other database into tables workers stores regions placement statistics =
     let open Base.Result.Let_syntax in
     let connect (conn : Quiver_mysql.Provider.conn_config) =
       Quiver_mysql.Link.connect ~local_data:Without_local_data conn.route ~timeouts:conn.timeouts ~user:conn.user
@@ -730,11 +730,28 @@ let () =
                     sizes = { scan = 1024; job = 16 lsl 20; batch = 16 lsl 10 };
                     workers;
                     stores;
+                    regions;
+                    placement;
                   }
               in
               Format.printf "%s.%s: %d keys, %d bytes, checksum %016Lx as TiDB's, in %a@." (into :> string)
                 (table :> string) copied.keys copied.bytes copied.checksum Core.Time_ns.Span.pp
                 (Quiver_core.Stopwatch.elapsed started);
+              let () =
+                match statistics with
+                | `Leave -> ()
+                | `Analyze -> (
+                    let started = Quiver_core.Stopwatch.start () in
+                    match Quiver_mysql.Link.run_statement target (Analyze_table { database = into; table }) with
+                    | Ok () ->
+                        Format.printf "%s.%s: statistics gathered in %a@." (into :> string) (table :> string) Core.Time_ns.Span.pp
+                          (Quiver_core.Stopwatch.elapsed started)
+                    | Error error ->
+                        Format.eprintf
+                          "warning: %s.%s is copied whole, but ANALYZE TABLE failed, and TiDB plans queries on it as on an empty table until its statistics are gathered: %a@."
+                          (into :> string) (table :> string) Base.Sexp.pp_hum
+                          ([%sexp_of: [ `Link of Quiver_mysql.Link.error | `Wire of Quiver_mysql.Wire.error | `Transport of Quiver_mysql.Transport.error ]] error))
+              in
               Ok ())
         in
         let () = match onto with Same_cluster -> () | Other_cluster onto -> Quiver_mysql.Link.close onto.link in
@@ -749,12 +766,11 @@ let () =
     | Error error ->
         let () =
           match error with
-          | `Renumber (Quiver_tikv.Renumber.Missing _ | Old_row) ->
+          | `Renumber (Quiver_tikv.Renumber.Missing _) ->
               Format.eprintf
                 "hint: the source has rows its copy would read otherwise: written before a column was added \
                  with a default quiver does not write into them (JSON, TIMESTAMP of TiDB before 3.0, a character \
-                 set other than utf8mb4, utf8, ascii, latin1 and binary), or in TiDB's first row format; quiver \
-                 copy copies the table through SQL@."
+                 set other than utf8mb4, utf8, ascii, latin1 and binary); quiver copy copies the table through SQL@."
           | `Renumber (Quiver_tikv.Renumber.Changing _ | Rearranging) ->
               Format.eprintf "hint: the table's schema or partitions are being changed; copy it once the change is done@."
           | `Renumber (Quiver_tikv.Renumber.Global_index _) ->
@@ -767,11 +783,18 @@ let () =
           | `Pd (Quiver_tikv.Pd.Gc_passed _) ->
               Format.eprintf
                 "hint: the source's GC may have removed versions the copy read (its hold on PD lapsed, as when PD was out of reach for minutes); the half-made copy was dropped, run it again@."
+          | `Mirror (Quiver_tikv.Mirror.Unknown_policies _) ->
+              Format.eprintf
+                "hint: create those placement policies in the target cluster, or copy with --placement default to place the copy as the target places any table@."
+          | `Http1 _ ->
+              Format.eprintf
+                "hint: the target's PD did not take the region label keeping it from scheduling the copy's regions over its HTTP API; --target-regions scheduled copies without it@."
           | _ -> ()
         in
         failed
           ([%sexp_of:
              [ `Mirror of Quiver_tikv.Mirror.error
+             | `Placement of Quiver_tikv.Placement.error
              | `Link of Quiver_mysql.Link.error
              | `Wire of Quiver_mysql.Wire.error
              | `Ident of Quiver_core.Ident.error
@@ -784,6 +807,7 @@ let () =
              | `Transport of Quiver_mysql.Transport.error
              | `Proto of Quiver_tikv.Proto.error
              | `Grpc of Quiver_tikv.Grpc.error
+             | `Http1 of Quiver_tikv.Http1.error
              | `Http2 of Quiver_tikv.Http2.error
              | `Hpack of Quiver_tikv.Hpack.error
              | `Not_tidb ]]
@@ -1638,6 +1662,36 @@ let () =
                the writes and no region is split by size, but compaction takes more threads and the \
                cluster's other writes may slow down meanwhile (on one machine running every store it \
                made copies slower), and a store left in it goes back by itself after ten minutes.")
+    and regions =
+      Arg.(
+        value
+        & opt (enum [ ("held", Quiver_tikv.Mirror.Held); ("scheduled", Scheduled) ]) Quiver_tikv.Mirror.Held
+        & described [ "target-regions" ] ~docv:"MODE"
+            ~doc:
+              "$(b,held) keeps PD from scheduling the copy's regions while its keys go in, as \
+               IMPORT INTO does: no leader or replica moved and no region merged under the writes \
+               (a region label $(b,schedule=deny) over the copy's keys, asked again every minute, \
+               lapsing by itself three minutes after the last ask, dropped at the end); \
+               $(b,scheduled) leaves them to PD as any other region.")
+    and placement =
+      Arg.(
+        value
+        & opt (enum [ ("keep", Quiver_tikv.Mirror.Kept_placement); ("default", Default_placement) ]) Quiver_tikv.Mirror.Kept_placement
+        & described [ "placement" ] ~docv:"MODE"
+            ~doc:
+              "Into another cluster: $(b,keep) gives the copy the source's placement policies, on the \
+               table and its partitions, and refuses before making anything when the target lacks \
+               one; $(b,default) leaves them out, the copy placed as the target places any table. \
+               Within one cluster the copy always keeps them.")
+    and statistics =
+      Arg.(
+        value
+        & opt (enum [ ("analyze", `Analyze); ("leave", `Leave) ]) `Analyze
+        & described [ "statistics" ] ~docv:"MODE"
+            ~doc:
+              "$(b,analyze) runs ANALYZE TABLE on each copy once it is made: its keys bypass TiDB, \
+               which otherwise counts it empty and never analyzes it by itself; a failure there is a \
+               warning, the copy being whole. $(b,leave) skips it.")
     and cluster side =
       let named long = match side with `Source -> long | `Target -> "to-" ^ long in
       let whose = match side with `Source -> "the source's" | `Target -> "the target's" in
@@ -1659,7 +1713,7 @@ let () =
               Result.map_error refused
                 (Result.map
                    (fun context -> Quiver_tikv.Http2.Secured context)
-                   (Quiver_openssl.Tls.http2 (Ca_file ca) identity))
+                   (Quiver_openssl.Tls.cluster (Ca_file ca) identity))
             in
             match (ca, certificate, key) with
             | None, None, None -> Ok Quiver_tikv.Http2.Cleartext
@@ -1697,7 +1751,7 @@ let () =
             checksum. Into another cluster the two must agree on new collations, and the copy is \
             made by the source's definition; where its columns and indexes have other ids, as \
             after the source's ALTERs, keys and rows are written under the copy's")
-      Term.(const mirror $ server `Source $ term_result (cluster `Source) $ target $ database $ into $ tables $ workers $ stores)
+      Term.(const mirror $ server `Source $ term_result (cluster `Source) $ target $ database $ into $ tables $ workers $ stores $ regions $ placement $ statistics)
   in
   let copy_cmd =
     let open Cmdliner in

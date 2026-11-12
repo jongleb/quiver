@@ -65,6 +65,7 @@ type t =
       (** TiDB: each id allocator of the table, the next id it hands out and its kind. *)
   | Checksum of Quiver_core.Schema.Name.t
       (** TiDB: the CRC64 XOR of every key and value of the table, their count and bytes. *)
+  | Names of Quiver_core.Ident.t  (** The name of every table, view and sequence of the database. *)
   | Base_tables of Quiver_core.Ident.t  (** The database's tables, not views or sequences, by name. *)
       (** TiDB: the table's [TIDB_PK_TYPE], [CLUSTERED] when its rows are kept by its primary key. *)
   | Warnings  (** Level, code and message of the last statement's warnings. *)

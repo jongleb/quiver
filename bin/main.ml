@@ -791,6 +791,8 @@ let () =
           | `Mirror (Quiver_tikv.Mirror.Unknown_policies _) ->
               Format.eprintf
                 "hint: create those placement policies in the target cluster, or copy with --placement default to place the copy as the target places any table@."
+          | `Mirror (Quiver_tikv.Mirror.Taken _) ->
+              Format.eprintf "hint: those names are taken in the target by tables, views or sequences (or by two copies): drop or rename them, or copy into another database with --to-database@."
           | `Http1 _ ->
               Format.eprintf
                 "hint: the target's PD did not take the region label keeping it from scheduling the copy's regions over its HTTP API; --target-regions scheduled copies without it@."

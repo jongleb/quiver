@@ -508,6 +508,8 @@ let queries () =
   Alcotest.(check string) "the table's id"
     "SELECT TIDB_TABLE_ID FROM information_schema.TABLES WHERE TABLE_SCHEMA = _utf8mb4 X'64' AND TABLE_NAME = _utf8mb4 X'7427'"
     (Quiver_mysql.Query.sql (Table_id name));
+  Alcotest.(check string) "names" "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = _utf8mb4 X'64'"
+    (Quiver_mysql.Query.sql (Names (Support.ident "d")));
   Alcotest.(check string) "PD" "SELECT INSTANCE FROM information_schema.CLUSTER_INFO WHERE TYPE = 'pd'" (Quiver_mysql.Query.sql Pd_instances);
   Alcotest.(check string) "allocators" "SHOW TABLE `d`.`t'` NEXT_ROW_ID" (Quiver_mysql.Query.sql (Next_row_ids name));
   Alcotest.(check string) "checksum" "ADMIN CHECKSUM TABLE `d`.`t'`" (Quiver_mysql.Query.sql (Checksum name));

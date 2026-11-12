@@ -26,6 +26,7 @@ type error =
   | Definition of Quiver_core.Schema.Name.t
   | Undescribed of Quiver_core.Schema.Name.t
   | Unknown_policies of string * string list
+  | Taken of Quiver_core.Schema.Name.t * Quiver_core.Schema.Name.t list
 [@@deriving sexp_of ~portable]
 
 type failure =
@@ -462,6 +463,25 @@ let through session tables =
         in
         match List.rev lacking with [] -> Ok () | first :: rest -> Error (`Mirror (Unknown_policies (first, rest))))
   in
+  let databases = Base.List.dedup_and_sort ~compare:Quiver_core.Ident.compare (List.map (fun (moved : moved) -> moved.target.database) tables) in
+  let%bind () =
+    let folded (database : Quiver_core.Ident.t) table = (String.lowercase_ascii (database :> string), String.lowercase_ascii table) in
+    let%bind there =
+      each databases ~f:(fun database ->
+          let%bind rows = target_side.query (Names database) in
+          each rows ~f:(fun row -> match row with [| Some table |] -> Ok (folded database table) | row -> malformed row))
+    in
+    let taken, _ =
+      List.fold_left
+        (fun (taken, seen) (moved : moved) ->
+          let name = folded moved.target.database (moved.target.table :> string) in
+          if not (List.mem name seen) then (taken, name :: seen)
+          else if List.mem moved.target taken then (taken, seen)
+          else (moved.target :: taken, seen))
+        ([], List.concat there) tables
+    in
+    match List.rev taken with [] -> Ok () | first :: rest -> Error (`Mirror (Taken (first, rest)))
+  in
   let tso side =
     let%bind rows = side.query (Binlog_status side.server) in
     match rows with
@@ -472,10 +492,7 @@ let through session tables =
   in
   let%bind version = tso source_side in
   let%bind () =
-    Base.List.fold_result
-      (Base.List.dedup_and_sort ~compare:Quiver_core.Ident.compare (List.map (fun (moved : moved) -> moved.target.database) tables))
-      ~init:()
-      ~f:(fun () database -> target_side.execute (Create_database database))
+    Base.List.fold_result databases ~init:() ~f:(fun () database -> target_side.execute (Create_database database))
   in
   let drop made = List.iter (fun (_, service) -> ignore (target_side.execute (Drop_table service))) made in
   let rec create made planned =

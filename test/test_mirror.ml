@@ -25,6 +25,9 @@ type other = {
 
 type place = Here | There of other [@@deriving sexp_of]
 
+(* Whether the name of the copy of the table [at] is free in the target. *)
+type taken = Free | Taken | Taken_otherwise_cased | Repeated [@@deriving sexp_of]
+
 (* What the source's GC says of the copy's version: held, passed it already, or passed it meanwhile. *)
 type holding = Held | Passed_before | Lapsed [@@deriving sexp_of]
 
@@ -38,6 +41,7 @@ type case = {
   sums : sums;
   failing : failing;
   holding : holding;
+  taken : taken;
 }
 [@@deriving sexp_of]
 
@@ -68,8 +72,11 @@ let gen =
       oneof_weighted
         [ (5, return Never); (1, return At_create); (1, return At_described); (1, return At_keys); (1, return At_checksum); (1, return At_rebase); (1, return At_rename) ]
     and* holding = oneof_weighted [ (6, return Held); (1, return Passed_before); (1, return Lapsed) ] in
-    let* at = int_range 0 (tables - 1) in
-    return { place; tables; at; changing; partitions; allocators; sums; failing; holding })
+    let* at = int_range 0 (tables - 1)
+    and* taken =
+      oneof_weighted ((8, return Free) :: (1, return Taken) :: (1, return Taken_otherwise_cased) :: (if tables > 1 then [ (1, return Repeated) ] else []))
+    in
+    return { place; tables; at; changing; partitions; allocators; sums; failing; holding; taken })
 
 let body = " (\n  `a` int COMMENT 'it''s \\\\ /*T![placement] PLACEMENT POLICY=`decoy` */'\n) ENGINE=InnoDB"
 
@@ -104,6 +111,8 @@ let described ~id ~column ~state ~partitions : Info.t =
 type ran = Source_ran of Quiver_mysql.Statement.t | Target_ran of Quiver_mysql.Statement.t
 
 let numbered case = List.init case.tables Fun.id
+let partner case = if case.at = 0 then 1 else case.at - 1
+let repeated case i = if case.taken = Repeated && i = case.at then partner case else i
 
 let run case =
   let executed = ref [] and keyed = ref [] and asked = ref [] and finished = ref [] and holding = ref None and named = ref 0
@@ -133,6 +142,14 @@ let run case =
                   in
                   Ok [ [| cell (Printf.sprintf "src%d" i); cell definition |] ])
                 (index source table)
+          | Names database when database = Support.ident "e" ->
+              let named = Printf.sprintf "dst%d" case.at in
+              Ok
+                (List.map
+                   (fun name -> [| cell name |])
+                   ("unrelated"
+                   :: (match case.taken with Taken -> [ named ] | Taken_otherwise_cased -> [ String.uppercase_ascii named ] | Free | Repeated -> [])))
+          | Names _ -> Ok []
           | Placement_policies ->
               Ok
                 (List.filter_map
@@ -209,7 +226,7 @@ let run case =
       finished = (fun moved copied -> finished := (moved, copied) :: !finished);
     }
   in
-  let moved = List.map (fun i : Mirror.moved -> { source = source i; target = target i }) (numbered case) in
+  let moved = List.map (fun i : Mirror.moved -> { source = source i; target = target (repeated case i) }) (numbered case) in
   let result = Mirror.through session moved in
   (result, List.rev !executed, List.rev !keyed, List.rev !asked, List.rev !finished)
 
@@ -247,6 +264,7 @@ let expected case =
   | There { collations = Differ; _ } -> (Error (`Mirror (Mirror.Collations_differ { source = "True"; target = "False" })), [], 0)
   | There { definition = Differ; _ } -> (Error (`Mirror (Mirror.Definition (source case.at))), [], 0)
   | There _ when lacking <> [] -> (Error (`Mirror (Mirror.Unknown_policies (List.hd lacking, List.tl lacking))), [], 0)
+  | (Here | There _) when case.taken <> Free -> (Error (`Mirror (Mirror.Taken (target (repeated case case.at), []))), [], 0)
   | Here | There _ -> (
       let made = ran (Create_database (Support.ident "e")) :: List.map (fun i -> ran (create i)) tables in
       match List.find_opt (fun i -> at i At_create) tables with

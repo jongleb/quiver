@@ -59,6 +59,8 @@ type error =
   | Definition of Quiver_core.Schema.Name.t  (** Its [SHOW CREATE TABLE] does not start with its name. *)
   | Undescribed of Quiver_core.Schema.Name.t  (** No description of the table under TiKV's meta keys. *)
   | Unknown_policies of string * string list  (** Placement policies of the source the target lacks, by name in any case. *)
+  | Taken of Quiver_core.Schema.Name.t * Quiver_core.Schema.Name.t list
+      (** Names of copies a table, view or sequence of the target has, or another copy, in any case. *)
 [@@deriving sexp_of ~portable]
 
 (** Keys of the source from [start] up to [stop]. *)
@@ -185,7 +187,7 @@ val copy :
   result
 @@ nonportable
 (** The tables as of one version of the source, taken now, into new tables, in its cluster or
-    another: their definitions, the clusters' collations and placement policies checked before
+    another: their definitions, the clusters' collations, placement policies and the copies' names checked before
     anything is made; each made under a name of its own ([LIKE] it, or by its definition in the
     other cluster), its keys copied by {!table} with the source's GC held at the version by
     {!Pd.held}, at a later version of the target's cluster under the copy's ids, as both tables are

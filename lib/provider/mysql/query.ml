@@ -48,6 +48,7 @@ type t =
   | Placement_policies
   | Next_row_ids of Quiver_core.Schema.Name.t
   | Checksum of Quiver_core.Schema.Name.t
+  | Names of Quiver_core.Ident.t
   | Base_tables of Quiver_core.Ident.t
   | Warnings
   | Loaded_files of { dump : string; target : string }
@@ -310,6 +311,7 @@ let sql = function
   | Placement_policies -> "SELECT POLICY_NAME FROM information_schema.PLACEMENT_POLICIES"
   | Next_row_ids name -> [%string "SHOW TABLE %{qualified name} NEXT_ROW_ID"]
   | Checksum name -> [%string "ADMIN CHECKSUM TABLE %{qualified name}"]
+  | Names database -> [%string "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = %{text (database :> string)}"]
   | Base_tables database ->
       [%string
         "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = %{text (database :> string)} \

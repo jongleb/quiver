@@ -41,7 +41,7 @@ let () =
         | Ok (Reply (Pairs pairs)) ->
             List.iter
               (fun (pair : Quiver_tikv.Kv.pair) ->
-                let key = match Quiver_tikv.Renumber.key plan pair.key with Some key -> key | None -> exit 1 in
+                let key = match Quiver_tikv.Renumber.key plan pair.key with Ok (Some key) -> key | Ok None | Error _ -> exit 1 in
                 Quiver_tikv.Pairs.add gathered key pair.value;
                 checksum := Int64.logxor !checksum (Quiver_tikv.Crc64.pair key pair.value);
                 size := !size + String.length pair.key + String.length pair.value)

@@ -288,18 +288,127 @@ let keys =
             (fun (under, index, suffix) ->
               let from = table under and into = into under in
               match index with
-              | -1 -> Renumber.key plan (prefix from ^ "_r" ^ suffix) = Option.map (fun (_, into) -> prefix into ^ "_r" ^ suffix) into
+              | -1 -> Renumber.key plan (prefix from ^ "_r" ^ suffix) = Ok (Option.map (fun (_, into) -> prefix into ^ "_r" ^ suffix) into)
               | index -> (
                   let key = prefix from ^ "_i" ^ id index ^ suffix in
                   match (List.find_opt (fun (source, _, _) -> source = index) public, into) with
-                  | Some (_, moved, _), Some (_, into) -> Renumber.key plan key = Some (prefix into ^ "_i" ^ id moved ^ suffix)
-                  | _ -> Renumber.key plan key = None))
+                  | Some (_, moved, _), Some (_, into) -> Renumber.key plan key = Ok (Some (prefix into ^ "_i" ^ id moved ^ suffix))
+                  | _ -> Renumber.key plan key = Ok None))
             keys
           && Renumber.tables plan
              = List.sort compare
                  (if partitions = 0 then [ (75L, 300L) ]
                   else List.init partitions (fun i -> (Int64.of_int (80 + (((5 * i) + 2) mod 7)), Int64.of_int (400 + partitions - 1 - i))))
-          && List.for_all (fun (from, into) -> Renumber.key plan (prefix from) = Some (prefix into)) (Renumber.tables plan))
+          && List.for_all (fun (from, into) -> Renumber.key plan (prefix from) = Ok (Some (prefix into))) (Renumber.tables plan))
+
+(* A key under a partitioned table with a local index [l] and a global one [g]. *)
+type entry =
+  | Global_entry of { values : string list; named : (int * string) option }  (** The partition and handle of an entry that has them. *)
+  | Global_unknown  (** An entry naming no partition of the table. *)
+  | Global_under of int  (** Under a partition's id. *)
+  | Local_under_own
+  | Local_under of int
+  | Row_under_own
+[@@deriving sexp_of]
+
+let globals =
+  QCheck2.Test.make ~count:3000
+    ~name:"a global index's keys move under the copy's own id, naming the copy's partitions in keys and values; keys under the wrong id stay behind"
+    ~print:(fun (case, naming, partitions, entries, values) ->
+      Base.Sexp.to_string_hum ([%sexp_of: case * Info.naming * int * entry list * (int option * index_value) list] (case, naming, partitions, entries, values)))
+    QCheck2.Gen.(
+      let* case = gen in
+      let* naming = oneof_list [ Info.In_values; In_keys_too ] in
+      let* partitions = int_range 1 4 in
+      let eight = string_size ~gen:char (return 8) in
+      let datum =
+        oneof
+          [
+            return "\x00";
+            map (fun bytes -> "\x01" ^ Codec.encode_bytes bytes) (string_size ~gen:(oneof [ char; return '\x7e'; return '\x03' ]) (int_range 0 20));
+            map (fun bytes -> "\x03" ^ bytes) eight;
+            map (fun bytes -> "\x04" ^ bytes) eight;
+            map (fun bytes -> "\x05" ^ bytes) eight;
+            map (fun bytes -> "\x07" ^ bytes) eight;
+            map (fun digit -> "\x06\x01\x00" ^ String.make 1 (Char.chr digit)) (int_range 0 9);
+          ]
+      in
+      let partition = int_range 0 (partitions - 1) in
+      let entry =
+        oneof_weighted
+          [
+            ( 6,
+              let* values = list_size (int_range 1 4) datum in
+              let* named = option (pair partition eight) in
+              return (Global_entry { values; named = (if naming = In_keys_too then named else None) }) );
+            ((if naming = In_keys_too then 1 else 0), return Global_unknown);
+            (1, map (fun i -> Global_under i) partition);
+            (1, return Local_under_own);
+            (1, map (fun i -> Local_under i) partition);
+            (1, return Row_under_own);
+          ]
+      in
+      let count = List.length case.columns in
+      let cell = oneof [ return Absent; return Null; map (fun bytes -> Held bytes) (string_size (int_range 0 6)) ] in
+      let value =
+        let* version_one = bool in
+        let* common = option (string_size (int_range 9 20)) in
+        let* restored = option (list_size (return count) cell) in
+        let* handle = option eight in
+        let* named = oneof_weighted [ (8, map Option.some partition); (1, return None) ] in
+        return (named, { version_one; common; partition = None; restored; handle = (if version_one || Option.is_some common then None else handle) })
+      in
+      let* entries = list_size (int_range 1 12) entry and* values = list_size (int_range 1 6) value in
+      return (case, naming, partitions, entries, values))
+    (fun (case, naming, partitions, entries, values) ->
+      let held n = String.init 8 (fun i -> Char.chr (Int64.to_int (Int64.logand (Int64.shift_right_logical (Int64.logxor n Int64.min_int) (8 * (7 - i))) 0xFFL))) in
+      let source_id i = Int64.of_int (80 + (((5 * i) + 2) mod 7)) and target_id i = Int64.of_int (400 + partitions - 1 - i) in
+      let named ids = List.init partitions (fun i : Info.partition -> { name = Printf.sprintf "p%d" i; id = ids i }) in
+      let layout listed : Info.layout = match listed with first :: rest -> Partitioned (first, rest) | [] -> Whole in
+      let indexes l g : Info.index list = [ { name = "l"; id = l; state = Public; scope = Local }; { name = "g"; id = g; state = Public; scope = Global naming } ] in
+      let source = { (info ~id:75L ~ids:(fun column -> column.source) ~origins:(fun _ -> Unset) case.columns) with indexes = indexes 2L 3L; layout = layout (named source_id) }
+      and target =
+        { (info ~id:300L ~ids:(fun column -> column.target) ~origins:(fun _ -> Unset) case.columns) with indexes = indexes 5L 7L; layout = layout (List.rev (named target_id)) }
+      in
+      match Renumber.make ~source ~target with
+      | Error _ -> false
+      | Ok plan ->
+          let index table id = fst (Codec.table table) ^ "_i" ^ held id in
+          let key_moved =
+            List.for_all
+              (fun entry ->
+                match entry with
+                | Global_entry { values; named } ->
+                    let tail ids = Option.fold ~none:"" ~some:(fun (i, handle) -> "\x7e" ^ held (ids i) ^ "\x03" ^ handle) named in
+                    Renumber.key plan (index 75L 3L ^ String.concat "" values ^ tail source_id)
+                    = Ok (Some (index 300L 7L ^ String.concat "" values ^ tail target_id))
+                | Global_unknown -> Result.is_error (Renumber.key plan (index 75L 3L ^ "\x03" ^ held 1L ^ "\x7e" ^ held 999L ^ "\x03" ^ held 1L))
+                | Global_under i -> Renumber.key plan (index (source_id i) 3L ^ "\x03" ^ held 1L) = Ok None
+                | Local_under_own -> Renumber.key plan (index 75L 2L ^ "\x03" ^ held 1L) = Ok None
+                | Local_under i -> Renumber.key plan (index (source_id i) 2L ^ "\x03" ^ held 1L) = Ok (Some (index (target_id i) 5L ^ "\x03" ^ held 1L))
+                | Row_under_own -> Renumber.key plan (fst (Codec.records 75L) ^ held 1L) = Ok None)
+              entries
+          in
+          let moved_case = { case with columns = List.map (fun column -> { column with source = column.target }) case.columns } in
+          let value_moved =
+            List.for_all
+              (fun (named, (value : index_value)) ->
+                let bytes = index_value case { value with partition = Option.map (fun i -> held (source_id i)) named } in
+                match (Renumber.value plan ~key:(index 75L 3L ^ "\x03" ^ held 1L) bytes, named) with
+                | Ok moved, Some i -> moved = index_value moved_case { value with partition = Some (held (target_id i)) }
+                | Error _, None -> true
+                | Ok _, None | Error _, Some _ -> false)
+              values
+            && Result.is_error (Renumber.value plan ~key:(index 75L 3L) (index_value case { (snd (List.hd values)) with partition = Some (held 999L) }))
+          in
+          let odd tail = Renumber.key plan (index 75L 3L ^ "\x03" ^ held 1L ^ "\x7e" ^ held (source_id 0) ^ tail) in
+          let refused =
+            match naming with
+            | In_keys_too -> List.for_all (fun tail -> Result.is_error (odd tail)) [ "\x04" ^ held 1L; "\x03" ^ held 1L ^ "\x00"; "\x03" ]
+            | In_values -> true
+          in
+          key_moved && value_moved && refused
+          && Renumber.tables plan = List.sort compare ((75L, 300L) :: List.init partitions (fun i -> (source_id i, target_id i))))
 
 let uvarint n =
   let buffer = Buffer.create 10 in
@@ -425,8 +534,12 @@ let refusals () =
     (shown { a with layout = partitioned [ "p"; "q" ] } { a with layout = partitioned [ "p"; "r" ] });
   Alcotest.(check string) "partitioned against not" "(Partitions_differ(source(p))(target()))" (shown { a with layout = partitioned [ "p" ] } a);
   Alcotest.(check string) "partitions being rearranged" "Rearranging" (shown a { a with layout = Rearranging });
-  Alcotest.(check string) "a global index" "(Global_index k)"
-    (shown { a with indexes = [ { name = "k"; id = 1L; state = Public; scope = Global } ] } a);
+  let global naming = { a with indexes = [ { name = "k"; id = 1L; state = Public; scope = Global naming } ]; layout = partitioned [ "p" ] } in
+  Alcotest.(check string) "a global index" "made" (shown (global In_keys_too) (global In_keys_too));
+  Alcotest.(check string) "a global index of a table without partitions" "(Global_index k)"
+    (shown { (global In_values) with layout = Whole } { (global In_values) with layout = Whole });
+  Alcotest.(check string) "a global index naming partitions in its keys in one table only" "(Global_index k)" (shown (global In_values) (global In_keys_too));
+  Alcotest.(check string) "a global index against a local one" "(Global_index k)" (shown (global In_values) { a with layout = partitioned [ "p" ] });
   Alcotest.(check string) "another handle" "(Handles_differ(source Row_number)(target Integer_key))" (shown a { a with handle = Integer_key });
   Alcotest.(check string) "a column being added" "(Changing b)" (shown { a with columns = [ column "a" 1; { (column "b" 2) with state = Changing } ] } a);
   Alcotest.(check string) "an index being built" "(Changing k)" (shown a { a with indexes = [ { name = "k"; id = 2L; state = Changing; scope = Local } ] });
@@ -610,5 +723,6 @@ let tests =
     QCheck_alcotest.to_alcotest first_format;
     QCheck_alcotest.to_alcotest indexes;
     QCheck_alcotest.to_alcotest keys;
+    QCheck_alcotest.to_alcotest globals;
     Alcotest.test_case "refusals" `Quick refusals;
   ]

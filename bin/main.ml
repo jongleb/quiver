@@ -779,7 +779,8 @@ let () =
           | `Renumber (Quiver_tikv.Renumber.Changing _ | Rearranging) ->
               Format.eprintf "hint: the table's schema or partitions are being changed; copy it once the change is done@."
           | `Renumber (Quiver_tikv.Renumber.Global_index _) ->
-              Format.eprintf "hint: a global index names partitions in its values, which mirror does not move; quiver copy copies the table through SQL@."
+              Format.eprintf
+                "hint: the copy's global index would keep its entries otherwise than the source's (the partition in its keys or not, as TiDB versions differ); quiver copy copies the table through SQL@."
           | `Transport (Quiver_mysql.Transport.Io _ | Tls _) ->
               Format.eprintf
                 "hint: if PD or a TiKV store ended the connection, the cluster may have TLS between its \

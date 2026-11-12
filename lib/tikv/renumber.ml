@@ -21,15 +21,21 @@ type need =
       (** The column's default then, in a row of either format; [None] when this does not write it in the first. *)
   | Unfilled of { source : int; name : string }  (** A default this does not write. *)
 
+(** What keys under an id of the source are of. *)
+type holder =
+  | Physical  (** The table's or a partition's: rows and local indexes. *)
+  | Logical  (** A partitioned table's own: its global indexes. *)
+
 type t = {
-  tables : (int64 * int64) iarray;  (** Each source id as its keys hold it, by that, with the copy's. *)
-  indexes : (int64 * int64) list;
+  tables : (int64 * int64 * holder) iarray;  (** Each source id as its keys hold it, by that, with the copy's. *)
+  partitions : (int64 * int64) iarray;  (** Each source partition's id as keys and values hold it, by that, with the copy's so held. *)
+  indexes : (int64 * int64 * Info.scope) list;
   columns : columns;
   needed : need list;
   ranks : (int * int) list;  (** Each column id of the copy with its place among the copy's columns. *)
 }
 
-let tables t = List.map (fun (held, into) -> (Int64.logxor held Int64.min_int, into)) (Iarray.to_list t.tables)
+let tables t = List.map (fun (held, into, _) -> (Int64.logxor held Int64.min_int, into)) (Iarray.to_list t.tables)
 
 let make ~(source : Info.t) ~(target : Info.t) =
   let changing =
@@ -46,7 +52,15 @@ let make ~(source : Info.t) ~(target : Info.t) =
   in
   let names table = List.map (fun (partition : Info.partition) -> partition.name) (partitions table) in
   let global =
-    List.find_map (fun (index : Info.index) -> match index.scope with Global -> Some index.name | Local -> None) (source.indexes @ target.indexes)
+    List.find_map
+      (fun (index : Info.index) ->
+        match (source.layout, index.scope) with
+        | Whole, Global _ -> Some index.name
+        | _, scope ->
+            Option.bind
+              (List.find_opt (fun (other : Info.index) -> other.name = index.name) target.indexes)
+              (fun (other : Info.index) -> if other.scope = scope then None else Some index.name))
+      source.indexes
   in
   match (changing, global) with
   | Some name, _ -> Error (`Renumber (Changing name))
@@ -88,17 +102,29 @@ let make ~(source : Info.t) ~(target : Info.t) =
       let indexes =
         List.filter_map
           (fun (index : Info.index) ->
-            Option.map (fun (other : Info.index) -> (index.id, other.id)) (List.find_opt (fun (other : Info.index) -> other.name = index.name) target.indexes))
+            Option.map
+              (fun (other : Info.index) -> (index.id, other.id, index.scope))
+              (List.find_opt (fun (other : Info.index) -> other.name = index.name) target.indexes))
           source.indexes
       in
+      let held id = Int64.logxor id Int64.min_int in
+      let paired = List.map2 (fun (from : Info.partition) (into : Info.partition) -> (from.id, into.id)) (partitions source) (partitions target) in
       let tables =
-        match partitions source with
-        | [] -> [ (source.id, target.id) ]
-        | own -> List.map2 (fun (from : Info.partition) (into : Info.partition) -> (from.id, into.id)) own (partitions target)
+        match paired with
+        | [] -> [ (source.id, target.id, Physical) ]
+        | _ :: _ ->
+            List.map (fun (from, into) -> (from, into, Physical)) paired
+            @ if List.exists (fun (_, _, scope) -> scope <> Info.Local) indexes then [ (source.id, target.id, Logical) ] else []
       in
-      let held = List.map (fun (source, into) -> (Int64.logxor source Int64.min_int, into)) tables in
-      let ranks = List.mapi (fun rank (column : Info.column) -> (column.id, rank)) target.columns in
-      Ok { tables = Iarray.of_list (List.sort (fun (a, _) (b, _) -> Int64.compare a b) held); indexes; columns = moved; needed; ranks }
+      Ok
+        {
+          tables = Iarray.of_list (List.sort (fun (a, _, _) (b, _, _) -> Int64.compare a b) (List.map (fun (from, into, holder) -> (held from, into, holder)) tables));
+          partitions = Iarray.of_list (List.sort (fun (a, _) (b, _) -> Int64.compare a b) (List.map (fun (from, into) -> (held from, held into)) paired));
+          indexes;
+          columns = moved;
+          needed;
+          ranks = List.mapi (fun rank (column : Info.column) -> (column.id, rank)) target.columns;
+        }
 
 (** What a key of the table is of. *)
 type kind = Row | Index | Other
@@ -107,37 +133,67 @@ let kind key =
   let length = String.length key in
   if length >= 19 && key.[9] = '_' && key.[10] = 'i' then Index else if length >= 11 && key.[9] = '_' && key.[10] = 'r' then Row else Other
 
+let malformed value = Error (`Renumber (Malformed (Hex_encode.to_hex value)))
+
+let partition t held =
+  let rec search low high =
+    if low >= high then None
+    else
+      let middle = (low + high) / 2 in
+      let from, into = Iarray.get t.partitions middle in
+      match Int64.compare from held with 0 -> Some into | n when n < 0 -> search (middle + 1) high | _ -> search low middle
+  in
+  search 0 (Iarray.length t.partitions)
+
 let key t key =
   let rec search tables key low high =
     if low >= high then -1
     else
       let middle = (low + high) / 2 in
-      match Int64.compare (fst (Iarray.get tables middle)) (String.get_int64_be key 1) with
+      let held, _, _ = Iarray.get tables middle in
+      match Int64.compare held (String.get_int64_be key 1) with
       | 0 -> middle
       | n when n < 0 -> search tables key (middle + 1) high
       | _ -> search tables key low middle
   in
   let found = if String.length key < 9 then -1 else search t.tables key 0 (Iarray.length t.tables) in
-  if found < 0 then None
+  if found < 0 then Ok None
   else
-    let into = snd (Iarray.get t.tables found) in
-    match kind key with
-    | Index ->
+    let _, into, holder = Iarray.get t.tables found in
+    match (kind key, holder) with
+    | Index, _ -> (
         let id = Int64.logxor (String.get_int64_be key 11) Int64.min_int in
-        Option.map
-          (fun target ->
-            let bytes = Bytes.of_string key in
-            Bytes.set_int64_be bytes 1 (Int64.logxor into Int64.min_int);
-            Bytes.set_int64_be bytes 11 (Int64.logxor target Int64.min_int);
-            Bytes.unsafe_to_string bytes)
-          (List.find_map (fun (source, target) -> if Int64.equal source id then Some target else None) t.indexes)
-    | Row | Other -> Some (Codec.retabled ~into key)
+        let moved target =
+          let bytes = Bytes.of_string key in
+          Bytes.set_int64_be bytes 1 (Int64.logxor into Int64.min_int);
+          Bytes.set_int64_be bytes 11 (Int64.logxor target Int64.min_int);
+          bytes
+        in
+        match (List.find_opt (fun (source, _, _) -> Int64.equal source id) t.indexes, holder) with
+        | Some (_, target, Local), Physical | Some (_, target, Global In_values), Logical -> Ok (Some (Bytes.unsafe_to_string (moved target)))
+        | Some (_, target, Global In_keys_too), Logical ->
+            let length = String.length key in
+            let rec named pos =
+              if pos = length then Ok (Bytes.unsafe_to_string (moved target))
+              else if key.[pos] = '\x7e' then
+                if pos + 18 = length && key.[pos + 9] = '\x03' then
+                  Option.fold ~none:(malformed key)
+                    ~some:(fun into ->
+                      let bytes = moved target in
+                      Bytes.set_int64_be bytes (pos + 1) into;
+                      Ok (Bytes.unsafe_to_string bytes))
+                    (partition t (String.get_int64_be key (pos + 1)))
+                else malformed key
+              else Option.fold ~none:(malformed key) ~some:(fun size -> named (pos + size)) (Datum.length key pos)
+            in
+            Result.map Option.some (named 19)
+        | (None | Some (_, _, Global _)), Physical | (None | Some (_, _, Local)), Logical -> Ok None)
+    | (Row | Other), Physical -> Ok (Some (Codec.retabled ~into key))
+    | (Row | Other), Logical -> Ok None
 
 (** A row of TiDB's second format: how wide an id is, how many columns hold a value and how many
     are NULL, where its end offsets and its data start. *)
 type row = { width : int; not_null : int; null : int; offsets : int; data : int }
-
-let malformed value = Error (`Renumber (Malformed (Hex_encode.to_hex value)))
 
 let id value row i = if row.width = 1 then Char.code value.[6 + i] else Int32.to_int (String.get_int32_le value (6 + (4 * i))) land 0xFFFF_FFFF
 
@@ -208,24 +264,38 @@ let value t ~key value =
     in
     search 0 row.not_null || search row.not_null (row.not_null + row.null)
   in
-  let restored map value =
+  let entry scope columns value =
     let length = String.length value in
-    if length <= 9 then Ok value
+    if length <= 9 then match scope with Info.Local -> Ok value | Global _ -> malformed value
     else
       let tail = Char.code value.[0] in
       let layout, first = if tail <= 1 && value.[1] = '\x7d' then (`Version_one, 3) else (`Version_zero, 1) in
       let past = length - tail in
-      let rec options pos =
-        if pos >= past then pos
+      let rec options pos named =
+        if pos >= past then (pos, named)
         else
           match value.[pos] with
-          | '\x7f' when pos + 3 <= past -> options (pos + 3 + String.get_uint16_be value (pos + 1))
-          | '\x7e' -> options (pos + 9)
-          | _ -> pos
+          | '\x7f' when pos + 3 <= past -> options (pos + 3 + String.get_uint16_be value (pos + 1)) named
+          | '\x7e' -> options (pos + 9) (Some pos)
+          | _ -> (pos, named)
       in
-      let start = options first in
-      if start >= past || value.[start] <> '\x80' then Ok value
-      else
+      let start, named = options first None in
+      let%bind value =
+        match (scope, named) with
+        | Local, _ -> Ok value
+        | Global _, Some pos when pos + 9 <= past ->
+            Option.fold ~none:(malformed value)
+              ~some:(fun into ->
+                let bytes = Bytes.of_string value in
+                Bytes.set_int64_be bytes (pos + 1) into;
+                Ok (Bytes.unsafe_to_string bytes))
+              (partition t (String.get_int64_be value (pos + 1)))
+        | Global _, _ -> malformed value
+      in
+      match columns with
+      | Kept -> Ok value
+      | Moved _ when start >= past || value.[start] <> '\x80' -> Ok value
+      | Moved map ->
         let data = String.sub value start (past - start) in
         let%bind row = row data in
         let%bind moved = rewritten (moved map) data row [] in
@@ -277,5 +347,9 @@ let value t ~key value =
   match (kind key, t.columns) with
   | Row, Kept -> ( match t.needed with [] -> Ok value | _ :: _ -> format Option.some)
   | Row, Moved map -> format (moved map)
-  | Index, Moved map -> restored map value
-  | Index, Kept | Other, _ -> Ok value
+  | Index, columns ->
+      let id = Int64.logxor (String.get_int64_be key 11) Int64.min_int in
+      entry
+        (Option.fold ~none:Info.Local ~some:(fun (_, _, scope) -> scope) (List.find_opt (fun (source, _, _) -> Int64.equal source id) t.indexes))
+        columns value
+  | Other, _ -> Ok value

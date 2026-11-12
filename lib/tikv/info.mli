@@ -53,10 +53,16 @@ type kind =
 type column = { name : string; id : int; state : state; missing : missing; kind : kind } [@@deriving sexp_of ~portable]
 (** By its name in lower case; a virtual column, never stored, is [Unset]. *)
 
+(** Where a global index names the partition of an entry: TiDB's [global_index_version]. *)
+type naming =
+  | In_values  (** In its values only: version 0. *)
+  | In_keys_too  (** Also in its keys, between the indexed values and the handle, when they have one: version 1. *)
+[@@deriving sexp_of ~portable]
+
 (** Which keys an index of a partitioned table is under. *)
 type scope =
   | Local  (** Each partition's, under its id. *)
-  | Global  (** One over every partition, under the table's id. *)
+  | Global of naming  (** One over every partition, under the table's id. *)
 [@@deriving sexp_of ~portable]
 
 type index = { name : string; id : int64; state : state; scope : scope } [@@deriving sexp_of ~portable]

@@ -175,6 +175,7 @@ let range ~source ~target ~version ~commit_ts ~sizes ~plan (into, { start; stop 
       Read.range read ~version ~start ~stop:(Before stop) ~limit:sizes.scan ~f:(fun pairs ->
           let%bind () =
             Base.List.fold_result pairs ~init:() ~f:(fun () (pair : Kv.pair) ->
+                let%bind moved = Renumber.key plan pair.key in
                 Option.fold ~none:(Ok ())
                   ~some:(fun key ->
                     let%bind value = Renumber.value plan ~key:pair.key pair.value in
@@ -187,7 +188,7 @@ let range ~source ~target ~version ~commit_ts ~sizes ~plan (into, { start; stop 
                     incr keys;
                     bytes := !bytes + cost;
                     Ok ())
-                  (Renumber.key plan pair.key))
+                  moved)
           in
           if !size >= sizes.job then flush () else Ok ())
     in
@@ -308,7 +309,7 @@ let table ~(from : reached) ~(into : reached) ~plan ~version ~commit_ts { timeou
                let first, past = Codec.table into in
                [ first; past ])
              tables
-          @ List.filter_map (fun (_, (part : range)) -> Renumber.key plan part.start) divided)
+          @ List.filter_map (fun (_, (part : range)) -> Option.join (Result.to_option (Renumber.key plan part.start))) divided)
       in
       let rec go keys tries made =
         let%bind held =

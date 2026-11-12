@@ -27,7 +27,8 @@ type kind =
 [@@deriving sexp_of ~portable]
 
 type column = { name : string; id : int; state : state; missing : missing; kind : kind } [@@deriving sexp_of ~portable]
-type scope = Local | Global [@@deriving sexp_of ~portable]
+type naming = In_values | In_keys_too [@@deriving sexp_of ~portable]
+type scope = Local | Global of naming [@@deriving sexp_of ~portable]
 type index = { name : string; id : int64; state : state; scope : scope } [@@deriving sexp_of ~portable]
 type partition = { name : string; id : int64 } [@@deriving sexp_of ~portable]
 type layout = Whole | Partitioned of partition * partition list | Rearranging [@@deriving sexp_of ~portable]
@@ -158,10 +159,12 @@ let of_json text =
     listed "index_info" (fun item ->
         let%bind state = state "index_info" item in
         let%bind scope =
-          match List.assoc_opt "is_global" item with
-          | Some (`Bool true) -> Ok Global
-          | Some (`Bool false) | None -> Ok Local
-          | Some _ -> malformed "index_info: is_global that is not true or false"
+          match (List.assoc_opt "is_global" item, List.assoc_opt "global_index_version" item) with
+          | Some (`Bool true), (None | Some (`Int 0)) -> Ok (Global In_values)
+          | Some (`Bool true), Some (`Int 1) -> Ok (Global In_keys_too)
+          | Some (`Bool true), Some _ -> malformed "index_info: a global_index_version this does not know"
+          | (Some (`Bool false) | None), _ -> Ok Local
+          | Some _, _ -> malformed "index_info: is_global that is not true or false"
         in
         match (lower "idx_name" item, List.assoc_opt "id" item) with
         | Some name, Some (`Int id) -> Ok { name; id = Int64.of_int id; state; scope }

@@ -62,8 +62,12 @@ let tables () =
   same "a table being exchanged" "Rearranging" (partitioned ~table:{|"exchange_partition_info":{"exchange_partition_id":92},|} "null");
   same "no definitions" {|(Malformed"partition: no definitions")|} (partitioned {|{"enable":true,"definitions":[]}|});
   same "a definition without its id" {|(Malformed"partition: a definition without its name or id")|} (partitioned {|{"enable":true,"definitions":[{"name":{"L":"p"}}]}|});
-  check "a global index" "((id 1)(columns())(indexes(((name g)(id 3)(state Public)(scope Global))))(handle Row_number)(layout Whole))"
+  check "a global index" "((id 1)(columns())(indexes(((name g)(id 3)(state Public)(scope(Global In_values)))))(handle Row_number)(layout Whole))"
     {|{"id":1,"cols":[],"index_info":[{"id":3,"idx_name":{"L":"g"},"state":5,"is_global":true}]}|};
+  check "a global index naming partitions in its keys" "((id 1)(columns())(indexes(((name g)(id 3)(state Public)(scope(Global In_keys_too)))))(handle Row_number)(layout Whole))"
+    {|{"id":1,"cols":[],"index_info":[{"id":3,"idx_name":{"L":"g"},"state":5,"is_global":true,"global_index_version":1}]}|};
+  check "a global index of a version this does not know" "(Malformed\"index_info: a global_index_version this does not know\")"
+    {|{"id":1,"cols":[],"index_info":[{"id":3,"idx_name":{"L":"g"},"state":5,"is_global":true,"global_index_version":2}]}|};
   Alcotest.(check string) "not JSON" "malformed" (match Info.of_json "{" with Error (`Info (Malformed _)) -> "malformed" | Ok _ -> "read")
 
 let kinds () =

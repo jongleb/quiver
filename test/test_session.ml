@@ -319,8 +319,9 @@ let scenario =
 let print scenario = Sexplib0.Sexp.to_string_hum (sexp_of_scenario scenario)
 
 (** Passes connections on to [target] byte for byte, reading frames from the
-    connecting side, and breaks data connections as [cuts] say. Its socket is
-    never closed: a thread may still accept on it. *)
+    connecting side, and breaks data connections as [cuts] say; a side that fails
+    ends the other, as a path would. Its socket is never closed: a thread may still
+    accept on it. *)
 let breaking ~target ~control cuts =
   let listening = Unix.socket PF_INET SOCK_STREAM 0 in
   Unix.setsockopt listening SO_REUSEADDR true;
@@ -387,7 +388,7 @@ let breaking ~target ~control cuts =
               ignore (Unix.write into payload 0 length);
               go (frames + 1))
     in
-    (try go 0 with Unix.Unix_error _ -> ())
+    try go 0 with Unix.Unix_error _ -> ( try Unix.shutdown into SHUTDOWN_SEND with Unix.Unix_error _ -> ())
   and copy ~from ~into ~reset ~deaf cut =
     let buffer = Bytes.create 65536 in
     let rec go () =
@@ -401,7 +402,7 @@ let breaking ~target ~control cuts =
           ignore (Unix.write into buffer 0 count);
           go ()
     in
-    try go () with Unix.Unix_error _ -> ()
+    try go () with Unix.Unix_error _ -> ( try Unix.shutdown into SHUTDOWN_SEND with Unix.Unix_error _ -> ())
   in
   Support.spawn (fun () ->
       let rec accept accepted =

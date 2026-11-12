@@ -2,7 +2,7 @@
 
 (** A region of TiKV: the keys it holds and where its leader and replicas are. *)
 
-type replica = { peer : Kv.peer; address : string  (** [host:port] of the peer's store. *) }
+type replica = { peer : Kv.peer; address : string  (** [host:port] of the peer's store, its proxy's for TiFlash. *) }
 [@@deriving sexp_of ~portable]
 
 type t = {

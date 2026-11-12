@@ -28,16 +28,17 @@ let stores =
   message (fun buffer ->
       Proto.bytes buffer 1 (header 42L);
       List.iter
-        (fun (id, address, labels) ->
+        (fun (id, address, peer_address, labels) ->
           Proto.bytes buffer 2
             (message (fun buffer ->
                  Proto.uint buffer 1 id;
                  Proto.bytes buffer 2 address;
-                 List.iter (fun (key, value) -> Proto.bytes buffer 4 (message (fun buffer -> Proto.bytes buffer 1 key; Proto.bytes buffer 2 value))) labels)))
+                 List.iter (fun (key, value) -> Proto.bytes buffer 4 (message (fun buffer -> Proto.bytes buffer 1 key; Proto.bytes buffer 2 value))) labels;
+                 Option.iter (Proto.bytes buffer 6) peer_address)))
         [
-          (1L, "tikv-1:20160", []);
-          (3L, "tiflash-3:3930", [ ("zone", "z1"); ("engine", "tiflash") ]);
-          (2L, "tikv-2:20160", [ ("zone", "tiflash"); ("tiflash", "z1"); ("engine", "tikv") ]);
+          (1L, "tikv-1:20160", None, []);
+          (3L, "tiflash-3:3930", Some "tiflash-3:20170", [ ("zone", "z1"); ("engine", "tiflash") ]);
+          (2L, "tikv-2:20160", Some "", [ ("zone", "tiflash"); ("tiflash", "z1"); ("engine", "tikv") ]);
         ])
 
 (* A region as PD describes it: raw bounds, its epoch, peers by id and store, the leader's peer id. *)
@@ -97,7 +98,7 @@ let run ~start ~stop pages =
 let expected regions : Region.t list =
   List.map
     (fun region ->
-      let address store = Printf.sprintf "tikv-%Ld:20160" store in
+      let address store = if store = 3L then "tiflash-3:20170" else Printf.sprintf "tikv-%Ld:20160" store in
       let leader = Option.get region.leader in
       let store = List.assoc leader region.peers in
       {
@@ -120,7 +121,8 @@ let show = function
 let key = QCheck2.Gen.(string_size ~gen:(oneof_list [ 'a'; 'b'; '\x00'; '\xff' ]) (int_range 1 10))
 
 let pages =
-  QCheck2.Test.make ~count:150 ~name:"regions of a range come whole from PD's pages, in order, each asked from where the last ended"
+  QCheck2.Test.make ~count:150
+    ~name:"regions of a range come whole from PD's pages, in order, each asked from where the last ended, a TiFlash learner at its proxy's peer address"
     ~print:(fun (bounds, sizes, stop) -> Base.Sexp.to_string ([%sexp_of: string list * int list * string option] (bounds, sizes, stop)))
     QCheck2.Gen.(
       triple
@@ -133,7 +135,7 @@ let pages =
         List.mapi
           (fun i first ->
             let id = Int64.of_int (i + 1) in
-            let peers = [ (Int64.mul id 10L, 2L); (Int64.add (Int64.mul id 10L) 1L, 1L) ] in
+            let peers = [ (Int64.mul id 10L, 2L); (Int64.add (Int64.mul id 10L) 1L, 1L); (Int64.add (Int64.mul id 10L) 2L, 3L) ] in
             { id; first; past = Option.value ~default:"" (List.nth_opt bounds i); peers; leader = Some (Int64.add (Int64.mul id 10L) 1L) })
           firsts
       in

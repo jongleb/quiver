@@ -684,7 +684,7 @@ let () =
                  | Quiver_load.Load.cause ]]
                  error))
   in
-  let mirror (conn : Quiver_mysql.Provider.conn_config) security other database into tables workers stores regions placement statistics =
+  let mirror (conn : Quiver_mysql.Provider.conn_config) security other database into tables workers stores regions placement tiflash statistics =
     let open Base.Result.Let_syntax in
     let connect (conn : Quiver_mysql.Provider.conn_config) =
       Quiver_mysql.Link.connect ~local_data:Without_local_data conn.route ~timeouts:conn.timeouts ~user:conn.user
@@ -737,6 +737,7 @@ let () =
                 stores;
                 regions;
                 placement;
+                tiflash;
               }
           in
           Format.printf "%d tables as of the source's TSO %Ld, each checksum equal to TiDB's, in %a@."
@@ -792,6 +793,9 @@ let () =
           | `Mirror (Quiver_tikv.Mirror.Unknown_policies _) ->
               Format.eprintf
                 "hint: create those placement policies in the target cluster, or copy with --placement default to place the copy as the target places any table@."
+          | `Mirror (Quiver_tikv.Mirror.Too_few_tiflash _) ->
+              Format.eprintf
+                "hint: the target cluster cannot hold as many TiFlash replicas as the source's table has: add TiFlash stores to it, or copy with --tiflash-replicas drop and set them later with ALTER TABLE … SET TIFLASH REPLICA@."
           | `Mirror (Quiver_tikv.Mirror.Taken _) ->
               Format.eprintf "hint: those names are taken in the target by tables, views or sequences (or by two copies): drop or rename them, or copy into another database with --to-database@."
           | `Http1 _ ->
@@ -1691,6 +1695,13 @@ let () =
                table and its partitions, and refuses before making anything when the target lacks \
                one; $(b,default) leaves them out, the copy placed as the target places any table. \
                Within one cluster the copy always keeps them.")
+    and tiflash =
+      Arg.(
+        value
+        & opt (enum [ ("keep", Quiver_tikv.Mirror.Kept_tiflash); ("drop", Dropped_tiflash) ]) Quiver_tikv.Mirror.Kept_tiflash
+        & described [ "tiflash-replicas" ] ~docv:"MODE"
+            ~doc:
+              "$(b,keep) gives each copy as many TiFlash replicas as its table has, by the same                location labels, set before its keys are written, so TiFlash takes them as TiKV does;                into another cluster it refuses before making anything when the target has fewer                TiFlash stores than a table has replicas. TiDB reads a replica only once it caught up.                $(b,drop) makes the copies without TiFlash replicas.")
     and statistics =
       Arg.(
         value
@@ -1759,7 +1770,7 @@ let () =
             checksum. Into another cluster the two must agree on new collations, and the copy is \
             made by the source's definition; where its columns and indexes have other ids, as \
             after the source's ALTERs, keys and rows are written under the copy's")
-      Term.(const mirror $ server `Source $ term_result (cluster `Source) $ target $ database $ into $ tables $ workers $ stores $ regions $ placement $ statistics)
+      Term.(const mirror $ server `Source $ term_result (cluster `Source) $ target $ database $ into $ tables $ workers $ stores $ regions $ placement $ tiflash $ statistics)
   in
   let copy_cmd =
     let open Cmdliner in

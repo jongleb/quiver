@@ -2,7 +2,7 @@ open Sexplib0.Sexp_conv
 open Quiver_tikv
 
 (* Where the model TiDB refuses. *)
-type failing = Never | At_create | At_described | At_keys | At_checksum | At_rebase | At_rename [@@deriving sexp_of]
+type failing = Never | At_create | At_tiflash | At_described | At_keys | At_checksum | At_rebase | At_rename [@@deriving sexp_of]
 
 (* What TiDB's checksum of the copy says against what was copied. *)
 type sums = Same | Fewer_keys | Other_crc [@@deriving sexp_of]
@@ -20,6 +20,7 @@ type other = {
   definition : agreement;
   policies : (string * presence) list;
   placement : Mirror.placement;
+  tiflash_stores : int;
 }
 [@@deriving sexp_of]
 
@@ -42,6 +43,8 @@ type case = {
   failing : failing;
   holding : holding;
   taken : taken;
+  replicas : (int * string list) list;  (* Each table's TiFlash replicas and their location labels. *)
+  tiflash : Mirror.tiflash;
 }
 [@@deriving sexp_of]
 
@@ -56,8 +59,9 @@ let gen =
            let* policies =
              list_size (int_range 0 3)
                (pair (oneof_list [ "p1"; "p 2"; "p`q" ]) (oneof_weighted [ (3, return Present); (1, return Present_otherwise_cased); (1, return Absent) ]))
-           and* placement = oneof_list [ Mirror.Kept_placement; Default_placement ] in
-           return (There { collations; ids; definition; policies; placement }));
+           and* placement = oneof_list [ Mirror.Kept_placement; Default_placement ]
+           and* tiflash_stores = int_range 0 3 in
+           return (There { collations; ids; definition; policies; placement; tiflash_stores }));
         ]
     and* tables = int_range 1 3
     and* changing = oneof_weighted [ (6, return Agree); (1, return Differ) ]
@@ -70,13 +74,18 @@ let gen =
     and* sums = oneof_weighted [ (4, return Same); (1, return Fewer_keys); (1, return Other_crc) ]
     and* failing =
       oneof_weighted
-        [ (5, return Never); (1, return At_create); (1, return At_described); (1, return At_keys); (1, return At_checksum); (1, return At_rebase); (1, return At_rename) ]
+        [ (5, return Never); (1, return At_create); (1, return At_tiflash); (1, return At_described); (1, return At_keys); (1, return At_checksum); (1, return At_rebase); (1, return At_rename) ]
     and* holding = oneof_weighted [ (6, return Held); (1, return Passed_before); (1, return Lapsed) ] in
     let* at = int_range 0 (tables - 1)
     and* taken =
       oneof_weighted ((8, return Free) :: (1, return Taken) :: (1, return Taken_otherwise_cased) :: (if tables > 1 then [ (1, return Repeated) ] else []))
-    in
-    return { place; tables; at; changing; partitions; allocators; sums; failing; holding; taken })
+    and* replicas =
+      list_size (return tables)
+        (pair
+           (oneof_weighted [ (3, return 0); (2, int_range 1 3) ])
+           (map (List.sort_uniq String.compare) (list_size (int_range 0 2) (oneof_list [ "zone"; "rack"; "host" ]))))
+    and* tiflash = oneof_list [ Mirror.Kept_tiflash; Dropped_tiflash ] in
+    return { place; tables; at; changing; partitions; allocators; sums; failing; holding; taken; replicas; tiflash })
 
 let body = " (\n  `a` int COMMENT 'it''s \\\\ /*T![placement] PLACEMENT POLICY=`decoy` */'\n) ENGINE=InnoDB"
 
@@ -150,6 +159,18 @@ let run case =
                    ("unrelated"
                    :: (match case.taken with Taken -> [ named ] | Taken_otherwise_cased -> [ String.uppercase_ascii named ] | Free | Repeated -> [])))
           | Names _ -> Ok []
+          | Tiflash_replicas database when database = Support.ident "d" ->
+              Ok
+                ([| cell "unrelated"; cell "3"; cell "" |]
+                :: List.filter_map
+                     (fun i ->
+                       let count, labels = List.nth case.replicas i in
+                       let table = Printf.sprintf "src%d" i in
+                       if count = 0 then None
+                       else Some [| cell (if i mod 2 = 1 then String.uppercase_ascii table else table); cell (Int.to_string count); cell (String.concat "," labels) |])
+                     (numbered case))
+          | Tiflash_replicas _ -> Ok []
+          | Tiflash_stores -> Option.fold ~none:refused ~some:(fun there -> Ok [ [| cell (Int.to_string there.tiflash_stores) |] ]) there
           | Placement_policies ->
               Ok
                 (List.filter_map
@@ -171,6 +192,7 @@ let run case =
           let failing = service case.at in
           match (statement, case.failing) with
           | (Create_like { table; _ } | Create_table { table; _ }), At_create when table = failing -> refused
+          | Set_tiflash_replica { table; _ }, At_tiflash when table = failing -> refused
           | Rebase { table; _ }, At_rebase when table = failing -> refused
           | Rename_tables (first, rest), At_rename when List.exists (fun (renaming : Quiver_mysql.Statement.renaming) -> renaming.from = failing) (first :: rest) -> refused
           | _ -> Ok ());
@@ -203,6 +225,7 @@ let run case =
       target_side;
       cluster;
       placement = (match there with Some there -> there.placement | None -> Kept_placement);
+      tiflash = case.tiflash;
       name =
         (fun () ->
           let name = Printf.sprintf "q_model%d" !named in
@@ -240,6 +263,13 @@ let expected case =
     | There { placement = Kept_placement; policies; _ } -> Create_table { table = service i; body = body ^ clauses policies }
     | There { placement = Default_placement; _ } -> Create_table { table = service i; body }
   in
+  let after i : Quiver_mysql.Statement.t option =
+    match (List.nth case.replicas i, case.place, case.tiflash) with
+    | (0, _), _, _ | _, Here, Kept_tiflash | _, There _, Dropped_tiflash -> None
+    | _, Here, Dropped_tiflash -> Some (Set_tiflash_replica { table = service i; count = 0; labels = [] })
+    | (count, labels), There _, Kept_tiflash -> Some (Set_tiflash_replica { table = service i; count; labels })
+  in
+  let wanted = match (case.place, case.tiflash) with There _, Kept_tiflash -> List.fold_left (fun most (count, _) -> max most count) 0 case.replicas | _ -> 0 in
   let lacking =
     match case.place with
     | There { placement = Kept_placement; policies; _ } ->
@@ -264,11 +294,23 @@ let expected case =
   | There { collations = Differ; _ } -> (Error (`Mirror (Mirror.Collations_differ { source = "True"; target = "False" })), [], 0)
   | There { definition = Differ; _ } -> (Error (`Mirror (Mirror.Definition (source case.at))), [], 0)
   | There _ when lacking <> [] -> (Error (`Mirror (Mirror.Unknown_policies (List.hd lacking, List.tl lacking))), [], 0)
+  | There { tiflash_stores; _ } when wanted > tiflash_stores ->
+      (Error (`Mirror (Mirror.Too_few_tiflash { replicas = wanted; stores = tiflash_stores })), [], 0)
   | (Here | There _) when case.taken <> Free -> (Error (`Mirror (Mirror.Taken (target (repeated case case.at), []))), [], 0)
   | Here | There _ -> (
-      let made = ran (Create_database (Support.ident "e")) :: List.map (fun i -> ran (create i)) tables in
-      match List.find_opt (fun i -> at i At_create) tables with
-      | Some k -> (refused, List.filteri (fun j _ -> j <= k + 1) made @ drops k, 0)
+      let steps i = List.map ran (create i :: Option.to_list (after i)) in
+      let database = ran (Create_database (Support.ident "e")) in
+      let made = database :: List.concat_map steps tables in
+      let broken =
+        List.find_map
+          (fun i ->
+            if at i At_create then Some (i, [ ran (create i) ], i)
+            else if at i At_tiflash && Option.is_some (after i) then Some (i, steps i, i + 1)
+            else None)
+          tables
+      in
+      match broken with
+      | Some (k, last, upto) -> (refused, (database :: List.concat_map steps (List.filter (fun i -> i < k) tables)) @ last @ drops upto, 0)
       | None -> (
           let all = drops case.tables in
           let rec keys i =

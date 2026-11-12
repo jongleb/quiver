@@ -3,6 +3,17 @@ open Quiver_tikv
 
 let key = QCheck2.Gen.(string_size ~gen:(oneof_list [ 'a'; 'b'; '\x00'; '\xff' ]) (int_range 0 12))
 
+let rows_end =
+  QCheck2.Test.make ~count:2000 ~name:"a table's rows end where the next table starts, never at _s: a rowless region would stop TiFlash"
+    ~print:(fun (id, rest) -> Printf.sprintf "%Ld %S" id rest)
+    QCheck2.Gen.(
+      pair
+        (oneof [ map Int64.of_int (int_range (-300) 300); oneof_list [ Int64.max_int; Int64.min_int; 255L; 256L; 65535L; -1L ]; int64 ])
+        (string_size ~gen:char (int_range 0 12)))
+    (fun (id, rest) ->
+      let first, past = Codec.table id in
+      Codec.kind_end (first ^ "_r" ^ rest) = if Int64.equal id Int64.max_int then None else Some past)
+
 let codec_roundtrip =
   QCheck2.Test.make ~count:3000 ~name:"bytes decode back from their order-keeping form, whatever follows it"
     QCheck2.Gen.(pair key (string_size ~gen:char (int_range 0 10)))
@@ -29,7 +40,10 @@ let codec () =
     (Codec.kind_end (table ^ "_i\x80\x00\x00\x00\x00\x00\x00\x01\x03abc"));
   Alcotest.(check (option string)) "carrying past 0xff" (Some (table ^ "_i\x80\x00\x00\x00\x00\x00\x01"))
     (Codec.kind_end (table ^ "_i\x80\x00\x00\x00\x00\x00\x00\xff"));
-  Alcotest.(check (option string)) "the rows end before _s" (Some (table ^ "_s")) (Codec.kind_end (table ^ "_r\x80\x00\x00\x00\x00\x00\x00\x07"));
+  Alcotest.(check (option string)) "the rows end where the next table starts" (Some (snd (Codec.table 75L)))
+    (Codec.kind_end (table ^ "_r\x80\x00\x00\x00\x00\x00\x00\x07"));
+  Alcotest.(check (option string)) "the rows of table 255 end at table 256" (Some (snd (Codec.table 255L)))
+    (Codec.kind_end (fst (Codec.table 255L) ^ "_r\x80"));
   Alcotest.(check (option string)) "a key of no known kind" None (Codec.kind_end (table ^ "_x"));
   Alcotest.(check string) "an index key of table 75 as table 300's"
     "t\x80\x00\x00\x00\x00\x00\x01\x2c_i\x80\x00\x00\x00\x00\x00\x00\x01x"
@@ -521,7 +535,15 @@ let queries () =
     (Quiver_mysql.Statement.sql (Rebase { table = copy; allocator = Auto_random; next = 7L }));
   let other : Quiver_core.Schema.Name.t = { database = Support.ident "e"; table = Support.ident "q_2" } in
   Alcotest.(check string) "renamed together" "RENAME TABLE `d`.`q_1` TO `d`.`t'`, `e`.`q_2` TO `e`.`u`"
-    (Quiver_mysql.Statement.sql (Rename_tables ({ from = copy; into = name }, [ { from = other; into = { other with table = Support.ident "u" } } ])))
+    (Quiver_mysql.Statement.sql (Rename_tables ({ from = copy; into = name }, [ { from = other; into = { other with table = Support.ident "u" } } ])));
+  Alcotest.(check string) "TiFlash replicas by labels" "ALTER TABLE `d`.`q_1` SET TIFLASH REPLICA 2 LOCATION LABELS 'zone', 'it''s \\\\ odd'"
+    (Quiver_mysql.Statement.sql (Set_tiflash_replica { table = copy; count = 2; labels = [ "zone"; "it's \\ odd" ] }));
+  Alcotest.(check string) "no TiFlash replicas" "ALTER TABLE `d`.`q_1` SET TIFLASH REPLICA 0"
+    (Quiver_mysql.Statement.sql (Set_tiflash_replica { table = copy; count = 0; labels = [] }));
+  Alcotest.(check string) "TiFlash replicas of a database"
+    "SELECT TABLE_NAME, REPLICA_COUNT, LOCATION_LABELS FROM information_schema.TIFLASH_REPLICA WHERE TABLE_SCHEMA = _utf8mb4 X'64'"
+    (Quiver_mysql.Query.sql (Tiflash_replicas (Support.ident "d")));
+  Alcotest.(check string) "TiFlash stores" "SELECT COUNT(*) FROM information_schema.CLUSTER_INFO WHERE TYPE = 'tiflash'" (Quiver_mysql.Query.sql Tiflash_stores)
 
 let tests =
   [
@@ -532,4 +554,4 @@ let tests =
     Alcotest.test_case "the region of a key" `Quick regions;
     Alcotest.test_case "reads that give up" `Quick refusals;
   ]
-  @ List.map QCheck_alcotest.to_alcotest [ codec_roundtrip; codec_order; reads ]
+  @ List.map QCheck_alcotest.to_alcotest [ codec_roundtrip; codec_order; rows_end; reads ]

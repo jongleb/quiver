@@ -52,6 +52,8 @@ type t =
   | Rebase of { table : Quiver_core.Schema.Name.t; allocator : allocator; next : int64 }
       (** TiDB: the allocator hands out ids from [next] on. *)
   | Analyze_table of Quiver_core.Schema.Name.t  (** Its statistics gathered anew. *)
+  | Set_tiflash_replica of { table : Quiver_core.Schema.Name.t; count : int; labels : string list }
+      (** TiDB: the table's TiFlash replicas, none at 0, placed apart by these location labels. *)
   | Drop_indexes of { table : Quiver_core.Schema.Name.t; indexes : Quiver_core.Ident.t list }
   | Scatter_regions
       (** TiDB: regions the session splits are spread over the stores before the split returns. *)

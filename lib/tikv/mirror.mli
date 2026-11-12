@@ -26,6 +26,12 @@ type placement =
   | Default_placement  (** Without them, as the target places any table. *)
 [@@deriving sexp_of ~portable]
 
+(** What a copy has of the source's TiFlash replicas. *)
+type tiflash =
+  | Kept_tiflash  (** As many, by the same location labels; the target must have that many TiFlash stores. *)
+  | Dropped_tiflash  (** None. *)
+[@@deriving sexp_of ~portable]
+
 type settings = {
   timeout : Core.Time_ns.Span.t;  (** Of connecting to PD and the stores, and of their silence. *)
   sizes : sizes;
@@ -33,6 +39,7 @@ type settings = {
   stores : stores;
   regions : regions;
   placement : placement;
+  tiflash : tiflash;
 }
 
 type reached = {
@@ -61,6 +68,7 @@ type error =
   | Unknown_policies of string * string list  (** Placement policies of the source the target lacks, by name in any case. *)
   | Taken of Quiver_core.Schema.Name.t * Quiver_core.Schema.Name.t list
       (** Names of copies a table, view or sequence of the target has, or another copy, in any case. *)
+  | Too_few_tiflash of { replicas : int; stores : int }  (** A table's TiFlash replicas outnumber the target's TiFlash stores. *)
 [@@deriving sexp_of ~portable]
 
 (** Keys of the source from [start] up to [stop]. *)
@@ -146,6 +154,7 @@ type 'e session = {
   target_side : 'e side;
   cluster : unit cluster;
   placement : placement;  (** Of a copy into another cluster. *)
+  tiflash : tiflash;
   name : unit -> string;  (** A table name no table has, for the copy while it is made. *)
   keys : Renumber.t -> version:int64 -> commit_ts:int64 -> (copied, 'e) result;
       (** The plan's keys as of [version] into the copy at [commit_ts]. *)
@@ -187,9 +196,10 @@ val copy :
   result
 @@ nonportable
 (** The tables as of one version of the source, taken now, into new tables, in its cluster or
-    another: their definitions, the clusters' collations, placement policies and the copies' names checked before
+    another: their definitions, the clusters' collations, placement policies, TiFlash stores and the copies' names checked before
     anything is made; each made under a name of its own ([LIKE] it, or by its definition in the
-    other cluster), its keys copied by {!table} with the source's GC held at the version by
+    other cluster) with its TiFlash replicas set before any key is written (TiFlash takes keys only from
+    the files written to it), its keys copied by {!table} with the source's GC held at the version by
     {!Pd.held}, at a later version of the target's cluster under the copy's ids, as both tables are
     described at those versions; every copy checked against TiDB's checksum and its id allocators
     moved past the source's, then all renamed by one statement; on any failure, all dropped. *)

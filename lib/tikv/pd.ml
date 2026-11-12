@@ -78,11 +78,11 @@ let connect dial address =
           match field with
           | 2 ->
               let%bind store = Proto.slice field value in
-              let%bind id, address, engine =
-                fields listed store ~init:(0L, "", `Tikv) ~f:(fun (id, address, engine) field value ->
+              let%bind id, address, peer_address, engine =
+                fields listed store ~init:(0L, "", "", `Tikv) ~f:(fun (id, address, peer_address, engine) field value ->
                     match field with
-                    | 1 -> Result.map (fun id -> (id, address, engine)) (Proto.number field value)
-                    | 2 -> Result.map (fun address -> (id, address, engine)) (Proto.contents listed field value)
+                    | 1 -> Result.map (fun id -> (id, address, peer_address, engine)) (Proto.number field value)
+                    | 2 -> Result.map (fun address -> (id, address, peer_address, engine)) (Proto.contents listed field value)
                     | 4 ->
                         let%bind label = Proto.slice field value in
                         let%bind pair =
@@ -93,9 +93,11 @@ let connect dial address =
                               | _ -> Ok (key, text))
                         in
                         let engine = match pair with "engine", "tiflash" -> `Tiflash | _ -> engine in
-                        Ok (id, address, engine)
-                    | _ -> Ok (id, address, engine))
+                        Ok (id, address, peer_address, engine)
+                    | 6 -> Result.map (fun peer_address -> (id, address, peer_address, engine)) (Proto.contents listed field value)
+                    | _ -> Ok (id, address, peer_address, engine))
               in
+              let address = if peer_address = "" then address else peer_address in
               Ok ((id, address, engine) :: acc)
           | _ -> Ok acc)
     in

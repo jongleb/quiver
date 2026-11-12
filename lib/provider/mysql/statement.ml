@@ -31,6 +31,7 @@ type t =
   | Create_table of { table : Quiver_core.Schema.Name.t; body : string }
   | Rebase of { table : Quiver_core.Schema.Name.t; allocator : allocator; next : int64 }
   | Analyze_table of Quiver_core.Schema.Name.t
+  | Set_tiflash_replica of { table : Quiver_core.Schema.Name.t; count : int; labels : string list }
   | Drop_indexes of { table : Quiver_core.Schema.Name.t; indexes : Quiver_core.Ident.t list }
   | Scatter_regions
   | Split_table of { table : Quiver_core.Ident.t; at : Quiver_core.Key.t * Quiver_core.Key.t list }
@@ -98,6 +99,12 @@ let sql = function
       [%string {|RENAME TABLE %{String.concat ", " (List.map pair (first :: rest))}|}]
   | Drop_table name -> [%string "DROP TABLE IF EXISTS %{Query.qualified name}"]
   | Analyze_table name -> [%string "ANALYZE TABLE %{Query.qualified name}"]
+  | Set_tiflash_replica { table; count; labels } ->
+      let quoted label =
+        "'" ^ String.concat "''" (String.split_on_char '\'' (Base.String.substr_replace_all label ~pattern:"\\" ~with_:"\\\\")) ^ "'"
+      in
+      let placed = match labels with [] -> "" | labels -> " LOCATION LABELS " ^ String.concat ", " (List.map quoted labels) in
+      [%string "ALTER TABLE %{Query.qualified table} SET TIFLASH REPLICA %{count#Int}%{placed}"]
   | Create_database name -> [%string "CREATE DATABASE IF NOT EXISTS %{Quiver_core.Ident.backquoted name}"]
   | Create_like { table; like } -> [%string "CREATE TABLE %{Query.qualified table} LIKE %{Query.qualified like}"]
   | Create_table { table; body } -> [%string "CREATE TABLE %{Query.qualified table}%{body}"]

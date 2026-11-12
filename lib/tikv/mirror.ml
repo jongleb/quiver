@@ -4,6 +4,7 @@ type sizes = { scan : int; job : int; batch : int }
 type stores = Imported | Untouched
 type regions = Held | Scheduled
 type placement = Kept_placement | Default_placement [@@deriving sexp_of ~portable]
+type tiflash = Kept_tiflash | Dropped_tiflash [@@deriving sexp_of ~portable]
 
 type settings = {
   timeout : Core.Time_ns.Span.t;
@@ -12,6 +13,7 @@ type settings = {
   stores : stores;
   regions : regions;
   placement : placement;
+  tiflash : tiflash;
 }
 type reached = { link : Quiver_mysql.Link.t; security : Http2.security }
 type copied = { keys : int; bytes : int; checksum : int64 } [@@deriving sexp_of ~portable]
@@ -27,6 +29,7 @@ type error =
   | Undescribed of Quiver_core.Schema.Name.t
   | Unknown_policies of string * string list
   | Taken of Quiver_core.Schema.Name.t * Quiver_core.Schema.Name.t list
+  | Too_few_tiflash of { replicas : int; stores : int }
 [@@deriving sexp_of ~portable]
 
 type failure =
@@ -240,7 +243,8 @@ let described link (name : Quiver_core.Schema.Name.t) ~at ~dial =
   Pd.close pd;
   info
 
-let table ~(from : reached) ~(into : reached) ~plan ~version ~commit_ts { timeout; sizes; workers; stores = tuning; regions = scheduling; placement = _ } =
+let table ~(from : reached) ~(into : reached) ~plan ~version ~commit_ts
+    { timeout; sizes; workers; stores = tuning; regions = scheduling; placement = _; tiflash = _ } =
   let tables = Renumber.tables plan and read = Renumber.ranges plan in
   let source_dial : Http2.dial = { timeout; security = from.security }
   and target_dial : Http2.dial = { timeout; security = into.security } in
@@ -399,6 +403,7 @@ type 'e session = {
   target_side : 'e side;
   cluster : unit cluster;
   placement : placement;
+  tiflash : tiflash;
   name : unit -> string;
   keys : Renumber.t -> version:int64 -> commit_ts:int64 -> (copied, 'e) result;
   kept : 'a. version:int64 -> (unit -> ('a, 'e) result) -> ('a, 'e) result;
@@ -460,6 +465,56 @@ let through session tables =
         in
         match List.rev lacking with [] -> Ok () | first :: rest -> Error (`Mirror (Unknown_policies (first, rest))))
   in
+  let%bind steps =
+    let%bind replicas =
+      match (session.cluster, session.tiflash) with
+      | Same_cluster, Kept_tiflash | Other_cluster (), Dropped_tiflash -> Ok []
+      | Same_cluster, Dropped_tiflash | Other_cluster (), Kept_tiflash ->
+          let sources = Base.List.dedup_and_sort ~compare:Quiver_core.Ident.compare (List.map (fun (moved : moved) -> moved.source.database) tables) in
+          Result.map List.concat
+            (each sources ~f:(fun database ->
+                 let%bind rows = source_side.query (Tiflash_replicas database) in
+                 each rows ~f:(fun row ->
+                     match row with
+                     | [| Some table; Some count; labels |] ->
+                         Option.fold ~none:(malformed row)
+                           ~some:(fun count ->
+                             let labels = Option.fold ~none:[] ~some:(fun labels -> List.filter (fun label -> label <> "") (String.split_on_char ',' labels)) labels in
+                             Ok ((database, String.lowercase_ascii table), (count, labels)))
+                           (int_of_string_opt count)
+                     | row -> malformed row)))
+    in
+    let replicated =
+      List.map
+        (fun ((moved : moved), service, statement, _) ->
+          let found = List.assoc_opt (moved.source.database, String.lowercase_ascii (moved.source.table :> string)) replicas in
+          (moved, service, statement, Base.Option.filter found ~f:(fun (count, _) -> count > 0)))
+        planned
+    in
+    let steps =
+      List.map
+        (fun (moved, service, statement, found) ->
+          let after =
+            Option.map
+              (fun (count, labels) : Quiver_mysql.Statement.t ->
+                match session.cluster with
+                | Same_cluster -> Set_tiflash_replica { table = service; count = 0; labels = [] }
+                | Other_cluster () -> Set_tiflash_replica { table = service; count; labels })
+              found
+          in
+          (moved, service, statement, after))
+        replicated
+    in
+    let wanted = List.fold_left (fun most (_, _, _, found) -> Option.fold ~none:most ~some:(fun (count, _) -> max most count) found) 0 replicated in
+    match session.cluster with
+    | Other_cluster () when wanted > 0 ->
+        let%bind stores = one target_side Tiflash_stores in
+        Option.fold
+          ~none:(malformed [| Some stores |])
+          ~some:(fun stores -> if wanted > stores then Error (`Mirror (Too_few_tiflash { replicas = wanted; stores })) else Ok steps)
+          (int_of_string_opt stores)
+    | Same_cluster | Other_cluster () -> Ok steps
+  in
   let databases = Base.List.dedup_and_sort ~compare:Quiver_core.Ident.compare (List.map (fun (moved : moved) -> moved.target.database) tables) in
   let%bind () =
     let folded (database : Quiver_core.Ident.t) table = (String.lowercase_ascii (database :> string), String.lowercase_ascii table) in
@@ -492,17 +547,23 @@ let through session tables =
     Base.List.fold_result databases ~init:() ~f:(fun () database -> target_side.execute (Create_database database))
   in
   let drop made = List.iter (fun (_, service) -> ignore (target_side.execute (Drop_table service))) made in
-  let rec create made planned =
-    match planned with
+  let rec create made steps =
+    match steps with
     | [] -> Ok (List.rev made)
-    | (moved, service, statement, _) :: rest -> (
+    | (moved, service, statement, after) :: rest -> (
+        let failed made error =
+          drop (List.rev made);
+          error
+        in
         match target_side.execute statement with
-        | Ok () -> create ((moved, service) :: made) rest
-        | Error _ as error ->
-            drop (List.rev made);
-            error)
+        | Error _ as error -> failed made error
+        | Ok () -> (
+            let made = (moved, service) :: made in
+            match Option.fold ~none:(Ok ()) ~some:target_side.execute after with
+            | Ok () -> create made rest
+            | Error _ as error -> failed made error))
   in
-  let%bind made = create [] planned in
+  let%bind made = create [] steps in
   let mirrored =
     let%bind copies =
       session.kept ~version (fun () ->
@@ -581,6 +642,7 @@ let copy (from : reached) ~into ~finished tables settings =
       target_side = side onto;
       cluster;
       placement = settings.placement;
+      tiflash = settings.tiflash;
       name = (fun () -> "q_" ^ hex ());
       keys = (fun plan ~version ~commit_ts -> table ~from ~into:onto ~plan ~version ~commit_ts settings);
       kept =

@@ -45,14 +45,24 @@ let retabled ~into key =
 
 let kind_end key =
   let length = String.length key in
-  if length >= 19 && String.sub key 9 2 = "_i" then
-    let rec increment text i =
-      if i < 0 then None
-      else if text.[i] = '\xff' then increment (String.sub text 0 i) (i - 1)
-      else Some (String.sub text 0 i ^ String.make 1 (Char.chr (Char.code text.[i] + 1)))
+  let rec increment text i =
+    if i < 0 then None
+    else if text.[i] = '\xff' then increment (String.sub text 0 i) (i - 1)
+    else Some (String.sub text 0 i ^ String.make 1 (Char.chr (Char.code text.[i] + 1)))
+  in
+  if length >= 19 && String.sub key 9 2 = "_i" then increment (String.sub key 0 19) 18
+  else if length >= 11 && String.sub key 9 2 = "_r" then
+    let next = Bytes.of_string (String.sub key 0 9) in
+    let rec carry i =
+      if i < 1 then None
+      else if Bytes.get next i = '\xff' then (
+        Bytes.set next i '\x00';
+        carry (i - 1))
+      else (
+        Bytes.set next i (Char.chr (Char.code (Bytes.get next i) + 1));
+        Some (Bytes.to_string next))
     in
-    increment (String.sub key 0 19) 18
-  else if length >= 11 && String.sub key 9 2 = "_r" then Some (String.sub key 0 9 ^ "_s")
+    carry 8
   else None
 
 let hashed key = "m" ^ encode_bytes key ^ "\x00\x00\x00\x00\x00\x00\x00h"

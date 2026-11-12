@@ -46,6 +46,8 @@ type t =
   | Pd_instances
   | New_collations
   | Placement_policies
+  | Tiflash_replicas of Quiver_core.Ident.t
+  | Tiflash_stores
   | Next_row_ids of Quiver_core.Schema.Name.t
   | Checksum of Quiver_core.Schema.Name.t
   | Names of Quiver_core.Ident.t
@@ -309,6 +311,10 @@ let sql = function
   | Pd_instances -> "SELECT INSTANCE FROM information_schema.CLUSTER_INFO WHERE TYPE = 'pd'"
   | New_collations -> "SELECT VARIABLE_VALUE FROM mysql.tidb WHERE VARIABLE_NAME = 'new_collation_enabled'"
   | Placement_policies -> "SELECT POLICY_NAME FROM information_schema.PLACEMENT_POLICIES"
+  | Tiflash_replicas database ->
+      [%string
+        "SELECT TABLE_NAME, REPLICA_COUNT, LOCATION_LABELS FROM information_schema.TIFLASH_REPLICA WHERE TABLE_SCHEMA = %{text (database :> string)}"]
+  | Tiflash_stores -> "SELECT COUNT(*) FROM information_schema.CLUSTER_INFO WHERE TYPE = 'tiflash'"
   | Next_row_ids name -> [%string "SHOW TABLE %{qualified name} NEXT_ROW_ID"]
   | Checksum name -> [%string "ADMIN CHECKSUM TABLE %{qualified name}"]
   | Names database -> [%string "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = %{text (database :> string)}"]

@@ -61,6 +61,9 @@ type t =
   | Pd_instances  (** TiDB: [host:port] of each PD server. *)
   | New_collations  (** TiDB: whether the cluster was made with the new collation framework, as [True] or [False]. *)
   | Placement_policies  (** TiDB: the name of every placement policy of the cluster. *)
+  | Tiflash_replicas of Quiver_core.Ident.t
+      (** TiDB: each table of the database with TiFlash replicas, their number and location labels joined by commas. *)
+  | Tiflash_stores  (** TiDB: how many TiFlash stores the cluster has. *)
   | Next_row_ids of Quiver_core.Schema.Name.t
       (** TiDB: each id allocator of the table, the next id it hands out and its kind. *)
   | Checksum of Quiver_core.Schema.Name.t

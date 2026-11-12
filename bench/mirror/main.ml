@@ -69,6 +69,7 @@ let () =
             stores;
             regions = Held;
             placement = Kept_placement;
+            tiflash = Kept_tiflash;
           }
       with
       | Ok mirrored ->

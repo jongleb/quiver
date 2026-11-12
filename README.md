@@ -633,7 +633,7 @@ quiver mirror -h tidb.example -P 4000 -B shop --to-database shop_copy \
 
 Every table of `-B`, or each named with `-T`, is copied as of one TSO, so the copies agree with
 each other as the source's tables did. The definitions, the clusters' collations and placement
-policies, and the copies' names are all checked before anything is made. Each copy is made under a
+policies, their TiFlash stores, and the copies' names are all checked before anything is made. Each copy is made under a
 name of its own (`CREATE TABLE … LIKE`, or the source's `SHOW CREATE TABLE` in another cluster).
 Its rows and indexes are read from TiKV region by region on `-w` workers, through the locks of
 transactions not yet resolved as TiDB's readers go through them, and imported through `ImportSST`
@@ -658,7 +658,11 @@ Rows of TiDB's first format stay in it. A partitioned table is copied partition 
 into the copy's partition of its name, and its global indexes with every entry naming the copy's
 partition; one whose entries name partitions in their keys in one TiDB version and not in the
 other is refused. Into another cluster, the placement policies the source's definition names must
-exist there, or `--placement default` places the copy as the target places any table. Mirror reaches PD and every TiKV store directly. When the
+exist there, or `--placement default` places the copy as the target places any table. A copy has
+as many TiFlash replicas as its table, by the same location labels, set before its keys are
+written: TiFlash takes them as the TiKV replicas do, at its proxy's address. Into another cluster
+there must be as many TiFlash stores; `--tiflash-replicas drop` makes the copies without replicas.
+Mirror reaches PD and every TiKV and TiFlash store directly. When the
 cluster has TLS between its components, `--cluster-ca`, `--cluster-cert` and `--cluster-key` name
 the files its `[security]` sections use; `--to-cluster-*` do the same for another target cluster.
 Their chains and host names are then checked, and h2 is required through ALPN. `--store-mode import` keeps every TiKV
@@ -785,6 +789,7 @@ quiver is young and moving fast.
 | TiDB 8.5 as a source and a target: one TSO, chunks by regions, `_tidb_rowid`, sequences, `--collation` | new in 1.6 |
 | `quiver mirror`: TiDB to TiDB as TiKV keys, within a cluster or into another | new in 1.6 |
 | `quiver mirror`: a database at one TSO, global indexes, locks read through, GC and scheduling held, TLS to PD and TiKV | new in 1.7 |
+| `quiver mirror`: TiFlash replicas, written as TiKV's are | new in 1.7.1 |
 | Resuming a network transfer from the same snapshot | next |
 | Postgres and other providers | after MySQL is done |
 

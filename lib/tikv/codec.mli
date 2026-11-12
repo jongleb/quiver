@@ -26,8 +26,8 @@ val retabled : into:int64 -> string -> string
     which is the next table's first. *)
 
 val kind_end : string -> string option
-(** The first key past the index, or the rows, of the table this key is of: what keys of one kind
-    span. *)
+(** The first key past the index of the table this key is of, or past its rows, the next table's
+    first: what keys of one kind span. A region from [_s] on, rowless, would stop TiFlash. *)
 
 val databases : string * string
 (** The first meta key describing a database and the first key past those. *)

@@ -631,14 +631,21 @@ quiver mirror -h tidb.example -P 4000 -B shop --to-database shop_copy \
   --cluster-ca ca.crt --cluster-cert client.crt --cluster-key client.key       # TLS to PD and TiKV
 ```
 
-The copy is made under a name of its own (`CREATE TABLE … LIKE`, or the source's `SHOW CREATE
-TABLE` in another cluster). Its rows and indexes are read from TiKV at one TSO, region by region
-on `-w` workers, and imported through `ImportSST` under the copy's table id, at a version after
-it. While it reads, the source's GC is held at that TSO through a service safe point in PD, as
+Every table of `-B`, or each named with `-T`, is copied as of one TSO, so the copies agree with
+each other as the source's tables did. The definitions, the clusters' collations and placement
+policies, and the copies' names are all checked before anything is made. Each copy is made under a
+name of its own (`CREATE TABLE … LIKE`, or the source's `SHOW CREATE TABLE` in another cluster).
+Its rows and indexes are read from TiKV region by region on `-w` workers, through the locks of
+transactions not yet resolved as TiDB's readers go through them, and imported through `ImportSST`
+under the copy's table id, at a version after it. While it is written, PD keeps its regions from
+being moved or merged (a `schedule=deny` label, as Lightning sets one; `--target-regions scheduled`
+leaves them to PD). While it reads, the source's GC is held at that TSO through a service safe point in PD, as
 dumpling and BR hold it, renewed every minute and asked once more after the reads: if GC may have
 passed the TSO meanwhile, the copy fails. TiDB's `ADMIN CHECKSUM TABLE` must equal quiver's own
 CRC64 of what it wrote; then the id
-allocators move past the source's and the copy is renamed. On any failure it is dropped.
+allocators move past the source's, and all copies are renamed by one `RENAME TABLE`, together or
+not at all. On any failure they are dropped. `ANALYZE TABLE` then gathers each copy's statistics
+(`--statistics leave` skips it), since TiDB would plan queries on it as on an empty table.
 
 Both tables are described as TiKV keeps them at the versions read and written. Into another
 cluster the two must agree on new collations, and where the copy's columns and indexes have other
@@ -647,8 +654,11 @@ written under the copy's; keys of a dropped index, until TiKV collects them, sta
 written before a column was added with a default gets that default written in, as TiDB writes it;
 a default quiver does not write (JSON other than null, a `TIMESTAMP` of TiDB before 3.0, another
 character set) refuses the table, with nothing left behind, and `quiver copy` moves it through SQL.
-A partitioned table is copied partition by partition, each into the copy's partition of its name;
-one with a global index is refused. Mirror reaches PD and every TiKV store directly. When the
+Rows of TiDB's first format stay in it. A partitioned table is copied partition by partition, each
+into the copy's partition of its name, and its global indexes with every entry naming the copy's
+partition; one whose entries name partitions in their keys in one TiDB version and not in the
+other is refused. Into another cluster, the placement policies the source's definition names must
+exist there, or `--placement default` places the copy as the target places any table. Mirror reaches PD and every TiKV store directly. When the
 cluster has TLS between its components, `--cluster-ca`, `--cluster-cert` and `--cluster-key` name
 the files its `[security]` sections use; `--to-cluster-*` do the same for another target cluster.
 Their chains and host names are then checked, and h2 is required through ALPN. `--store-mode import` keeps every TiKV
@@ -774,6 +784,7 @@ quiver is young and moving fast.
 | Online tuning of streams, compression, readers; chunks divided while read | shipped |
 | TiDB 8.5 as a source and a target: one TSO, chunks by regions, `_tidb_rowid`, sequences, `--collation` | new in 1.6 |
 | `quiver mirror`: TiDB to TiDB as TiKV keys, within a cluster or into another | new in 1.6 |
+| `quiver mirror`: a database at one TSO, global indexes, locks read through, GC and scheduling held, TLS to PD and TiKV | new in 1.7 |
 | Resuming a network transfer from the same snapshot | next |
 | Postgres and other providers | after MySQL is done |
 

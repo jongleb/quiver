@@ -707,6 +707,12 @@ into_tidb() {
   sleep 4
   kill -9 "$killed" 2> /dev/null || true
   wait "$killed" 2> /dev/null || true
+  # The killed load's sessions may still be committing a piece: resumed before that ends, the
+  # load would repeat it and one of the two fail on its mark.
+  for _ in $(seq 60); do
+    [ "$(ti -N -e "SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE ID <> CONNECTION_ID() AND INFO IS NOT NULL")" = 0 ] && break
+    sleep 1
+  done
   "$quiver" load --tls disabled -P "$port" -u root -d "$dir" -t 2 > "$dir.resumed.log" 2>&1 \
     || fail "resumed load: $(cat "$dir.resumed.log")"
   same "a load killed and resumed"

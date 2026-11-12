@@ -516,7 +516,10 @@ let queries () =
   Alcotest.(check string) "row ids moved on" "ALTER TABLE `d`.`q_1` AUTO_INCREMENT = 30001"
     (Quiver_mysql.Statement.sql (Rebase { table = copy; allocator = Auto_increment; next = 30001L }));
   Alcotest.(check string) "random ids moved on" "ALTER TABLE `d`.`q_1` AUTO_RANDOM_BASE = 7"
-    (Quiver_mysql.Statement.sql (Rebase { table = copy; allocator = Auto_random; next = 7L }))
+    (Quiver_mysql.Statement.sql (Rebase { table = copy; allocator = Auto_random; next = 7L }));
+  let other : Quiver_core.Schema.Name.t = { database = Support.ident "e"; table = Support.ident "q_2" } in
+  Alcotest.(check string) "renamed together" "RENAME TABLE `d`.`q_1` TO `d`.`t'`, `e`.`q_2` TO `e`.`u`"
+    (Quiver_mysql.Statement.sql (Rename_tables ({ from = copy; into = name }, [ { from = other; into = { other with table = Support.ident "u" } } ])))
 
 let tests =
   [

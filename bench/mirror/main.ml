@@ -59,7 +59,9 @@ let () =
     (fun table ->
       let started = Unix.gettimeofday () in
       match
-        Quiver_tikv.Mirror.copy { link; security = Cleartext } ~into:Same_cluster ~source:(name table) ~target:(name (table ^ "_copy"))
+        Quiver_tikv.Mirror.copy { link; security = Cleartext } ~into:Same_cluster
+          ~finished:(fun _ _ -> ())
+          [ { source = name table; target = name (table ^ "_copy") } ]
           {
             timeout = Core.Time_ns.Span.of_int_sec 30;
             sizes = { scan = 1024; job = 16 lsl 20; batch = 16 lsl 10 };
@@ -69,9 +71,12 @@ let () =
             placement = Kept_placement;
           }
       with
-      | Ok copied ->
-          Printf.printf "%s: %d keys, %d bytes, checksum %Lx as TiDB's, in %.2f s\n%!" table copied.keys copied.bytes copied.checksum
-            (Unix.gettimeofday () -. started)
+      | Ok mirrored ->
+          List.iter
+            (fun (_, (copied : Quiver_tikv.Mirror.copied)) ->
+              Printf.printf "%s: %d keys, %d bytes, checksum %Lx as TiDB's, in %.2f s\n%!" table copied.keys copied.bytes copied.checksum
+                (Unix.gettimeofday () -. started))
+            mirrored.copies
       | Error error ->
           fail
             (show

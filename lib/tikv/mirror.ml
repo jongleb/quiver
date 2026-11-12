@@ -16,8 +16,11 @@ type settings = {
 type reached = { link : Quiver_mysql.Link.t; security : Http2.security }
 type copied = { keys : int; bytes : int; checksum : int64 } [@@deriving sexp_of ~portable]
 
+type moved = { source : Quiver_core.Schema.Name.t; target : Quiver_core.Schema.Name.t } [@@deriving sexp_of ~portable]
+type mirrored = { version : int64; copies : (moved * copied) list }
+
 type error =
-  | Mismatch of { copied : copied; target : copied }
+  | Mismatch of { table : Quiver_core.Schema.Name.t; copied : copied; target : copied }
   | Allocator of string
   | Collations_differ of { source : string; target : string }
   | Definition of Quiver_core.Schema.Name.t
@@ -400,12 +403,14 @@ type 'e session = {
   placement : placement;
   name : unit -> string;
   keys : Renumber.t -> version:int64 -> commit_ts:int64 -> (copied, 'e) result;
-  kept : version:int64 -> (unit -> (copied, 'e) result) -> (copied, 'e) result;
+  kept : 'a. version:int64 -> (unit -> ('a, 'e) result) -> ('a, 'e) result;
+  finished : moved -> copied -> unit;
 }
 
-let through session ~source ~target =
+let through session tables =
   let { source_side; target_side; _ } = session in
   let malformed row = Error (`Region (Region.Malformed (Array.to_list row))) in
+  let each l ~f = Result.map List.rev (Base.List.fold_result l ~init:[] ~f:(fun acc x -> Result.map (fun y -> y :: acc) (f x))) in
   let one side query =
     let%bind rows = side.query query in
     match rows with [ [| Some value |] ] -> Ok value | row :: _ -> malformed row | [] -> malformed [||]
@@ -419,6 +424,44 @@ let through session ~source ~target =
         if String.equal (String.lowercase_ascii here) (String.lowercase_ascii there) then Ok ()
         else Error (`Mirror (Collations_differ { source = here; target = there }))
   in
+  let%bind planned =
+    each tables ~f:(fun moved ->
+        let%bind service =
+          let name = session.name () in
+          Result.map
+            (fun table : Quiver_core.Schema.Name.t -> { moved.target with table })
+            (Result.map_error (fun _ -> `Region (Region.Malformed [ Some name ])) (Quiver_core.Ident.of_string name))
+        in
+        match session.cluster with
+        | Same_cluster -> Ok (moved, service, Quiver_mysql.Statement.Create_like { table = service; like = moved.source }, [])
+        | Other_cluster () -> (
+            let%bind rows = source_side.query (Show_create (Table moved.source)) in
+            match rows with
+            | [ [| _; Some definition |] ] -> (
+                match Base.String.chop_prefix definition ~prefix:("CREATE TABLE " ^ Quiver_core.Ident.backquoted moved.source.table) with
+                | None -> Error (`Mirror (Definition moved.source))
+                | Some body -> (
+                    let%bind placed = Placement.read body in
+                    match session.placement with
+                    | Default_placement -> Ok (moved, service, Quiver_mysql.Statement.Create_table { table = service; body = Placement.without placed }, [])
+                    | Kept_placement -> Ok (moved, service, Quiver_mysql.Statement.Create_table { table = service; body }, Placement.policies placed)))
+            | row :: _ -> malformed row
+            | [] -> malformed [||]))
+  in
+  let%bind () =
+    match List.concat_map (fun (_, _, _, policies) -> policies) planned with
+    | [] -> Ok ()
+    | named -> (
+        let%bind rows = target_side.query Placement_policies in
+        let there = List.filter_map (fun row -> match row with [| Some name |] -> Some (String.lowercase_ascii name) | _ -> None) rows in
+        let lacking =
+          List.fold_left
+            (fun lacking name ->
+              if List.mem (String.lowercase_ascii name) there || List.mem name lacking then lacking else name :: lacking)
+            [] named
+        in
+        match List.rev lacking with [] -> Ok () | first :: rest -> Error (`Mirror (Unknown_policies (first, rest))))
+  in
   let tso side =
     let%bind rows = side.query (Binlog_status side.server) in
     match rows with
@@ -427,92 +470,86 @@ let through session ~source ~target =
     | row :: _ -> malformed row
     | [] -> malformed [||]
   in
-  let%bind service =
-    let name = session.name () in
-    Result.map
-      (fun table : Quiver_core.Schema.Name.t -> { target with table })
-      (Result.map_error (fun _ -> `Region (Region.Malformed [ Some name ])) (Quiver_core.Ident.of_string name))
-  in
   let%bind version = tso source_side in
   let%bind () =
-    match session.cluster with
-    | Same_cluster -> target_side.execute (Create_like { table = service; like = source })
-    | Other_cluster () -> (
-        let%bind rows = source_side.query (Show_create (Table source)) in
-        match rows with
-        | [ [| _; Some definition |] ] -> (
-            match Base.String.chop_prefix definition ~prefix:("CREATE TABLE " ^ Quiver_core.Ident.backquoted source.table) with
-            | None -> Error (`Mirror (Definition source))
-            | Some body -> (
-                let%bind placed = Placement.read body in
-                let%bind body =
-                  match (session.placement, Placement.policies placed) with
-                  | Default_placement, _ -> Ok (Placement.without placed)
-                  | Kept_placement, [] -> Ok body
-                  | Kept_placement, (_ :: _ as named) -> (
-                      let%bind rows = target_side.query Placement_policies in
-                      let there = List.filter_map (fun row -> match row with [| Some name |] -> Some (String.lowercase_ascii name) | _ -> None) rows in
-                      match List.filter (fun name -> not (List.mem (String.lowercase_ascii name) there)) named with
-                      | [] -> Ok body
-                      | first :: rest -> Error (`Mirror (Unknown_policies (first, rest))))
-                in
-                target_side.execute (Create_table { table = service; body })))
-        | row :: _ -> malformed row
-        | [] -> malformed [||])
+    Base.List.fold_result
+      (Base.List.dedup_and_sort ~compare:Quiver_core.Ident.compare (List.map (fun (moved : moved) -> moved.target.database) tables))
+      ~init:()
+      ~f:(fun () database -> target_side.execute (Create_database database))
   in
-  let copied =
-    let%bind copied =
+  let drop made = List.iter (fun (_, service) -> ignore (target_side.execute (Drop_table service))) made in
+  let rec create made planned =
+    match planned with
+    | [] -> Ok (List.rev made)
+    | (moved, service, statement, _) :: rest -> (
+        match target_side.execute statement with
+        | Ok () -> create ((moved, service) :: made) rest
+        | Error _ as error ->
+            drop (List.rev made);
+            error)
+  in
+  let%bind made = create [] planned in
+  let mirrored =
+    let%bind copies =
       session.kept ~version (fun () ->
-          let%bind commit_ts = tso target_side in
-          let%bind here = source_side.described source ~at:version in
-          let%bind there = target_side.described service ~at:commit_ts in
-          let%bind plan = Renumber.make ~source:here ~target:there in
-          session.keys plan ~version ~commit_ts)
-    in
-    let%bind sums = target_side.query (Checksum service) in
-    let%bind () =
-      match sums with
-      | [ ([| _; _; Some checksum; Some keys; Some bytes |] as row) ] -> (
-          match (Int64.of_string_opt ("0u" ^ checksum), int_of_string_opt keys, int_of_string_opt bytes) with
-          | Some checksum, Some keys, Some bytes ->
-              let target = { keys; bytes; checksum } in
-              if target = copied then Ok () else Error (`Mirror (Mismatch { copied; target }))
-          | _ -> malformed row)
-      | row :: _ -> malformed row
-      | [] -> malformed [||]
-    in
-    let%bind allocators = source_side.query (Next_row_ids source) in
-    let%bind rebased =
-      Base.Result.all
-        (List.filter_map
-           (fun row ->
-             match row with
-             | [| _; _; _; Some next; Some kind |] -> (
-                 match (Int64.of_string_opt next, kind) with
-                 | Some next, ("_TIDB_ROWID" | "AUTO_INCREMENT") -> Some (Ok (Quiver_mysql.Statement.Auto_increment, next))
-                 | Some next, "AUTO_RANDOM" -> Some (Ok (Quiver_mysql.Statement.Auto_random, next))
-                 | Some _, "SEQUENCE" -> None
-                 | Some _, kind -> Some (Error (`Mirror (Allocator kind)))
-                 | None, _ -> Some (malformed row))
-             | row -> Some (malformed row))
-           allocators)
+          each made ~f:(fun (moved, service) ->
+              let%bind commit_ts = tso target_side in
+              let%bind here = source_side.described moved.source ~at:version in
+              let%bind there = target_side.described service ~at:commit_ts in
+              let%bind plan = Renumber.make ~source:here ~target:there in
+              let%bind copied = session.keys plan ~version ~commit_ts in
+              session.finished moved copied;
+              Ok (moved, service, copied)))
     in
     let%bind () =
-      Base.List.fold_result [ Quiver_mysql.Statement.Auto_increment; Auto_random ] ~init:() ~f:(fun () allocator ->
-          let next =
-            List.fold_left
-              (fun most (kind, next) -> if kind = allocator then Some (Option.fold ~none:next ~some:(Int64.max next) most) else most)
-              None rebased
+      Base.List.fold_result copies ~init:() ~f:(fun () ((moved : moved), service, copied) ->
+          let%bind sums = target_side.query (Checksum service) in
+          let%bind () =
+            match sums with
+            | [ ([| _; _; Some checksum; Some keys; Some bytes |] as row) ] -> (
+                match (Int64.of_string_opt ("0u" ^ checksum), int_of_string_opt keys, int_of_string_opt bytes) with
+                | Some checksum, Some keys, Some bytes ->
+                    let target = { keys; bytes; checksum } in
+                    if target = copied then Ok () else Error (`Mirror (Mismatch { table = moved.source; copied; target }))
+                | _ -> malformed row)
+            | row :: _ -> malformed row
+            | [] -> malformed [||]
           in
-          Option.fold ~none:(Ok ()) ~some:(fun next -> target_side.execute (Rebase { table = service; allocator; next })) next)
+          let%bind allocators = source_side.query (Next_row_ids moved.source) in
+          let%bind rebased =
+            Base.Result.all
+              (List.filter_map
+                 (fun row ->
+                   match row with
+                   | [| _; _; _; Some next; Some kind |] -> (
+                       match (Int64.of_string_opt next, kind) with
+                       | Some next, ("_TIDB_ROWID" | "AUTO_INCREMENT") -> Some (Ok (Quiver_mysql.Statement.Auto_increment, next))
+                       | Some next, "AUTO_RANDOM" -> Some (Ok (Quiver_mysql.Statement.Auto_random, next))
+                       | Some _, "SEQUENCE" -> None
+                       | Some _, kind -> Some (Error (`Mirror (Allocator kind)))
+                       | None, _ -> Some (malformed row))
+                   | row -> Some (malformed row))
+                 allocators)
+          in
+          Base.List.fold_result [ Quiver_mysql.Statement.Auto_increment; Auto_random ] ~init:() ~f:(fun () allocator ->
+              let next =
+                List.fold_left
+                  (fun most (kind, next) -> if kind = allocator then Some (Option.fold ~none:next ~some:(Int64.max next) most) else most)
+                  None rebased
+              in
+              Option.fold ~none:(Ok ()) ~some:(fun next -> target_side.execute (Rebase { table = service; allocator; next })) next))
     in
-    let%bind () = target_side.execute (Rename_table { from = service; into = target }) in
-    Ok copied
+    let%bind () =
+      match List.map (fun ((moved : moved), service, _) : Quiver_mysql.Statement.renaming -> { from = service; into = moved.target }) copies with
+      | [] -> Ok ()
+      | first :: rest -> target_side.execute (Rename_tables (first, rest))
+    in
+    Ok { version; copies = List.map (fun (moved, _, copied) -> (moved, copied)) copies }
   in
-  let () = match copied with Ok _ -> () | Error _ -> ignore (target_side.execute (Drop_table service)) in
-  copied
+  let () = match mirrored with Ok _ -> () | Error _ -> drop made in
+  mirrored
 
-let copy (from : reached) ~into ~source ~target settings =
+let copy (from : reached) ~into ~finished tables settings =
   let random = Random.State.make_self_init () in
   let side ({ link; security } : reached) =
     {
@@ -543,5 +580,6 @@ let copy (from : reached) ~into ~source ~target settings =
               Pd.close pd;
               kept)
             work);
+      finished;
     }
-    ~source ~target
+    tables

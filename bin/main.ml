@@ -720,39 +720,44 @@ let () =
                        | row -> Error (`Region (Quiver_tikv.Region.Malformed (Array.to_list row))))
                      rows)
           in
-          let%bind () = Quiver_mysql.Link.run_statement target (Create_database into) in
-          Base.List.fold_result tables ~init:() ~f:(fun () table ->
-              let started = Quiver_core.Stopwatch.start () in
-              let%bind copied =
-                Quiver_tikv.Mirror.copy { link; security } ~into:onto ~source:{ database; table } ~target:{ database = into; table }
-                  {
-                    timeout = conn.timeouts.connecting;
-                    sizes = { scan = 1024; job = 16 lsl 20; batch = 16 lsl 10 };
-                    workers;
-                    stores;
-                    regions;
-                    placement;
-                  }
-              in
-              Format.printf "%s.%s: %d keys, %d bytes, checksum %016Lx as TiDB's, in %a@." (into :> string)
-                (table :> string) copied.keys copied.bytes copied.checksum Core.Time_ns.Span.pp
-                (Quiver_core.Stopwatch.elapsed started);
-              let () =
-                match statistics with
-                | `Leave -> ()
-                | `Analyze -> (
-                    let started = Quiver_core.Stopwatch.start () in
-                    match Quiver_mysql.Link.run_statement target (Analyze_table { database = into; table }) with
-                    | Ok () ->
-                        Format.printf "%s.%s: statistics gathered in %a@." (into :> string) (table :> string) Core.Time_ns.Span.pp
-                          (Quiver_core.Stopwatch.elapsed started)
-                    | Error error ->
-                        Format.eprintf
-                          "warning: %s.%s is copied whole, but ANALYZE TABLE failed, and TiDB plans queries on it as on an empty table until its statistics are gathered: %a@."
-                          (into :> string) (table :> string) Base.Sexp.pp_hum
-                          ([%sexp_of: [ `Link of Quiver_mysql.Link.error | `Wire of Quiver_mysql.Wire.error | `Transport of Quiver_mysql.Transport.error ]] error))
-              in
-              Ok ())
+          let started = Quiver_core.Stopwatch.start () in
+          let last = ref (Quiver_core.Stopwatch.start ()) in
+          let%bind mirrored =
+            Quiver_tikv.Mirror.copy { link; security } ~into:onto
+              ~finished:(fun moved copied ->
+                Format.printf "%s.%s: %d keys, %d bytes, checksum %016Lx, copied in %a@." (moved.target.database :> string)
+                  (moved.target.table :> string) copied.keys copied.bytes copied.checksum Core.Time_ns.Span.pp
+                  (Quiver_core.Stopwatch.elapsed !last);
+                last := Quiver_core.Stopwatch.start ())
+              (List.map (fun table : Quiver_tikv.Mirror.moved -> { source = { database; table }; target = { database = into; table } }) tables)
+              {
+                timeout = conn.timeouts.connecting;
+                sizes = { scan = 1024; job = 16 lsl 20; batch = 16 lsl 10 };
+                workers;
+                stores;
+                regions;
+                placement;
+              }
+          in
+          Format.printf "%d tables as of the source's TSO %Ld, each checksum equal to TiDB's, in %a@."
+            (List.length mirrored.copies) mirrored.version Core.Time_ns.Span.pp (Quiver_core.Stopwatch.elapsed started);
+          List.iter
+            (fun ((moved : Quiver_tikv.Mirror.moved), _) ->
+              match statistics with
+              | `Leave -> ()
+              | `Analyze -> (
+                  let started = Quiver_core.Stopwatch.start () in
+                  match Quiver_mysql.Link.run_statement target (Analyze_table moved.target) with
+                  | Ok () ->
+                      Format.printf "%s.%s: statistics gathered in %a@." (into :> string) (moved.target.table :> string)
+                        Core.Time_ns.Span.pp (Quiver_core.Stopwatch.elapsed started)
+                  | Error error ->
+                      Format.eprintf
+                        "warning: %s.%s is copied whole, but ANALYZE TABLE failed, and TiDB plans queries on it as on an empty table until its statistics are gathered: %a@."
+                        (into :> string) (moved.target.table :> string) Base.Sexp.pp_hum
+                        ([%sexp_of: [ `Link of Quiver_mysql.Link.error | `Wire of Quiver_mysql.Wire.error | `Transport of Quiver_mysql.Transport.error ]] error)))
+            mirrored.copies;
+          Ok ()
         in
         let () = match onto with Same_cluster -> () | Other_cluster onto -> Quiver_mysql.Link.close onto.link in
         copied

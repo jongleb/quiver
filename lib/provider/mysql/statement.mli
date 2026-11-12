@@ -3,6 +3,9 @@
     apart. *)
 type allocator = Auto_increment | Auto_random [@@deriving sexp_of ~portable]
 
+type renaming = { from : Quiver_core.Schema.Name.t; into : Quiver_core.Schema.Name.t } [@@deriving sexp_of ~portable]
+(** A table and its new name. *)
+
 type t =
   | Configure_session of Server.t
       (** UTC time zone, empty [sql_mode], long network timeouts, [REPEATABLE
@@ -40,7 +43,7 @@ type t =
           [.cfg] written until [UNLOCK TABLES]. *)
   | Discard_tablespace of Quiver_core.Schema.Name.t
   | Import_tablespace of Quiver_core.Schema.Name.t
-  | Rename_table of { from : Quiver_core.Schema.Name.t; into : Quiver_core.Schema.Name.t }
+  | Rename_tables of renaming * renaming list  (** All renamed, or none. *)
   | Drop_table of Quiver_core.Schema.Name.t  (** If it exists. *)
   | Create_database of Quiver_core.Ident.t  (** If it does not exist, in the server's defaults. *)
   | Create_like of { table : Quiver_core.Schema.Name.t; like : Quiver_core.Schema.Name.t }

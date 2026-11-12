@@ -1,4 +1,5 @@
 type allocator = Auto_increment | Auto_random [@@deriving sexp_of ~portable]
+type renaming = { from : Quiver_core.Schema.Name.t; into : Quiver_core.Schema.Name.t } [@@deriving sexp_of ~portable]
 
 type t =
   | Configure_session of Server.t
@@ -23,7 +24,7 @@ type t =
   | Export of Quiver_core.Schema.Name.t
   | Discard_tablespace of Quiver_core.Schema.Name.t
   | Import_tablespace of Quiver_core.Schema.Name.t
-  | Rename_table of { from : Quiver_core.Schema.Name.t; into : Quiver_core.Schema.Name.t }
+  | Rename_tables of renaming * renaming list
   | Drop_table of Quiver_core.Schema.Name.t
   | Create_database of Quiver_core.Ident.t
   | Create_like of { table : Quiver_core.Schema.Name.t; like : Quiver_core.Schema.Name.t }
@@ -92,7 +93,9 @@ let sql = function
   | Export name -> [%string "FLUSH TABLES %{Query.qualified name} FOR EXPORT"]
   | Discard_tablespace name -> [%string "ALTER TABLE %{Query.qualified name} DISCARD TABLESPACE"]
   | Import_tablespace name -> [%string "ALTER TABLE %{Query.qualified name} IMPORT TABLESPACE"]
-  | Rename_table { from; into } -> [%string "RENAME TABLE %{Query.qualified from} TO %{Query.qualified into}"]
+  | Rename_tables (first, rest) ->
+      let pair { from; into } = [%string "%{Query.qualified from} TO %{Query.qualified into}"] in
+      [%string {|RENAME TABLE %{String.concat ", " (List.map pair (first :: rest))}|}]
   | Drop_table name -> [%string "DROP TABLE IF EXISTS %{Query.qualified name}"]
   | Analyze_table name -> [%string "ANALYZE TABLE %{Query.qualified name}"]
   | Create_database name -> [%string "CREATE DATABASE IF NOT EXISTS %{Quiver_core.Ident.backquoted name}"]

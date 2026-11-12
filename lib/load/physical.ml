@@ -219,7 +219,7 @@ let import link { table = t; rows } =
           Error (`Warned (List.map (fun row -> String.concat " " (List.filter_map Fun.id (Array.to_list row))) said))
     in
     let (_ : (unit, _) result) = Quiver_innodb.File.remove t.cfg_path in
-    let%map () = execute link (Rename_table { from = t.service; into = t.into }) in
+    let%map () = execute link (Rename_tables ({ from = t.service; into = t.into }, [])) in
     rows
   in
   Result.iter_error (fun _ -> abandon link t) imported;

@@ -45,8 +45,14 @@ type copied = { keys : int; bytes : int; checksum : int64 } [@@deriving sexp_of 
 (** What was copied: keys, their bytes with the values', and the CRC64 XOR of them as TiKV's
     checksum of a table sums them. *)
 
+type moved = { source : Quiver_core.Schema.Name.t; target : Quiver_core.Schema.Name.t } [@@deriving sexp_of ~portable]
+(** A table of the source and the new table its copy becomes. *)
+
+type mirrored = { version : int64; copies : (moved * copied) list }
+(** Tables copied as of one version of the source, TiDB's TSO. *)
+
 type error =
-  | Mismatch of { copied : copied; target : copied }  (** TiDB's checksum of the target differs. *)
+  | Mismatch of { table : Quiver_core.Schema.Name.t; copied : copied; target : copied }  (** TiDB's checksum of the copy differs. *)
   | Allocator of string  (** An id allocator of a kind this side does not know. *)
   | Collations_differ of { source : string; target : string }
       (** The clusters' [new_collation_enabled]: an index's keys would be encoded otherwise. *)
@@ -141,25 +147,25 @@ type 'e session = {
   name : unit -> string;  (** A table name no table has, for the copy while it is made. *)
   keys : Renumber.t -> version:int64 -> commit_ts:int64 -> (copied, 'e) result;
       (** The plan's keys as of [version] into the copy at [commit_ts]. *)
-  kept : version:int64 -> (unit -> (copied, 'e) result) -> (copied, 'e) result;
+  kept : 'a. version:int64 -> (unit -> ('a, 'e) result) -> ('a, 'e) result;
       (** The work, which reads the source at [version], with GC of the source held from passing it. *)
+  finished : moved -> copied -> unit;  (** Told of each table whose keys are copied. *)
 }
 (** How a copy reaches TiDB and TiKV. *)
 
 val through :
   ([> `Mirror of error | `Placement of Placement.error | `Region of Region.error | `Renumber of Renumber.error ] as 'e) session ->
-  source:Quiver_core.Schema.Name.t ->
-  target:Quiver_core.Schema.Name.t ->
-  (copied, 'e) result
+  moved list ->
+  (mirrored, 'e) result
 (** What {!copy} does, through the session. *)
 
 val copy :
   reached ->
   into:reached cluster ->
-  source:Quiver_core.Schema.Name.t ->
-  target:Quiver_core.Schema.Name.t ->
+  finished:(moved -> copied -> unit) ->
+  moved list ->
   settings ->
-  ( copied,
+  ( mirrored,
     [> `Mirror of error
     | `Placement of Placement.error
     | `Info of Info.error
@@ -178,9 +184,10 @@ val copy :
     | `Hpack of Hpack.error ] )
   result
 @@ nonportable
-(** [source] as of now into a new table [target], in its cluster or another: made under a name of
-    its own ([LIKE] it, or by its definition in the other cluster, where the two clusters must agree
-    on collations), its keys copied by {!table}, with the source's GC held at their version by
-    {!Pd.held}, at a later version of the target's cluster under the
-    copy's ids, as both tables are described at those versions, checked against TiDB's checksum,
-    its id allocators moved past the source's, renamed; dropped on any failure. *)
+(** The tables as of one version of the source, taken now, into new tables, in its cluster or
+    another: their definitions, the clusters' collations and placement policies checked before
+    anything is made; each made under a name of its own ([LIKE] it, or by its definition in the
+    other cluster), its keys copied by {!table} with the source's GC held at the version by
+    {!Pd.held}, at a later version of the target's cluster under the copy's ids, as both tables are
+    described at those versions; every copy checked against TiDB's checksum and its id allocators
+    moved past the source's, then all renamed by one statement; on any failure, all dropped. *)

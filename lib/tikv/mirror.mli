@@ -66,8 +66,8 @@ type error =
 (** Keys of the source from [start] up to [stop]. *)
 type range = { start : string; stop : string }
 
-val ranges : source:int64 -> Region.t list -> range list
-(** The source table's keys split at the bounds of its regions. *)
+val ranges : range -> Region.t list -> range list
+(** The range split at the bounds of its regions. *)
 
 val points : first:string -> last:string -> parts:int -> string list
 (** Up to [parts - 1] keys after [first] and up to [last], evenly apart in the eight bytes after
@@ -101,7 +101,7 @@ val table :
     | `Http2 of Http2.error
     | `Hpack of Hpack.error ] )
   result
-(** The keys of the plan's source table, or of each of its partitions, as of [version] into the
+(** The keys of the plan's source table, or of each of its partitions and its global indexes, as of [version] into the
     copy's at [commit_ts], which must be later than any version the copy holds; the TiDB of each,
     [from] and [into], the same or of two clusters, names its cluster's PD, which the regions of
     their tables are learned from; each region of the source, cut at keys evenly apart, copied by

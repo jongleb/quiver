@@ -299,7 +299,8 @@ let keys =
              = List.sort compare
                  (if partitions = 0 then [ (75L, 300L) ]
                   else List.init partitions (fun i -> (Int64.of_int (80 + (((5 * i) + 2) mod 7)), Int64.of_int (400 + partitions - 1 - i))))
-          && List.for_all (fun (from, into) -> Renumber.key plan (prefix from) = Ok (Some (prefix into))) (Renumber.tables plan))
+          && List.for_all (fun (from, into) -> Renumber.key plan (prefix from) = Ok (Some (prefix into))) (Renumber.tables plan)
+          && Renumber.ranges plan = List.map (fun (from, into) -> (from, into, Codec.table from)) (Renumber.tables plan))
 
 (* A key under a partitioned table with a local index [l] and a global one [g]. *)
 type entry =
@@ -408,7 +409,10 @@ let globals =
             | In_values -> true
           in
           key_moved && value_moved && refused
-          && Renumber.tables plan = List.sort compare ((75L, 300L) :: List.init partitions (fun i -> (source_id i, target_id i))))
+          && Renumber.tables plan = List.sort compare ((75L, 300L) :: List.init partitions (fun i -> (source_id i, target_id i)))
+          && Renumber.ranges plan
+             = List.sort compare
+                 ((75L, 300L, (index 75L 3L, index 75L 4L)) :: List.init partitions (fun i -> (source_id i, target_id i, Codec.table (source_id i)))))
 
 let uvarint n =
   let buffer = Buffer.create 10 in

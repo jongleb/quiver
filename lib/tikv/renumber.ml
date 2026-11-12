@@ -37,6 +37,19 @@ type t = {
 
 let tables t = List.map (fun (held, into, _) -> (Int64.logxor held Int64.min_int, into)) (Iarray.to_list t.tables)
 
+let ranges t =
+  List.concat_map
+    (fun (held, into, holder) ->
+      let source = Int64.logxor held Int64.min_int in
+      match holder with
+      | Physical -> [ (source, into, Codec.table source) ]
+      | Logical ->
+          let index id = fst (Codec.table source) ^ "_i" ^ String.init 8 (fun i -> Char.chr (Int64.to_int (Int64.logand (Int64.shift_right_logical (Int64.logxor id Int64.min_int) (8 * (7 - i))) 0xFFL))) in
+          List.filter_map
+            (fun (id, _, (scope : Info.scope)) -> match scope with Global _ -> Some (source, into, (index id, index (Int64.succ id))) | Local -> None)
+            (List.sort (fun (a, _, _) (b, _, _) -> Int64.compare a b) t.indexes))
+    (Iarray.to_list t.tables)
+
 let make ~(source : Info.t) ~(target : Info.t) =
   let changing =
     Base.Option.first_some

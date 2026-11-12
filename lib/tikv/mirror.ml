@@ -53,8 +53,7 @@ let learned pd ~start ~stop =
 
 type range = { start : string; stop : string }
 
-let ranges ~source regions =
-  let first, past = Codec.table source in
+let ranges { start = first; stop = past } regions =
   List.filter_map
     (fun (region : Region.t) ->
       let start = Base.String.max region.start first
@@ -242,7 +241,7 @@ let described link (name : Quiver_core.Schema.Name.t) ~at ~dial =
   info
 
 let table ~(from : reached) ~(into : reached) ~plan ~version ~commit_ts { timeout; sizes; workers; stores = tuning; regions = scheduling; placement = _ } =
-  let tables = Renumber.tables plan in
+  let tables = Renumber.tables plan and read = Renumber.ranges plan in
   let source_dial : Http2.dial = { timeout; security = from.security }
   and target_dial : Http2.dial = { timeout; security = into.security } in
   let%bind source_address = pd_of from.link in
@@ -262,15 +261,12 @@ let table ~(from : reached) ~(into : reached) ~plan ~version ~commit_ts { timeou
           Pd.close source_pd;
           Pd.close pd;
           error)
-        (Base.Result.all
-           (List.map
-              (fun (source, _) ->
-                let first, past = Codec.table source in
-                learned source_pd ~start:first ~stop:(Before past))
-              tables))
+        (Base.Result.all (List.map (fun (_, _, (first, past)) -> learned source_pd ~start:first ~stop:(Before past)) read))
     in
     let regions = List.concat held in
-    let whole = List.concat (List.map2 (fun (source, into) regions -> List.map (fun part -> (into, part)) (ranges ~source regions)) tables held) in
+    let whole =
+      List.concat (List.map2 (fun (_, into, (start, stop)) regions -> List.map (fun part -> (into, part)) (ranges { start; stop } regions)) read held)
+    in
     let parts = Int.max 1 (((4 * workers) + List.length whole - 1) / Int.max 1 (List.length whole)) in
     let source_stores = Stores.create source_dial and stores = Stores.create target_dial in
     let divided =

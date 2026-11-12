@@ -29,6 +29,11 @@ val tables : t -> (int64 * int64) list
 (** The ids keys are under, each of the source with the copy's: the table's, or its partitions' and,
     when it has global indexes, its own. *)
 
+val ranges : t -> (int64 * int64 * (string * string)) list
+(** The source's keys worth reading, each range from a key up to before another with the ids of
+    {!tables} it is under, in order: a partition's or the table's keys whole, under a partitioned
+    table's own id only those of each of its global indexes. *)
+
 val key : t -> string -> (string option, [> `Renumber of error ]) result
 (** The key in the copy, any key of the ranges of {!tables}; [None] for a key of an index the source
     does not have public, of another table, or under a partitioned table's own id but of none of its

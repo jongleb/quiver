@@ -563,7 +563,7 @@ let ranges =
             })
           ("" :: bounds)
       in
-      let parts = Mirror.ranges ~source:75L regions in
+      let parts = Mirror.ranges { start = first; stop = past } regions in
       let rec chained expected first_of last_of = function
         | [] -> expected
         | (part : Mirror.range) :: rest -> if first_of part = expected && String.compare (first_of part) (last_of part) < 0 then chained (last_of part) first_of last_of rest else "broken"

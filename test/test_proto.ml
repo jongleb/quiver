@@ -110,7 +110,31 @@ let walks =
             Ok ())
       in
       let before = Base.List.is_prefix (List.rev !read) ~prefix:(List.rev !seen) ~equal:( = ) in
-      let long = Base.String.is_substring text ~substring:"\x80\x80\x80\x80\x80\x80\x80\x80" || Base.String.is_substring text ~substring:"\xff\xff\xff\xff\xff\xff\xff\xff" in
+      let long =
+        let size = String.length text in
+        let rec past pos = if pos >= size then None else if Char.code text.[pos] < 0x80 then Some (pos + 1) else past (pos + 1) in
+        let rec fields pos =
+          Option.fold ~none:false
+            ~some:(fun after ->
+              after - pos > 8
+              ||
+              match Char.code text.[pos] land 7 with
+              | 0 -> Option.fold ~none:false ~some:(fun next -> next - after > 8 || fields next) (past after)
+              | 1 -> fields (after + 8)
+              | 5 -> fields (after + 4)
+              | 2 ->
+                  Option.fold ~none:false
+                    ~some:(fun next ->
+                      next - after > 8
+                      ||
+                      let length = Base.String.foldi (String.sub text after (next - after)) ~init:0 ~f:(fun i acc c -> acc lor ((Char.code c land 0x7F) lsl (7 * i))) in
+                      fields (next + length))
+                    (past after)
+              | _ -> false)
+            (past pos)
+        in
+        fields 0
+      in
       match (walk, folded) with
       | Walked, Ok () -> !read = !seen
       | Walked, Error _ -> false
@@ -119,6 +143,10 @@ let walks =
 
 let known () =
   let check name expected actual = Alcotest.(check string) name expected actual in
+  let nine = "\b\000\b\000\taaaaaaa\t\146\128\128\128\128\128\128\128a\b\128\001\b\128\001\n\016aaaaaaaaaaaaaaaa\n\019aaaaaaaaaaaaaaaaaaa\n\000" in
+  Alcotest.(check bool) "a key of nine bytes stops a walk, not a fold" true
+    (Proto.walk nine ~pos:0 ~len:(String.length nine) ~delimited:(fun _ _ _ -> Walked) ~scalar:(fun _ -> Walked) = Unusual
+    && Result.is_ok (Proto.fold nine ~pos:0 ~len:(String.length nine) ~init:() ~f:(fun () _ _ -> Ok ())));
   check "field 1 = 150" "\x08\x96\x01" (encode [ (1, Number 150L) ]);
   check "field 2 = testing" "\x12\x07testing" (encode [ (2, Text "testing") ]);
   check "-1 in ten bytes" "\x08\xff\xff\xff\xff\xff\xff\xff\xff\xff\x01" (encode [ (1, Number (-1L)) ]);

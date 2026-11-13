@@ -64,7 +64,7 @@ let chunks (session : session) = session.chunks
 (** How accepting one data connection ended. *)
 type attachment : value mod contended portable =
   | Attached of Channel.t
-  | Broke  (** Before its attach arrived: the agent sends its frames again. *)
+  | Broke  (** Before its attach arrived: the agent replaces it and sends its frames again. *)
   | Failed of error
 
 let attached listening (session : session) =
@@ -90,14 +90,12 @@ let attached listening (session : session) =
       tried
   in
   match
-    ( List.find_map
-        (function Failed error -> Some error | Attached _ | Broke -> None)
-        tried,
-      channels )
+    List.find_map
+      (function Failed error -> Some error | Attached _ | Broke -> None)
+      tried
   with
-  | None, _ :: _ -> Ok channels
-  | None, [] -> Error (`Collector (Lost Closed))
-  | Some error, _ ->
+  | None -> Ok channels
+  | Some error ->
       List.iter Channel.close channels;
       Error (`Collector error)
 

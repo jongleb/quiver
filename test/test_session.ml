@@ -44,7 +44,7 @@ type breaking =
 
 type cut = {
   connection : int;  (** A data connection, in the order they are accepted. *)
-  after : int;  (** Batch frames it carries before it breaks at the next. *)
+  after : int;  (** Frames it carries, its attach first, before it breaks at the next. *)
   breaking : breaking;
 }
 [@@deriving sexp_of]
@@ -251,7 +251,7 @@ let scenario =
       | Plain ->
           let+ broken =
             list_size (int_range 0 streams)
-              (pair (int_range 0 6)
+              (pair (int_range 0 7)
                  (oneof_list [ Truncated; Damaged; Reset; Silent ]))
           in
           let silent =
@@ -264,6 +264,11 @@ let scenario =
                 | Silent when silent >= streams -> Reset
                 | Truncated | Damaged | Reset | Silent -> breaking
               in
+              let after =
+                match breaking with
+                | Silent -> Int.max 1 after
+                | Truncated | Damaged | Reset -> after
+              in
               { connection; after; breaking })
             broken
     and* control =
@@ -271,7 +276,7 @@ let scenario =
       | Mutual_tls -> pure None
       | Plain ->
           option
-            (pair (int_range 1 12) (oneof_list [ Truncated; Damaged; Reset ]))
+            (pair (int_range 2 13) (oneof_list [ Truncated; Damaged; Reset ]))
     and* place =
       match topology with
       | Chained -> oneof_list [ Into_first; Into_last ]
@@ -340,7 +345,7 @@ let breaking ~target ~control cuts =
     let header = Bytes.create Quiver_net.Frame.header_bytes in
     let rec go frames =
       (match cut with
-      | Some { after; _ } when frames = after + 1 -> Atomic.set deaf true
+      | Some { after; _ } when frames = after -> Atomic.set deaf true
       | Some _ | None -> ());
       match exactly from header 0 (Bytes.length header) with
       | `Ended -> ignore (Unix.shutdown into SHUTDOWN_SEND)
@@ -351,7 +356,7 @@ let breaking ~target ~control cuts =
           let payload = Bytes.create length in
           match (exactly from payload 0 length, cut) with
           | `Ended, _ -> ignore (Unix.shutdown into SHUTDOWN_SEND)
-          | `Read, Some { after; breaking; _ } when frames > after ->
+          | `Read, Some { after; breaking; _ } when frames >= after ->
               let shutdown fd how =
                 try Unix.shutdown fd how with Unix.Unix_error _ -> ()
               in
@@ -952,7 +957,7 @@ let resumed_through_relays =
          refusal = Nobody;
          wire = Plain;
          cuts = [];
-         control = Some (3, Truncated);
+         control = Some (4, Truncated);
          place = Into_first;
          adjustments = [];
          compression = Fixed Plain;
@@ -980,10 +985,10 @@ let replaced_when_silent =
          wire = Plain;
          cuts =
            [
-             { connection = 0; after = 0; breaking = Truncated };
-             { connection = 1; after = 0; breaking = Truncated };
-             { connection = 2; after = 0; breaking = Truncated };
-             { connection = 3; after = 0; breaking = Silent };
+             { connection = 0; after = 1; breaking = Truncated };
+             { connection = 1; after = 1; breaking = Truncated };
+             { connection = 2; after = 1; breaking = Truncated };
+             { connection = 3; after = 1; breaking = Silent };
            ];
          control = None;
          place = Into_first;
@@ -993,6 +998,38 @@ let replaced_when_silent =
          columns = (Written, Written);
        })
        (QCheck2.Gen.oneof_list [ Direct; Relayed 1; Relayed 2; Chained ]))
+    property
+
+let replaced_before_attach =
+  QCheck2.Test.make ~count:12
+    ~name:
+      "data connections that all break before their attach arrives are \
+       replaced, and the session goes on"
+    ~print
+    (QCheck2.Gen.map2
+       (fun topology breaking ->
+         {
+           tables = [ [ ([ 3; 4 ], Kept); ([ 5 ], Kept) ]; [ ([ 2; 2 ], Kept) ] ];
+           streams = 2;
+           chunks = 2;
+           readers = 2;
+           topology;
+           refusal = Nobody;
+           wire = Plain;
+           cuts =
+             [
+               { connection = 0; after = 0; breaking };
+               { connection = 1; after = 0; breaking };
+             ];
+           control = None;
+           place = Into_first;
+           adjustments = [];
+           compression = Fixed Plain;
+           linger = 0.;
+           columns = (Written, Written);
+         })
+       (QCheck2.Gen.oneof_list [ Direct; Relayed 1; Chained ])
+       (QCheck2.Gen.oneof_list [ Truncated; Damaged; Reset ]))
     property
 
 let resumed_after_heartbeats =
@@ -1011,7 +1048,7 @@ let resumed_after_heartbeats =
          refusal = Nobody;
          wire = Plain;
          cuts = [];
-         control = Some (5, Reset);
+         control = Some (6, Reset);
          place = Into_first;
          adjustments = [];
          compression = Fixed Plain;
@@ -1035,8 +1072,8 @@ let refused_while_cut =
          topology = Chained;
          refusal = First (Ddl_of 0);
          wire = Plain;
-         cuts = [ { connection = 0; after = 0; breaking = Truncated } ];
-         control = Some (4, Truncated);
+         cuts = [ { connection = 0; after = 1; breaking = Truncated } ];
+         control = Some (5, Truncated);
          place = Into_first;
          adjustments = [ Open 1 ];
          compression = Fixed Plain;
@@ -1053,6 +1090,7 @@ let tests =
          refused_downstream;
          resumed_through_relays;
          replaced_when_silent;
+         replaced_before_attach;
          resumed_after_heartbeats;
          refused_while_cut;
        ]

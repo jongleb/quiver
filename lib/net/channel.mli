@@ -42,6 +42,25 @@ val accept : listener -> Protection.t -> (t, [> `Channel of error ]) result
   @@ portable
 (** Waits for the next connection; [Closed] once the listener is stopped. *)
 
+type arrival : value mod contended portable
+(** A connection accepted, before any byte of it is read. *)
+
+val arrive : listener -> (arrival, [> `Channel of error ]) result @@ portable
+(** Waits for the next connection; [Closed] once the listener is stopped. *)
+
+val introduced :
+  arrival ->
+  Protection.t ->
+  within:Core.Time_ns.Span.t ->
+  (Sexplib0.Sexp.t -> 'a) ->
+  (t * 'a, [> `Channel of error | `Frame of Frame.error ]) result
+  @@ portable
+(** Its handshake and its first frame, a message decoding as given, both
+    within so long; a connection that fails is closed. *)
+
+val release : arrival -> unit @@ portable
+(** Closes it unread. *)
+
 val stop : listener -> unit @@ portable
 
 val all :

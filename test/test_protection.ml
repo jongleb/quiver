@@ -101,7 +101,7 @@ let exchange =
         Support.both
           (fun () ->
             let socket, _ = Unix.accept listening in
-            match Quiver_net.Protection.accepted (protection server) socket with
+            match Quiver_net.Protection.accepted (protection server) socket Unlimited with
             | Error _ -> `Refused
             | Ok flow -> (
                 Quiver_net.Protection.rekey_after flow rekey_bytes;
@@ -178,7 +178,7 @@ let mismatched =
     let outcome =
       Support.within mismatch_seconds @@ fun () ->
       Support.both
-        (fun () -> Result.is_ok (Quiver_net.Collector.accept listening collector ~reconnect:Support.reconnect))
+        (fun () -> Result.is_ok (Quiver_net.Collector.accept listening collector ~reconnect:Support.reconnect ~introduction:Support.introduction))
         (fun () ->
           Result.is_ok
             (Quiver_net.Remote.create agent
@@ -359,6 +359,65 @@ let stopped =
         "connections taken by a stopped listener" 0
         (Base.List.count taken ~f:(fun round -> round = `Taken)))
 
+let introduced =
+  List.map
+    (fun (name, protection) ->
+      Alcotest.test_case
+        ("a connection has its time to say what it is, and no limit after, "
+       ^ name)
+        `Quick (fun () ->
+          let protection = protection () in
+          let within = Core.Time_ns.Span.of_sec 0.3 in
+          let listener = Result.get_ok (Quiver_net.Channel.listen Support.loopback) in
+          let peer =
+            {
+              Quiver_net.Channel.host = "127.0.0.1";
+              address = Quiver_net.Channel.listening_address listener;
+            }
+          in
+          let introduce () =
+            Result.bind (Quiver_net.Channel.arrive listener) (fun arrival ->
+                Quiver_net.Channel.introduced arrival protection ~within Fun.id)
+          in
+          let silent = Unix.socket PF_INET SOCK_STREAM 0 in
+          Unix.connect silent peer.address;
+          let deadline_seconds = 2. in
+          let unheard = Support.within deadline_seconds introduce in
+          Unix.close silent;
+          let talking =
+            Support.start (fun () ->
+                let channel =
+                  Result.get_ok (Quiver_net.Channel.connect protection peer)
+                in
+                ignore (Quiver_net.Channel.send channel (Atom "first"));
+                Thread.delay 0.8;
+                ignore (Quiver_net.Channel.send channel (Atom "later"));
+                channel)
+          in
+          let heard =
+            Support.within deadline_seconds (fun () ->
+                Result.bind (introduce ()) (fun (channel, first) ->
+                    Result.map
+                      (fun later -> (channel, [ first; later ]))
+                      (Quiver_net.Channel.receive channel Fun.id)))
+          in
+          Quiver_net.Channel.close (Support.join talking);
+          Quiver_net.Channel.stop listener;
+          Alcotest.(check bool)
+            "the silent one is closed in time" true
+            (match unheard with Ok (Error _) -> true | Ok (Ok _) | Error `Timeout -> false);
+          Alcotest.(check bool)
+            "the other is heard before and after the limit" true
+            (match heard with
+            | Ok (Ok (channel, said)) ->
+                Quiver_net.Channel.close channel;
+                said = [ Atom "first"; Atom "later" ]
+            | Ok (Error _) | Error `Timeout -> false)))
+    [
+      ("in plaintext", fun () -> Quiver_net.Protection.plaintext);
+      ("under TLS", fun () -> Support.protection ~node:"node" ~peers:"ca");
+    ]
+
 let tests =
-  stopped :: trusted :: mismatched
+  stopped :: trusted :: mismatched @ introduced
   @ List.map QCheck_alcotest.to_alcotest [ exchange; spliced ]

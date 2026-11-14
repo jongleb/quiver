@@ -27,9 +27,18 @@ type flow : value mod contended portable
 (** A connected socket, plain or under TLS, blocking its reader and writer; one
     thread may read while another writes. *)
 
+(** How long a flow's reads and writes may wait for the socket. *)
+type patience =
+  | Unlimited
+  | Within of Core.Time_ns.Span.t  (** In all, from now on: the handshake too. *)
+
 val accepted :
-  t -> Unix.file_descr -> (flow, [> `Protection of error ]) result @@ portable
+  t -> Unix.file_descr -> patience -> (flow, [> `Protection of error ]) result
+  @@ portable
 (** The listening side: the peer must present a trusted certificate. *)
+
+val settle : flow -> unit @@ portable
+(** Its reads and writes wait as long as the socket makes them, from now on. *)
 
 val connected :
   t -> host:string -> Unix.file_descr -> (flow, [> `Protection of error ]) result

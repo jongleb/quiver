@@ -132,6 +132,7 @@ let finished part =
     }
 
 let reconnect = Core.Time_ns.Span.of_sec 0.5
+let introduction = Core.Time_ns.Span.of_sec 1.
 
 let settings ?(compression =
     Quiver_net.Remote.Fixed

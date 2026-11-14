@@ -212,6 +212,7 @@ let hostile_agent =
                  match
                    Quiver_net.Collector.accept listening
                      Quiver_net.Protection.plaintext ~reconnect:Support.reconnect
+                     ~introduction:Support.introduction
                  with
                  | Error _ -> ()
                  | Ok session -> ignore (Collecting.run listening session () ~columns:Written)
@@ -483,7 +484,7 @@ let vanishing_hop =
         and node =
           Support.start (fun () ->
               match Quiver_net.Collector.accept collecting plaintext
-                      ~reconnect:Support.reconnect with
+                      ~reconnect:Support.reconnect ~introduction:Support.introduction with
               | Error _ -> `Unaccepted
               | Ok session -> (
                   match Quiver_net.Collector.forward (peer next) session with

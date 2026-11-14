@@ -18,14 +18,15 @@ type session = {
   protection : Protection.t;
   reconnect : Core.Time_ns.Span.t;
       (** How long the agent may take to replace a broken control connection. *)
+  introduction : Core.Time_ns.Span.t;
+      (** How long a connection accepted may take to say what it is. *)
 }
 
 type downstream = {
   control : Channel.t;
-  data : Channel.t list;
   format : Quiver_core.Output_format.t;
   columns : Message.columns;  (** What the next hop takes. *)
-  peer : Channel.peer;  (** Where data connections that replace broken ones go. *)
+  peer : Channel.peer;  (** Where a data connection goes for each that arrives. *)
 }
 
 let failed result =
@@ -41,17 +42,19 @@ let unexpected reply =
   out_of_place
     ("a reply " ^ Sexplib0.Sexp.to_string (Message.sexp_of_reply reply))
 
-let accept listening protection ~reconnect =
-  let%bind control = failed (Channel.accept listening protection) in
+let accept listening protection ~reconnect ~introduction =
+  let%bind arrival = failed (Channel.arrive listening) in
+  let%bind control, hello =
+    failed
+      (Channel.introduced arrival protection ~within:introduction
+         Message.control_of_sexp)
+  in
   let greeted =
-    let%bind hello =
-      failed (Channel.receive control Message.control_of_sexp)
-    in
     match hello with
     | Hello { byte_order; _ } when byte_order <> Message.byte_order ->
         Error (`Collector (Foreign_byte_order byte_order))
     | Hello { session; streams; chunks; _ } ->
-        Ok { control; id = session; streams; chunks; protection; reconnect }
+        Ok { control; id = session; streams; chunks; protection; reconnect; introduction }
     | Database _ | Table _ | Grown _ | Accepts _ | Objects _ | Begin _ | End _ | Abort _ | Finish _
     | Heartbeat _ | Leave ->
         out_of_place "before hello"
@@ -61,48 +64,9 @@ let accept listening protection ~reconnect =
 
 let chunks (session : session) = session.chunks
 
-(** How accepting one data connection ended. *)
-type attachment : value mod contended portable =
-  | Attached of Channel.t
-  | Broke  (** Before its attach arrived: the agent replaces it and sends its frames again. *)
-  | Failed of error
-
-let attached listening (session : session) =
-  let protection = session.protection and id = session.id in
-  let tried =
-    Quiver_core.Concurrent.each session.streams (fun (_ : int) ->
-        match Channel.accept listening protection with
-        | Error (`Channel error) -> Failed (Lost error)
-        | Ok channel -> (
-            match Channel.receive channel Message.attach_of_sexp with
-            | Ok (Data { session }) when String.equal session id ->
-                Attached channel
-            | Ok (Data _ | Control _) ->
-                Channel.close channel;
-                Failed (Out_of_place "a data connection of another session")
-            | Error (`Channel _ | `Frame _) ->
-                Channel.close channel;
-                Broke))
-  in
-  let channels =
-    List.filter_map
-      (function Attached channel -> Some channel | Failed _ | Broke -> None)
-      tried
-  in
-  match
-    List.find_map
-      (function Failed error -> Some error | Attached _ | Broke -> None)
-      tried
-  with
-  | None -> Ok channels
-  | Some error ->
-      List.iter Channel.close channels;
-      Error (`Collector error)
-
 let forward peer (session : session) =
   let (forwarded : (downstream, [ `Collector of error ]) result) =
-  let connect () = failed (Channel.connect session.protection peer) in
-  let%bind control = connect () in
+  let%bind control = failed (Channel.connect session.protection peer) in
   let greeted =
   let%bind () =
     failed
@@ -117,30 +81,13 @@ let forward peer (session : session) =
                })))
   in
   let%bind ready = failed (Channel.receive control Message.reply_of_sexp) in
-  let%bind format, columns =
+  let%map format, columns =
     match ready with
     | Ready { format; columns } -> Ok (format, columns)
     | Refused message | Failed message -> Error (`Collector (Downstream message))
     | Done | Skipped | Committed _ | Rejected _ | Heard _ -> unexpected ready
   in
-  let%map data =
-    let protection = session.protection and id = session.id in
-    Result.map_error
-      (fun error -> `Collector error)
-      (Channel.all session.streams ~close:Channel.close (fun () ->
-               match Channel.connect protection peer with
-               | Error (`Channel error) -> Error (Lost error)
-               | Ok channel -> (
-                   match
-                     Channel.send channel
-                       (Message.sexp_of_attach (Data { session = id }))
-                   with
-                   | Ok () -> Ok channel
-                   | Error (`Channel error) ->
-                       Channel.close channel;
-                       Error (Lost error))))
-  in
-  { control; data; format; columns; peer }
+  { control; format; columns; peer }
   in
   Result.iter_error (fun _ -> Channel.close control) greeted;
   greeted
@@ -157,15 +104,6 @@ let forward peer (session : session) =
       Channel.close session.control;
       Error (`Collector error)
 
-let attaching (session : session) channel =
-  match Channel.receive channel Message.attach_of_sexp with
-  | Ok ((Data { session = id } | Control { session = id; _ }) as attach)
-    when String.equal id session.id ->
-      Some (channel, attach)
-  | Ok (Data _ | Control _) | Error (`Channel _ | `Frame _) ->
-      Channel.close channel;
-      None
-
 let reaching (session : session) (downstream : downstream) attach =
   match Channel.connect session.protection downstream.peer with
   | Error (`Channel _) -> None
@@ -177,21 +115,34 @@ let reaching (session : session) (downstream : downstream) attach =
           None)
 
 let accepting listening (session : session) take =
+  let attaching arrival =
+    match
+      Channel.introduced arrival session.protection ~within:session.introduction
+        Message.attach_of_sexp
+    with
+    | Ok (channel, ((Data { session = id } | Control { session = id; _ }) as attach))
+      when String.equal id session.id ->
+        Some (channel, attach)
+    | Ok (channel, (Data _ | Control _)) ->
+        Channel.close channel;
+        None
+    | Error (`Channel _ | `Frame _) -> None
+  in
   let rec go taken =
-    match Channel.accept listening session.protection with
+    match Channel.arrive listening with
     | Error (`Channel Channel.Closed) -> taken
     | Error (`Channel _) ->
         let pause = 0.01 in
         Unix.sleepf pause;
         go taken
-    | Ok channel -> (
+    | Ok arrival -> (
         match
           Quiver_core.Concurrent.start (fun () ->
-              Option.iter take (attaching session channel))
+              Option.iter take (attaching arrival))
         with
         | Ok task -> go (task :: taken)
         | Error (`Concurrent _) ->
-            Channel.close channel;
+            Channel.release arrival;
             go taken)
   in
   List.iter Quiver_core.Concurrent.join (go [])
@@ -203,31 +154,27 @@ type pair = {
   ends : Channel.t list;  (** Both of its connections. *)
 }
 
+(** Whether the relay still pairs the connections that arrive. *)
+type course = Pairing | Ended
+
 type pairs = {
   mutable control : pair;  (** The latest. *)
   mutable opened : Channel.t list;
       (** Every pair's connections, closed only once the relay ends, so ending
           one never reaches a descriptor reused since. *)
+  mutable course : course;
 }
 
 let relay listening (session : session) (downstream : downstream) =
   match
-    let%bind () =
-      failed
-        (Channel.send session.control
-           (Message.sexp_of_reply (Ready { format = downstream.format; columns = downstream.columns })))
-    in
-    attached listening session
+    failed
+      (Channel.send session.control
+         (Message.sexp_of_reply (Ready { format = downstream.format; columns = downstream.columns })))
   with
   | Error _ as error ->
-      List.iter Channel.close
-        (session.control :: downstream.control :: downstream.data);
+      List.iter Channel.close [ session.control; downstream.control ];
       error
-  | Ok channels ->
-      let #(used, spare) =
-        Base.List.split_n downstream.data (List.length channels)
-      in
-      List.iter Channel.close spare;
+  | Ok () ->
       let (spliced @ portable) from into =
         Result.map_error (fun (`Channel error) -> error) (Channel.splice from into)
       in
@@ -289,10 +236,7 @@ let relay listening (session : session) (downstream : downstream) =
       in
       let pairs =
         Await.Capsule.Await.With_mutex.create (fun () ->
-            {
-              control = first;
-              opened = channels @ used @ first.ends;
-            })
+            { control = first; opened = first.ends; course = Pairing })
       in
       let (started @ portable) work =
         Result.to_option (Quiver_core.Concurrent.start work)
@@ -307,14 +251,13 @@ let relay listening (session : session) (downstream : downstream) =
       | None ->
           Await.Await.Ivar.fill_if_empty first.ended
             (Error (Channel.Io "no thread for the control connection")));
-      let tasks =
-        controlled
-        :: List.map2
-             (fun (from : Channel.t) (into : Channel.t) ->
-               started (fun () -> ignore (spliced from into)))
-             channels used
+      let (opening @ portable) pairs ends =
+        pairs.opened <- ends @ pairs.opened;
+        match pairs.course with
+        | Pairing -> ()
+        | Ended -> List.iter Channel.abort ends
       in
-      let late =
+      let arriving =
         started (fun () ->
             accepting listening session (fun (channel, attach) ->
                 match reaching session downstream attach with
@@ -323,8 +266,7 @@ let relay listening (session : session) (downstream : downstream) =
                     let ends = [ channel; next ] in
                     match attach with
                     | Data _ ->
-                        Quiver_core.Guarded.hold pairs (fun pairs ->
-                            pairs.opened <- ends @ pairs.opened);
+                        Quiver_core.Guarded.hold pairs (fun pairs -> opening pairs ends);
                         ignore (spliced channel next)
                     | Control _ ->
                         let ended = Await.Await.Ivar.create () in
@@ -332,7 +274,7 @@ let relay listening (session : session) (downstream : downstream) =
                             List.iter Channel.abort pairs.control.ends;
                             pairs.control <-
                               { number = pairs.control.number + 1; ended; ends };
-                            pairs.opened <- ends @ pairs.opened);
+                            opening pairs ends);
                         Await.Await.Ivar.fill_if_empty ended (steered channel next))))
       in
       let latest () = Quiver_core.Guarded.hold pairs (fun pairs -> pairs.control) in
@@ -356,9 +298,11 @@ let relay listening (session : session) (downstream : downstream) =
             replaced ()
       in
       let outcome = watch first in
-      Quiver_core.Guarded.hold pairs (fun pairs -> List.iter Channel.abort pairs.opened);
+      Quiver_core.Guarded.hold pairs (fun pairs ->
+          pairs.course <- Ended;
+          List.iter Channel.abort pairs.opened);
       Channel.stop listening;
-      List.iter (Option.iter Quiver_core.Concurrent.join) (late :: tasks);
+      List.iter (Option.iter Quiver_core.Concurrent.join) [ arriving; controlled ];
       Quiver_core.Guarded.hold pairs (fun pairs ->
           List.iter Channel.close pairs.opened);
       failed (Result.map_error (fun error -> `Channel error) outcome)
@@ -384,8 +328,8 @@ module Make (S : Quiver_core.Sink_intf.S) = struct
   }
   (** What the threads serving connections know of a chunk. *)
 
-  type late = { mutable handles : Channel.handle list }
-  (** Data connections that replaced broken ones, to end at a failure. *)
+  type attached = { mutable handles : Channel.handle list }
+  (** Data connections taken, to end at a failure or once the session is over. *)
 
   (** Where a chunk's batches go. *)
   type arrival =
@@ -555,51 +499,30 @@ module Make (S : Quiver_core.Sink_intf.S) = struct
                    : (unit, [ `Channel of Channel.error ]) result)))
     in
     match
-      let%bind () =
-        failed
-          (Channel.send session.control
-             (Message.sexp_of_reply
-                (Ready
-                   {
-                     format = S.format sink;
-                     columns =
-                       Option.fold forward ~none:columns ~some:(fun (downstream : downstream) ->
-                           match ((columns : Message.columns), downstream.columns) with
-                           | Written, Written -> Written
-                           | Stored_too, _ | _, Stored_too -> Stored_too);
-                   })))
-      in
-      attached listening session
+      failed
+        (Channel.send session.control
+           (Message.sexp_of_reply
+              (Ready
+                 {
+                   format = S.format sink;
+                   columns =
+                     Option.fold forward ~none:columns ~some:(fun (downstream : downstream) ->
+                         match ((columns : Message.columns), downstream.columns) with
+                         | Written, Written -> Written
+                         | Stored_too, _ | _, Stored_too -> Stored_too);
+                 })))
     with
     | Error _ as error ->
         Channel.close session.control;
-        Option.iter
-          (fun (downstream : downstream) ->
-            List.iter Channel.close (downstream.control :: downstream.data))
-          forward;
+        Option.iter (fun (downstream : downstream) -> Channel.close downstream.control) forward;
         error
-    | Ok channels ->
-    let forward =
-      Option.map
-        (fun (downstream : downstream) ->
-          let #(used, spare) =
-            Base.List.split_n downstream.data (List.length channels)
-          in
-          List.iter Channel.close spare;
-          { downstream with data = used })
+    | Ok () ->
+    let handles =
+      Option.fold ~none:[]
+        ~some:(fun (downstream : downstream) -> [ Channel.handle downstream.control ])
         forward
     in
-    let handles =
-      List.map Channel.handle
-        (Option.fold ~none:[]
-              ~some:(fun (downstream : downstream) -> [ downstream.control ])
-              forward
-        @ channels
-        @ Option.fold ~none:[]
-            ~some:(fun (downstream : downstream) -> downstream.data)
-            forward)
-    in
-    let late =
+    let attached =
       Await.Capsule.Await.With_mutex.create (fun () -> { handles = [] })
     in
     let report = function
@@ -614,7 +537,7 @@ module Make (S : Quiver_core.Sink_intf.S) = struct
               ignore (pass Leave);
               Channel.stop listening;
               List.iter Channel.sever
-                (Quiver_core.Guarded.hold late (fun { handles } -> handles));
+                (Quiver_core.Guarded.hold attached (fun { handles } -> handles));
               Registry.close lanes;
               Registry.close passed;
               Quiver_core.Mailbox.close verdicts;
@@ -1105,18 +1028,8 @@ module Make (S : Quiver_core.Sink_intf.S) = struct
           ~some:(fun (downstream : downstream) ->
             [ launch (fun () -> listen_downstream downstream) ~unstarted:ignore ])
           forward
-    and data_threads =
-      List.mapi
-          (fun index (channel : Channel.t) ->
-            let next =
-              Option.map
-                (fun ({ data; _ } : downstream) -> List.nth data index)
-                forward
-            in
-            launch (fun () -> report (serve channel next)) ~unstarted:ignore)
-          channels
     in
-    let replacing =
+    let arriving =
       launch
         (fun () ->
           accepting listening session (fun (channel, attach) ->
@@ -1145,11 +1058,11 @@ module Make (S : Quiver_core.Sink_intf.S) = struct
                     List.map Channel.handle
                       (channel :: Option.to_list next)
                   in
-                  Quiver_core.Guarded.hold late (fun late ->
-                      late.handles <- held @ late.handles);
-                  (match Atomic.get first_failure with
-                  | Some _ -> List.iter Channel.sever held
-                  | None -> ());
+                  Quiver_core.Guarded.hold attached (fun attached ->
+                      attached.handles <- held @ attached.handles);
+                  (match Portable.Atomic.get life with
+                  | Over -> List.iter Channel.sever held
+                  | Live -> ());
                   report (serve channel next)))
         ~unstarted:ignore
     in
@@ -1185,11 +1098,9 @@ module Make (S : Quiver_core.Sink_intf.S) = struct
       (Await.Await.Ivar.read Quiver_core.Blocking.await finishing);
     List.iter (Option.iter Quiver_core.Concurrent.join) steering_threads;
     List.iter Channel.sever
-      (List.map Channel.handle channels
-      @ Quiver_core.Guarded.hold late (fun late -> late.handles));
-    List.iter (Option.iter Quiver_core.Concurrent.join) data_threads;
+      (Quiver_core.Guarded.hold attached (fun attached -> attached.handles));
     Channel.stop listening;
-    Option.iter Quiver_core.Concurrent.join replacing;
+    Option.iter Quiver_core.Concurrent.join arriving;
     let outcome =
       Option.fold ~none:(Ok ()) ~some:Result.error (Atomic.get first_failure)
     in

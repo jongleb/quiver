@@ -264,11 +264,6 @@ let scenario =
                 | Silent when silent >= streams -> Reset
                 | Truncated | Damaged | Reset | Silent -> breaking
               in
-              let after =
-                match breaking with
-                | Silent -> Int.max 1 after
-                | Truncated | Damaged | Reset -> after
-              in
               { connection; after; breaking })
             broken
     and* control =
@@ -535,6 +530,7 @@ let property
     Support.start (fun () ->
           (let%bind session =
              Quiver_net.Collector.accept socket protection ~reconnect
+               ~introduction:Support.introduction
            in
            let%bind forward =
              match next with
@@ -555,7 +551,7 @@ let property
         ignore
           (let%bind session =
              Quiver_net.Collector.accept socket protection
-               ~reconnect:Support.reconnect
+               ~reconnect:Support.reconnect ~introduction:Support.introduction
            in
            let%bind downstream =
              Quiver_net.Collector.forward next session
@@ -922,7 +918,8 @@ let unreachable_next =
       let head = Result.get_ok (Quiver_net.Channel.listen Support.loopback) in
       Support.spawn (fun () ->
           ignore
-            (Result.bind (Quiver_net.Collector.accept head plaintext ~reconnect:Support.reconnect)
+            (Result.bind (Quiver_net.Collector.accept head plaintext ~reconnect:Support.reconnect
+                 ~introduction:Support.introduction)
                (Quiver_net.Collector.forward nowhere)));
       let refusal_seconds = 2. in
       let created =
@@ -1032,6 +1029,55 @@ let replaced_before_attach =
        (QCheck2.Gen.oneof_list [ Truncated; Damaged; Reset ]))
     property
 
+let silent_before_attach =
+  QCheck2.Test.make ~count:6
+    ~name:
+      "a first data connection that never says what it is is closed in time, \
+       and the session goes on"
+    ~print
+    (QCheck2.Gen.map
+       (fun topology ->
+         {
+           tables = [ [ ([ 3; 4 ], Kept); ([ 5 ], Kept) ]; [ ([ 2; 2 ], Kept) ] ];
+           streams = 2;
+           chunks = 2;
+           readers = 2;
+           topology;
+           refusal = Nobody;
+           wire = Plain;
+           cuts = [ { connection = 0; after = 0; breaking = Silent } ];
+           control = None;
+           place = Into_first;
+           adjustments = [];
+           compression = Fixed Plain;
+           linger = 0.;
+           columns = (Written, Written);
+         })
+       (QCheck2.Gen.oneof_list [ Direct; Relayed 1; Chained ]))
+    property
+
+let silent_first =
+  Alcotest.test_case
+    "a collector whose first connection never says hello fails in time instead \
+     of waiting forever"
+    `Quick (fun () ->
+      let listener = Result.get_ok (Quiver_net.Channel.listen Support.loopback) in
+      let stray = Unix.socket PF_INET SOCK_STREAM 0 in
+      Unix.connect stray (Quiver_net.Channel.listening_address listener);
+      let refusal_seconds = 3. in
+      let accepted =
+        Support.within refusal_seconds (fun () ->
+            Quiver_net.Collector.accept listener Quiver_net.Protection.plaintext
+              ~reconnect:Support.reconnect ~introduction:Support.introduction)
+      in
+      Unix.close stray;
+      Quiver_net.Channel.stop listener;
+      Alcotest.(check bool)
+        "refused before the deadline" true
+        (match accepted with
+        | Ok (Error _) -> true
+        | Ok (Ok _) | Error `Timeout -> false))
+
 let resumed_after_heartbeats =
   QCheck2.Test.make ~count:5
     ~name:
@@ -1083,7 +1129,7 @@ let refused_while_cut =
     property
 
 let tests =
-  unreachable_next
+  unreachable_next :: silent_first
   :: List.map QCheck_alcotest.to_alcotest
        [
          session;
@@ -1091,6 +1137,7 @@ let tests =
          resumed_through_relays;
          replaced_when_silent;
          replaced_before_attach;
+         silent_before_attach;
          resumed_after_heartbeats;
          refused_while_cut;
        ]

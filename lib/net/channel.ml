@@ -117,7 +117,9 @@ let listening_address listener = Unix.getsockname listener.socket
 let release socket =
   match Unix.close socket with () -> () | exception Unix.Unix_error _ -> ()
 
-let accept listener protection =
+type arrival = Unix.file_descr
+
+let arrive listener =
   let socket = listener.socket in
   let rec go () =
     match
@@ -161,7 +163,7 @@ let accept listener protection =
               Unix.clear_nonblock fd;
               Quiver_core.Tcp.tune fd
             with
-            | () -> of_flow (Protection.accepted protection fd)
+            | () -> Ok fd
             | exception Unix.Unix_error (error, _, _) ->
                 release fd;
                 io (Unix.error_message error))
@@ -408,3 +410,17 @@ let sever fd =
 let finish t = Protection.shutdown t.flow
 let abort t = Protection.abort t.flow
 let close t = Protection.close t.flow
+
+let accept listener protection =
+  let%bind fd = arrive listener in
+  of_flow (Protection.accepted protection fd Unlimited)
+
+let introduced fd protection ~within decode =
+  let%bind t = of_flow (Protection.accepted protection fd (Within within)) in
+  match receive t decode with
+  | Ok value ->
+      Protection.settle t.flow;
+      Ok (t, value)
+  | Error _ as error ->
+      close t;
+      error

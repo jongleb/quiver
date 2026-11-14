@@ -32,15 +32,47 @@ type channel : value mod contended portable =
 (** Whether this side told the peer it sends nothing more. *)
 type notice = Unsent | Sent
 
-type flow = { fd : Unix.file_descr; channel : channel; notice : notice Atomic.t }
+(** How long reads and writes may wait for the socket. *)
+type patience =
+  | Unlimited
+  | Within of Core.Time_ns.Span.t
+
+(** Until when this flow's reads and writes may wait. *)
+type limit =
+  | Unbounded
+  | Until of { since : Quiver_core.Stopwatch.t; within : Core.Time_ns.Span.t }
+
+type flow = {
+  fd : Unix.file_descr;
+  channel : channel;
+  notice : notice Atomic.t;
+  limit : limit Atomic.t;
+}
+
+let flowing fd channel limit =
+  Unix.set_nonblock fd;
+  { fd; channel; notice = Atomic.make Unsent; limit = Atomic.make limit }
 
 let closed = "the connection closed without TLS close_notify"
 
-let secure fd session ~start =
+let secure fd session ~start limit =
+  let bounded seconds =
+    match
+      Unix.setsockopt_float fd SO_RCVTIMEO seconds;
+      Unix.setsockopt_float fd SO_SNDTIMEO seconds
+    with
+    | () -> ()
+    | exception Unix.Unix_error _ -> ()
+  in
+  let () =
+    match limit with
+    | Unbounded -> ()
+    | Until { within; _ } -> bounded (Core.Time_ns.Span.to_sec within)
+  in
   match start session with
   | Quiver_openssl.Tls.Done () ->
-      Unix.set_nonblock fd;
-      Ok { fd; channel = Secure session; notice = Atomic.make Unsent }
+      bounded 0.;
+      Ok (flowing fd (Secure session) limit)
   | (Want_read | Want_write | Closed | Lost | Failed _) as failed -> (
       Unix.close fd;
       match Quiver_openssl.Tls.verified session with
@@ -53,21 +85,22 @@ let secure fd session ~start =
                   | Failed reason -> reason
                   | Done () | Want_read | Want_write | Closed | Lost -> closed))))
 
-let accepted t fd =
+let accepted t fd patience =
+  let limit =
+    match patience with
+    | Unlimited -> Unbounded
+    | Within within -> Until { since = Quiver_core.Stopwatch.start (); within }
+  in
   match t with
-  | Plaintext ->
-      Unix.set_nonblock fd;
-      Ok { fd; channel = Plain; notice = Atomic.make Unsent }
+  | Plaintext -> Ok (flowing fd Plain limit)
   | Mutual context -> (
       match Quiver_openssl.Tls.session context fd with
       | Error reason -> Error (`Protection (Handshake reason))
-      | Ok session -> secure fd session ~start:Quiver_openssl.Tls.accept)
+      | Ok session -> secure fd session ~start:Quiver_openssl.Tls.accept limit)
 
 let connected t ~host fd =
   match t with
-  | Plaintext ->
-      Unix.set_nonblock fd;
-      Ok { fd; channel = Plain; notice = Atomic.make Unsent }
+  | Plaintext -> Ok (flowing fd Plain Unbounded)
   | Mutual context -> (
       let expectation : Quiver_openssl.Tls.expectation =
         match Quiver_openssl.Tls.naming host with Ip_address -> Ip | Host_name -> Host
@@ -77,40 +110,60 @@ let connected t ~host fd =
             Result.map (fun () -> session) (Quiver_openssl.Tls.expect session expectation host))
       with
       | Error reason -> Error (`Protection (Handshake reason))
-      | Ok session -> secure fd session ~start:Quiver_openssl.Tls.connect)
+      | Ok session -> secure fd session ~start:Quiver_openssl.Tls.connect Unbounded)
 
 (** How a call into OpenSSL ended once the socket stopped making it wait. *)
 type 'a settled = Settled of 'a | Ended | Broken of string
 
-let rec settled fd attempt =
+let silent = "the peer sent nothing in the time it had"
+
+let waited flow direction =
+  match Atomic.get flow.limit with
+  | Unbounded ->
+      ignore (Quiver_core.Blocking.wait direction flow.fd);
+      `Waited
+  | Until { since; within } -> (
+      match Core.Time_ns.Span.(within - Quiver_core.Stopwatch.elapsed since) with
+      | left when Core.Time_ns.Span.(left <= zero) -> `Out_of_time
+      | left ->
+          ignore
+            (Quiver_core.Blocking.wait ~seconds:(Core.Time_ns.Span.to_sec left)
+               direction flow.fd);
+          `Waited)
+
+let rec settled flow attempt =
+  let after direction =
+    match waited flow direction with
+    | `Waited -> settled flow attempt
+    | `Out_of_time -> Broken silent
+  in
   match attempt () with
   | Quiver_openssl.Tls.Done value -> Settled value
   | Closed | Lost -> Ended
   | Failed reason -> Broken reason
-  | Want_read ->
-      ignore (Quiver_core.Blocking.wait Readable fd);
-      settled fd attempt
-  | Want_write ->
-      ignore (Quiver_core.Blocking.wait Writable fd);
-      settled fd attempt
+  | Want_read -> after Readable
+  | Want_write -> after Writable
 
-let rec plain fd direction attempt =
+let rec plain flow direction attempt =
   match attempt () with
   | count -> Ok count
-  | exception Unix.Unix_error ((EAGAIN | EWOULDBLOCK), _, _) ->
-      ignore (Quiver_core.Blocking.wait direction fd);
-      plain fd direction attempt
-  | exception Unix.Unix_error (EINTR, _, _) -> plain fd direction attempt
+  | exception Unix.Unix_error ((EAGAIN | EWOULDBLOCK), _, _) -> (
+      match waited flow direction with
+      | `Waited -> plain flow direction attempt
+      | `Out_of_time -> Error silent)
+  | exception Unix.Unix_error (EINTR, _, _) -> plain flow direction attempt
   | exception Unix.Unix_error (error, _, _) -> Error (Unix.error_message error)
+
+let settle flow = Atomic.set flow.limit Unbounded
 
 let read flow bytes off len =
   match flow.channel with
   | Plain ->
-      plain flow.fd Readable (fun () ->
+      plain flow Readable (fun () ->
           Core_unix.read_assume_fd_is_nonblocking flow.fd ~pos:off ~len bytes)
   | Secure session -> (
       match
-        settled flow.fd (fun () ->
+        settled flow (fun () ->
             Quiver_openssl.Tls.read_nonblocking session bytes ~pos:off ~len)
       with
       | Settled count -> Ok count
@@ -124,7 +177,7 @@ let write flow text off len =
       match flow.channel with
       | Plain -> (
           match
-            plain flow.fd Writable (fun () ->
+            plain flow Writable (fun () ->
                 Core_unix.write_assume_fd_is_nonblocking flow.fd ~pos:off ~len
                   (Bytes.unsafe_of_string text))
           with
@@ -132,7 +185,7 @@ let write flow text off len =
           | Error _ as error -> error)
       | Secure session -> (
           match
-            settled flow.fd (fun () ->
+            settled flow (fun () ->
                 Quiver_openssl.Tls.write_nonblocking session text ~pos:off ~len)
           with
           | Settled count -> go (off + count) (len - count)
@@ -152,7 +205,7 @@ let shutdown flow =
           | exception Unix.Unix_error _ -> ())
       | Secure session ->
           ignore
-            (settled flow.fd (fun () -> Quiver_openssl.Tls.shutdown session)))
+            (settled flow (fun () -> Quiver_openssl.Tls.shutdown session)))
 
 let descriptor flow = flow.fd
 

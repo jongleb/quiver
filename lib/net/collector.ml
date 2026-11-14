@@ -475,8 +475,9 @@ module Make (S : Quiver_core.Sink_intf.S) = struct
           say reply;
           answerer ()
       | Some (`Settle settled) ->
-          let%bind passed = passed () in
-          Await.Await.Ivar.fill_if_empty settled passed;
+          let passed = passed () in
+          Await.Await.Ivar.fill_if_empty settled (Result.value passed ~default:stopped);
+          let%bind (_ : passed) = passed in
           answerer ()
       | Some ((`Skipped | `Applied _) as verdict) ->
           let%bind passed = passed () in

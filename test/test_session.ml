@@ -1128,12 +1128,38 @@ let refused_while_cut =
        })
     property
 
+let failed_behind_finish =
+  QCheck2.Test.make ~count:20
+    ~name:
+      "the head of a chain whose last node failed while its finish waited on \
+       that node's answer fails too, and does not wait for ever"
+    ~print
+    (QCheck2.Gen.pure
+       {
+         tables = [ [ ([], Abandoned_after 0) ] ];
+         streams = 1;
+         chunks = 1;
+         readers = 1;
+         topology = Chained;
+         refusal = Last Objects;
+         wire = Plain;
+         cuts = [ { connection = 0; after = 0; breaking = Truncated } ];
+         control = None;
+         place = Into_last;
+         adjustments = [];
+         compression = Fixed Plain;
+         linger = 0.;
+         columns = (Written, Written);
+       })
+    property
+
 let tests =
   unreachable_next :: silent_first
   :: List.map QCheck_alcotest.to_alcotest
        [
          session;
          refused_downstream;
+         failed_behind_finish;
          resumed_through_relays;
          replaced_when_silent;
          replaced_before_attach;

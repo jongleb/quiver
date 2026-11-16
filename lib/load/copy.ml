@@ -285,24 +285,9 @@ let declare t { table = { name; _ } as table; ddl; parts; order; splits; declare
           let%bind () = execute link (Use into.database) in
           let%bind () = retried link create in
           let%bind () =
-            match (Quiver_mysql.Link.server link, splits) with
-            | Tidb_8_5 _, _ :: _ -> (
-                let clustering : Quiver_mysql.Query.t = Clustering into in
-                let%bind kept =
-                  rejected (Quiver_mysql.Query.sql clustering) (Quiver_mysql.Link.run_query link clustering)
-                in
-                match kept with
-                | [ [| Some "CLUSTERED" |] ] ->
-                    let%bind () = execute link Scatter_regions in
-                    Base.List.fold_result
-                      (Base.List.chunks_of splits ~length:1000)
-                      ~init:()
-                      ~f:(fun () -> function
-                        | first :: rest -> execute link (Split_table { table = into.table; at = (first, rest) })
-                        | [] -> Ok ())
-                | _ -> Ok ())
-            | (Mysql_8_0 _ | Mysql_8_4 _ | Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _ | Tidb_8_5 _), _ ->
-                Ok ()
+            match Load.split link into splits with
+            | Ok () -> Ok ()
+            | Error (statement, cause) -> rejected statement (Error cause)
           in
           match (later, parts) with
           | first :: rest, 0 ->

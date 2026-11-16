@@ -817,8 +817,11 @@ into_tidb() {
   "$quiver" copy --tls disabled -P "$source_port" -p quiver -B into_tidb -t 4 --to-tls disabled --to-port "$port" \
     > "$dir.copy.log" 2>&1 || fail "copy: $(cat "$dir.copy.log")"
   same "copy"
+  regions() { ti -N -e "SHOW TABLE into_tidb.keyed REGIONS" | wc -l; }
+  [ "$(regions)" -gt 1 ] || fail "copy: keyed was left in one region"
   "$quiver" dump --tls disabled -P "$source_port" -p quiver -B into_tidb -t 4 -o "$dir" > "$dir.log" 2>&1 \
     || fail "dump: $(cat "$dir.log")"
+  [ "$(ls "$dir"/into_tidb.keyed.*.sql | wc -l)" -gt 1 ] || fail "keyed was dumped in one part"
   for dialect in rfc4180 mysql-load-data; do
     "$quiver" dump --tls disabled -P "$source_port" -p quiver -B into_tidb -t 4 --format csv --csv-dialect "$dialect" \
       -o "$dir-$dialect" > "$dir-$dialect.log" 2>&1 || fail "dump csv: $(cat "$dir-$dialect.log")"
@@ -828,6 +831,7 @@ into_tidb() {
     "$quiver" load --tls disabled -P "$port" -u root -d "$files" -t 2 > "$files.load.log" 2>&1 \
       || fail "load: $(cat "$files.load.log")"
     same "load of $files"
+    [ "$(regions)" -gt 1 ] || fail "load of $files: keyed was left in one region"
   done
   ti -e "DROP DATABASE into_tidb"
   "$quiver" load --tls disabled -P "$port" -u root -d "$dir" -t 2 > "$dir.killed.log" 2>&1 &
@@ -855,7 +859,7 @@ into_tidb() {
   fi
   ti -e "DROP DATABASE into_tidb"
   my -e "DROP DATABASE into_tidb"
-  echo "$service: MySQL copied and loaded into TiDB in pieces, a killed load resumed, rows equal; sequences under another name"
+  echo "$service: MySQL copied and loaded into TiDB in pieces, split at the parts' first keys, a killed load resumed, rows equal; sequences under another name"
 }
 # MariaDB into TiDB: sakila, whose triggers and routines TiDB lacks, is refused before
 # anything is made; without objects and with MariaDB's utf8mb4_uca1400_ai_ci created as

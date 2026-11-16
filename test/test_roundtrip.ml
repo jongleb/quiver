@@ -512,7 +512,7 @@ let localized =
       | Ok json -> (
           match Quiver_core.Manifest.read json with
           | Error _ -> false
-          | Ok { format; tables = read; parts } ->
+          | Ok { format; tables = read; parts; splits = _ } ->
               let seen = Hashtbl.create 8 in
               format = Csv Rfc4180
               && List.equal Quiver_core.Schema.Name.equal read
@@ -529,6 +529,115 @@ let localized =
                      File_path.Part.equal got.file
                        (part name index ~mark:"here").file)
                    parts))
+
+let splits =
+  property ~count:500 "a manifest gives back where each table read by its primary key was cut"
+    ~print:(fun tables ->
+      String.concat "; "
+        (List.map
+           (fun (kind, bounds, masked) ->
+             Printf.sprintf "%s %s%s"
+               (match kind with `Primary -> "primary" | `Unique -> "unique" | `No_key -> "no key")
+               (String.concat "," (List.map Int64.to_string bounds))
+               (match masked with `Masked -> " masked" | `Plain -> ""))
+           tables))
+    QCheck2.Gen.(
+      list_size (int_range 1 4)
+        (triple
+           (oneof_list [ `Primary; `Unique; `No_key ])
+           (map (List.sort_uniq Int64.compare)
+              (list_size (int_range 0 5) (oneof [ int64; oneof_list [ 0L; Int64.min_int; Int64.max_int ] ])))
+           (oneof_list [ `Masked; `Plain ])))
+    (fun drawn ->
+      let id : Quiver_core.Schema.Field.t =
+        { name = Support.ident "id"; ltype = Int64; nullability = Not_null }
+      in
+      let tables =
+        List.mapi
+          (fun n (kind, bounds, masked) ->
+            let table =
+              Support.get_ok
+                (Quiver_core.Schema.Table.make ~generated:[]
+                   ~name:{ database = Support.ident "db"; table = Support.ident ("t" ^ string_of_int n) }
+                   ~fields:[ id ]
+                   ~key:
+                     (match kind with
+                     | `Primary -> Primary (id.name, [])
+                     | `Unique -> Unique { index = Support.ident "u"; fields = (id.name, []) }
+                     | `No_key -> No_key)
+                   ~estimate:{ rows = 0; bytes = 0 })
+            in
+            let chunks =
+              match kind with
+              | `No_key -> [ Quiver_core.Chunk.whole table ]
+              | `Primary | `Unique ->
+                  Support.get_ok
+                    (Quiver_core.Chunk.of_bounds table
+                       (List.map (fun bound -> [ Quiver_core.Key.Signed bound ]) bounds))
+            in
+            (table, kind, bounds, masked, chunks))
+          drawn
+      in
+      let manifest =
+        Quiver_core.Manifest.make ~level:(Any Snapshot) ~format:Sql ~position:`Null
+          ~threads:{ sessions = 1; readers = 1; peak = 1; renderers = 1 }
+          ~phases:
+            {
+              connected = Core.Time_ns.Span.zero;
+              planned = Core.Time_ns.Span.zero;
+              snapshot = Core.Time_ns.Span.zero;
+              first_part = None;
+              read = Core.Time_ns.Span.zero;
+              committed = Core.Time_ns.Span.zero;
+            }
+          ~schema:(Support.get_ok (Quiver_core.Schema.make (List.map (fun (table, _, _, _, _) -> table) tables)))
+          ~masked:
+            (List.filter_map
+               (fun ((table : Quiver_core.Schema.Table.t), _, _, masked, _) ->
+                 match masked with
+                 | `Masked -> Some { Quiver_core.Manifest.table = table.name; column = id.name; action = "permute" }
+                 | `Plain -> None)
+               tables)
+          (List.concat_map
+             (fun ((table : Quiver_core.Schema.Table.t), _, _, _, chunks) ->
+               List.mapi
+                 (fun index chunk ->
+                   ( chunk,
+                     Support.finished
+                       {
+                         Quiver_core.Manifest.file =
+                           File_path.Part.of_string (Printf.sprintf "%s.%d" (table.name.table :> string) index);
+                         rows = 0;
+                         bytes = 0;
+                         stored_bytes = 0;
+                         checksum = Xxh3_64 0L;
+                       } ))
+                 chunks)
+             tables)
+      in
+      let expected =
+        List.filter_map
+          (fun ((table : Quiver_core.Schema.Table.t), kind, bounds, masked, _) ->
+            match (kind, masked, bounds) with
+            | `Primary, `Plain, _ :: _ ->
+                Some
+                  ( table.name,
+                    List.map
+                      (fun bound -> Support.get_ok (Quiver_core.Key.make (id, []) [ Signed bound ]))
+                      bounds )
+            | `Primary, (`Plain | `Masked), _ | (`Unique | `No_key), _, _ -> None)
+          tables
+      in
+      match
+        Quiver_core.Manifest.read
+          (Yojson.Safe.from_string (Yojson.Safe.to_string (Quiver_core.Manifest.yojson_of_t manifest)))
+      with
+      | Error _ -> false
+      | Ok { splits; _ } ->
+          List.equal
+            (fun (name, keys) (name', keys') ->
+              Quiver_core.Schema.Name.equal name name' && List.equal Quiver_core.Key.equal keys keys')
+            splits expected)
 
 let calendar =
   property "dates convert to days and back as Ptime converts them"
@@ -602,6 +711,15 @@ let key_values =
     (fun value ->
       Quiver_core.Key.equal_value value
         (Quiver_core.Key.value_of_sexp (Parsexp.Single.parse_string_exn (Sexplib0.Sexp.to_string (Quiver_core.Key.sexp_of_value value)))))
+
+let key_values_json =
+  property ~count:2000 "a key value reads back from the text of its JSON as it was"
+    ~print:(fun value -> Yojson.Safe.to_string (Quiver_core.Key.yojson_of_value value))
+    key_value
+    (fun value ->
+      Quiver_core.Key.equal_value value
+        (Quiver_core.Key.value_of_yojson
+           (Yojson.Safe.from_string (Yojson.Safe.to_string (Quiver_core.Key.yojson_of_value value)))))
 
 let messages =
   property ~count:500
@@ -812,9 +930,11 @@ let tests =
   [
     messages;
     key_values;
+    key_values_json;
     unchecked_sexp;
     calendar;
     localized;
+    splits;
     table_json;
     unchecked_json;
     gtid ("MySQL 8.4", "8.4.11", mysql_gtid);

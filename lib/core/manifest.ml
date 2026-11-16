@@ -227,15 +227,18 @@ type written = { part : part }
 (** A chunk's state as stored. *)
 type stored = Pending | Done of written [@@deriving of_yojson]
 
-type chunk = { table : Schema.Name.t; state : stored }
+type bound = Key.value * Key.value list [@@deriving of_yojson]
+(** A boundary as stored, its values not yet checked against the key. *)
+
+(** A chunk's range as stored. *)
+type stored_range = Below of bound | Between of bound * bound | From of bound
+[@@deriving of_yojson]
+
+type chunk = { table : Schema.Name.t; range : stored_range option; [@default None] state : stored }
 [@@deriving of_yojson] [@@yojson.allow_extra_fields]
 (** A chunk as stored, read only as far as loading needs. *)
 
-type stored_table = { name : Schema.Name.t }
-[@@deriving of_yojson] [@@yojson.allow_extra_fields]
-(** A table as stored, read only for its name. *)
-
-type stored_schema = { tables : stored_table list }
+type stored_schema = { tables : Schema.Table.t list }
 [@@deriving of_yojson] [@@yojson.allow_extra_fields]
 
 type stored_manifest = {
@@ -250,22 +253,52 @@ type contents = {
   format : Output_format.t;
   tables : Schema.Name.t list;
   parts : (Schema.Name.t * part) list;
+  splits : (Schema.Name.t * Key.t list) list;
 }
 
 let read json =
   match Codec.decode stored_manifest_of_yojson json with
   | Error reason -> Error (`Manifest (Malformed reason))
   | Ok { format; schema = { tables }; chunks } ->
-      let%map parts =
+      let%bind parts =
         Base.Result.all
           (List.map
-             (fun { table; state } ->
+             (fun { table; state; _ } ->
                match state with
                | Done { part } -> Ok (table, part)
                | Pending -> Error (`Manifest (Unfinished table)))
              chunks)
       in
-      { format; tables = List.map (fun { name } -> name) tables; parts }
+      let%map splits =
+        Base.Result.all
+          (List.filter_map
+             (fun ({ name; key; _ } : Schema.Table.t) ->
+               match key with
+               | Primary fields -> (
+                   let starts =
+                     List.filter_map
+                       (fun { table; range; _ } ->
+                         match range with
+                         | Some (Between ((first, rest), _) | From (first, rest))
+                           when Schema.Name.equal table name ->
+                             Some (first :: rest)
+                         | Some (Below _ | Between _ | From _) | None -> None)
+                       chunks
+                   in
+                   match starts with
+                   | [] -> None
+                   | _ :: _ ->
+                       Some
+                         (Result.map
+                            (fun keys -> (name, keys))
+                            (Result.map_error
+                               (fun (`Key error) ->
+                                 `Manifest (Malformed (Sexplib0.Sexp.to_string (Key.sexp_of_error error))))
+                               (Base.Result.all (List.map (Key.make fields) starts)))))
+               | Unique _ | Indexed _ | Row_id _ | No_key -> None)
+             tables)
+      in
+      { format; tables = List.map (fun ({ name; _ } : Schema.Table.t) -> name) tables; parts; splits }
 
 let replace key value fields =
   List.map (fun (k, v) -> if String.equal k key then (k, value) else (k, v)) fields

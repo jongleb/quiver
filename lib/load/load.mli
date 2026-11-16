@@ -100,6 +100,16 @@ val sharing :
   @@ portable
 (** For a table in the target. *)
 
+val split :
+  Quiver_mysql.Link.t ->
+  Quiver_core.Schema.Name.t ->
+  Quiver_core.Key.t list ->
+  (unit, string * cause) result
+  @@ portable
+(** On a TiDB target, cuts a table clustered by its primary key into regions starting at these
+    keys, scattered over its stores, once the table is made and the session uses its database;
+    elsewhere nothing. A failure names the statement it ran. *)
+
 val advice : Quiver_mysql.Link.t -> binlog -> Quiver_core.Advice.t list @@ portable
 (** What the target's durability settings cost a load; none when it does not
     tell. *)

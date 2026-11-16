@@ -34,6 +34,25 @@ let yojson_of_value value =
   | Instant moment -> tagged "Instant" (`String (printed Temporal.moment moment))
   | Duration v -> tagged "Duration" (`Intlit (Int64.to_string v))
 
+let value_of_yojson json =
+  let wrong () = Ppx_yojson_conv_lib.Yojson_conv.of_yojson_error "a key value" json in
+  let parsed parse found = Base.Option.value_or_thunk ~default:wrong (Option.bind found parse)
+  and digits = function `Int v -> Some (Int.to_string v) | `Intlit v -> Some v | _ -> None
+  and text = function `String text -> Some text | _ -> None in
+  match json with
+  | `List [ `String "Signed"; v ] -> Signed (parsed Int64.of_string_opt (digits v))
+  | `List [ `String "Unsigned"; v ] ->
+      Unsigned (parsed (fun v -> Int64.of_string_opt ("0u" ^ v)) (digits v))
+  | `List [ `String "Text"; `String text ] -> Text text
+  | `List [ `String "Binary"; hex ] ->
+      Binary (parsed (fun hex -> Base.Option.try_with (fun () -> Hex_encode.from_hex hex)) (text hex))
+  | `List [ `String "Exact"; `String text ] -> Exact text
+  | `List [ `String "Day"; day ] ->
+      Day (parsed (fun day -> Base.Option.try_with (fun () -> Core.Date.of_string day)) (text day))
+  | `List [ `String "Instant"; moment ] -> Instant (parsed Temporal.parse_datetime (text moment))
+  | `List [ `String "Duration"; v ] -> Duration (parsed Int64.of_string_opt (digits v))
+  | _ -> wrong ()
+
 let text value =
   let cut text = if String.length text > 32 then String.sub text 0 32 ^ "…" else text in
   match value with

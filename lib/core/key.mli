@@ -25,6 +25,9 @@ val value_of_sexp : Sexplib0.Sexp.t -> value @@ portable
 
 val yojson_of_value : value -> Yojson.Safe.t
 
+val value_of_yojson : Yojson.Safe.t -> value
+(** Reads back what {!yojson_of_value} wrote; raises as derived converters do. *)
+
 type t = private value * value list [@@deriving sexp_of ~portable, equal ~portable, yojson_of]
 (** A boundary: one value per key field, in key order; its S-expression is for people. *)
 

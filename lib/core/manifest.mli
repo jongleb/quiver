@@ -122,6 +122,9 @@ type contents = {
   tables : Schema.Name.t list;
       (** Every table of the dump; one without parts was dumped without rows. *)
   parts : (Schema.Name.t * part) list;  (** Every chunk's part, in plan order. *)
+  splits : (Schema.Name.t * Key.t list) list;
+      (** Where tables read by their primary key were cut into parts: each part's first key, of the
+          parts that have one; a table cut nowhere is left out. *)
 }
 (** What loading needs from a manifest. *)
 

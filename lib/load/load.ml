@@ -107,6 +107,29 @@ let sharing link increments table =
         (function [] -> Together | _ :: _ -> One_at_a_time)
         (Quiver_mysql.Link.run_query link (Auto_increment table))
 
+let split link (table : Quiver_core.Schema.Name.t) keys =
+  let failed sql result = Result.map_error (fun (#cause as cause) -> (sql, cause)) result in
+  let run statement =
+    failed (Quiver_mysql.Statement.sql statement) (Quiver_mysql.Link.run_statement link statement)
+  in
+  match (Quiver_mysql.Link.server link, keys) with
+  | Tidb_8_5 _, _ :: _ -> (
+      let clustering : Quiver_mysql.Query.t = Clustering table in
+      let%bind kept =
+        failed (Quiver_mysql.Query.sql clustering) (Quiver_mysql.Link.run_query link clustering)
+      in
+      match kept with
+      | [ [| Some "CLUSTERED" |] ] ->
+          let%bind () = run Scatter_regions in
+          Base.List.fold_result
+            (Base.List.chunks_of keys ~length:1000)
+            ~init:()
+            ~f:(fun () -> function
+              | first :: rest -> run (Split_table { table = table.table; at = (first, rest) })
+              | [] -> Ok ())
+      | _ -> Ok ())
+  | (Mysql_8_0 _ | Mysql_8_4 _ | Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _ | Tidb_8_5 _), _ -> Ok ()
+
 (** Whether the loading threads still work, or only answer after a failure. *)
 type course = Going | Stopping
 
@@ -345,7 +368,7 @@ let run config ~dir target { keys; after; binlog; collations } ~objects:wanted ~
   and progress_target =
     match target with Same_names -> "" | Into renamed -> (renamed :> string)
   in
-  let%bind { format; tables; parts } = Quiver_core.Manifest.read manifest in
+  let%bind { format; tables; parts; splits } = Quiver_core.Manifest.read manifest in
   let tables =
     let grouped = Base.Hashtbl.create (module Quiver_core.Schema.Name) in
     List.iter
@@ -557,6 +580,15 @@ let run config ~dir target { keys; after; binlog; collations } ~objects:wanted ~
                   | keys ->
                       deferred := keys;
                       create)))
+    in
+    let%bind () =
+      match
+        split link
+          { database = renamed target database; table }
+          (Option.value ~default:[] (Base.List.Assoc.find splits ~equal:Quiver_core.Schema.Name.equal name))
+      with
+      | Ok () -> Ok ()
+      | Error (statement, cause) -> rejected file statement (Error cause)
     in
     let%bind delivery =
       match format with

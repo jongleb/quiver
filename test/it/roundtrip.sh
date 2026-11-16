@@ -398,6 +398,134 @@ objects() {
   sql -e "DROP DATABASE autoinc; DROP DATABASE autoinc_c"
   echo "$service: an AUTO_INCREMENT table copied in parts while its table lock lets one load at a time"
 }
+# Masking with a fixed secret: keys permuted and carried along foreign keys by
+# id and by email, names shaped, phones hashed; a copy, a dump loaded back and
+# an agent to a collector give the same tables, references hold, no source
+# email or name is left, an --after-load statement runs, and rules that cannot
+# hold stop the run before anything is made.
+masks() {
+  selected "$1" || return 0
+  service=$1 port=$2 client=$3 tls=$4
+  sql() {
+    docker compose -p quiver -f "$compose" exec -T -e MYSQL_PWD=quiver "$service" \
+      "$client" -uroot --default-character-set=utf8mb4 "$@"
+  }
+  digits="(SELECT 0 d UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9)"
+  sql -e "DROP DATABASE IF EXISTS masked; DROP DATABASE IF EXISTS masked_c; DROP DATABASE IF EXISTS masked_l;
+    DROP DATABASE IF EXISTS masked_a; DROP DATABASE IF EXISTS masked_r; CREATE DATABASE masked;
+    CREATE TABLE masked.users (id INT NOT NULL PRIMARY KEY, email VARCHAR(100) NOT NULL UNIQUE,
+      name VARCHAR(50), phone VARCHAR(20), born DATE);
+    CREATE TABLE masked.orders (id INT NOT NULL PRIMARY KEY, user_id INT NOT NULL, email VARCHAR(100) NOT NULL,
+      total DECIMAL(10,2), FOREIGN KEY (user_id) REFERENCES masked.users (id),
+      FOREIGN KEY (email) REFERENCES masked.users (email));
+    CREATE TABLE masked.notes (id INT NOT NULL PRIMARY KEY, body VARCHAR(20));
+    INSERT INTO masked.users SELECT n + 1, CONCAT('user', n, '@example.com'), CONCAT('Name', n),
+      CONCAT('+7900', LPAD(n, 7, '0')), DATE_ADD('1970-01-01', INTERVAL n DAY)
+      FROM (SELECT a.d + 10 * b.d + 100 * c.d n FROM $digits a, $digits b, $digits c) t;
+    INSERT INTO masked.orders SELECT m + 1, m % 1000 + 1, CONCAT('user', m % 1000, '@example.com'), m / 7
+      FROM (SELECT a.d + 10 * b.d + 100 * c.d + 1000 * e.d m FROM $digits a, $digits b, $digits c,
+        (SELECT 0 d UNION ALL SELECT 1 UNION ALL SELECT 2) e) t;
+    INSERT INTO masked.notes VALUES (1, 'first'), (2, 'second')"
+  rules="--mask-secret quiver-it --mask masked.users.id=permute --mask masked.users.email=permute
+    --mask masked.users.name=shape --mask masked.users.phone=hash"
+  dir="$out/$service-masked"
+  rm -rf "$dir"
+  # shellcheck disable=SC2086
+  "$quiver" copy --tls "$tls" -P "$port" -p quiver -B masked -t 4 $rules \
+    --after-load "masked.notes=UPDATE {table} SET body = 'done'" \
+    --to-tls "$tls" --to-port "$port" --to-password quiver --to-database masked_c > "$dir.copy.log" 2>&1 \
+    || fail "masked copy: $(cat "$dir.copy.log")"
+  # shellcheck disable=SC2086
+  "$quiver" dump --tls "$tls" -P "$port" -p quiver -B masked -t 4 $rules -o "$dir" > "$dir.log" 2>&1 \
+    || fail "masked dump: $(cat "$dir.log")"
+  "$quiver" load --tls "$tls" -P "$port" -p quiver -d "$dir" -B masked_l -t 4 > "$dir.load.log" 2>&1 \
+    || fail "quiver load of a masked dump: $(cat "$dir.load.log")"
+  ! grep -rq "user17@example.com" "$dir" || fail "a source email is in the masked dump's files"
+  watched 600 "$quiver" collect $wire --listen 127.0.0.1:7392 --to-tls "$tls" --to-port "$port" \
+    --to-password quiver --to-database masked_a > "$dir.collect.log" 2>&1
+  collector=$last
+  sleep 1
+  # shellcheck disable=SC2086
+  watched 600 "$quiver" agent $wire --tls "$tls" -P "$port" -p quiver -B masked -t 4 $rules \
+    --collector 127.0.0.1:7392 > "$dir.agent.log" 2>&1
+  wait "$last" || fail "masked agent: $(cat "$dir.agent.log") collector: $(cat "$dir.collect.log")"
+  wait $collector || fail "masked collect: $(cat "$dir.collect.log")"
+  sums() { sql -N -e "CHECKSUM TABLE $1.users, $1.orders" | sed "s/^$1\.//"; }
+  [ "$(sums masked_c)" = "$(sums masked_l)" ] || fail "masks differ between a copy and a dump loaded back"
+  [ "$(sums masked_c)" = "$(sums masked_a)" ] || fail "masks differ between a copy and an agent's"
+  [ "$(sums masked)" != "$(sums masked_c)" ] || fail "nothing was masked"
+  count() { sql -N -e "SELECT COUNT(*) FROM $1"; }
+  [ "$(count "masked_c.users")" = 1000 ] && [ "$(count "masked_c.orders")" = 3000 ] || fail "masked rows lost"
+  [ "$(count "masked_c.orders o JOIN masked_c.users u ON u.id = o.user_id AND u.email = o.email")" = 3000 ] \
+    || fail "masked references broke"
+  [ "$(count "masked_c.users c JOIN masked.users s ON c.email = s.email")" = 0 ] || fail "a source email was kept"
+  [ "$(count "masked_c.users c JOIN masked.users s ON c.name = s.name")" = 0 ] || fail "a source name was kept"
+  [ "$(count "masked_c.users WHERE id <= 1000")" -lt 10 ] || fail "ids were barely moved"
+  [ "$(sql -N -e "SELECT SUM(CHAR_LENGTH(name)) FROM masked.users")" = "$(sql -N -e "SELECT SUM(CHAR_LENGTH(name)) FROM masked_c.users")" ] \
+    || fail "shape changed the names' lengths"
+  [ "$(count "masked_c.notes WHERE body = 'done'")" = 2 ] || fail "--after-load did not run"
+  echo "$service masked: copy, dump and load, agent and collector agree; references hold, no source email or name left"
+  refused() {
+    # shellcheck disable=SC2086
+    if "$quiver" copy --tls "$tls" -P "$port" -p quiver -B masked -t 4 --mask-secret quiver-it "$@" \
+      --to-tls "$tls" --to-port "$port" --to-password quiver --to-database masked_r > "$dir.refused.log" 2>&1; then
+      fail "masked copy accepted $*"
+    fi
+    [ "$(count "information_schema.schemata WHERE schema_name = 'masked_r'")" = 0 ] \
+      || fail "a refused masked copy made its database: $*"
+  }
+  refused --mask masked.users.nothing=null
+  refused --mask masked.users.id=shape
+  echo "$service masked: a rule naming no column and a shape on a key are refused before anything is made"
+  sql -e "DROP DATABASE masked_c; DROP DATABASE masked_l; DROP DATABASE masked_a"
+}
+# MariaDB's sequences as schema before the tables: used, fresh, spent,
+# cycling and descending ones, and a table whose default takes from one, go
+# on from where the source left them after a dump is loaded back; MySQL has
+# none and refuses them before anything is made.
+sequences() {
+  selected "$1" || return 0
+  service=$1 port=$2 tls=$3 target=$4 target_port=$5
+  maria() {
+    docker compose -p quiver -f "$compose" exec -T -e MYSQL_PWD=quiver "$service" \
+      mariadb -uroot --default-character-set=utf8mb4 "$@"
+  }
+  target_sql() {
+    docker compose -p quiver -f "$compose" exec -T -e MYSQL_PWD=quiver "$target" \
+      mysql -uroot --default-character-set=utf8mb4 "$@"
+  }
+  maria -e "DROP DATABASE IF EXISTS quiver_seq; CREATE DATABASE quiver_seq; USE quiver_seq;
+    CREATE SEQUENCE used; CREATE SEQUENCE fresh START WITH 7;
+    CREATE SEQUENCE spent MAXVALUE 3 NOCACHE; CREATE SEQUENCE around MAXVALUE 3 CYCLE NOCACHE;
+    CREATE SEQUENCE down START WITH -5 INCREMENT BY -2 MINVALUE -100 MAXVALUE -5 CACHE 3;
+    CREATE TABLE counted (id INT NOT NULL DEFAULT NEXT VALUE FOR used, v INT, PRIMARY KEY (id));
+    INSERT INTO counted (v) VALUES (1), (2), (3);
+    SELECT NEXTVAL(spent), NEXTVAL(spent), NEXTVAL(spent);
+    SELECT NEXTVAL(around), NEXTVAL(around), NEXTVAL(around), NEXTVAL(around);
+    SELECT NEXTVAL(down), NEXTVAL(down)" > /dev/null
+  dir="$out/$service-sequences"
+  rm -rf "$dir"
+  target_sql -e "DROP DATABASE IF EXISTS quiver_seq"
+  if "$quiver" copy --tls "$tls" -P "$port" -p quiver -B quiver_seq --to-tls verified --to-port "$target_port" \
+    --to-password quiver > "$dir.refused.log" 2>&1; then
+    fail "sequences were copied into MySQL"
+  fi
+  grep -q No_sequences "$dir.refused.log" || fail "sequences into MySQL: $(cat "$dir.refused.log")"
+  [ -z "$(target_sql -N -e "SHOW DATABASES LIKE 'quiver_seq'")" ] || fail "a database was made for sequences MySQL refused"
+  "$quiver" dump --tls "$tls" -P "$port" -p quiver -B quiver_seq -o "$dir" > "$dir.log" 2>&1 \
+    || fail "dump of sequences: $(cat "$dir.log")"
+  [ "$(ls "$dir"/quiver_seq.*-schema-sequence.sql | wc -l)" -eq 5 ] || fail "sequences were not dumped"
+  maria -e "DROP DATABASE quiver_seq"
+  "$quiver" load --tls "$tls" -P "$port" -p quiver -d "$dir" > "$dir.load.log" 2>&1 \
+    || fail "load of sequences: $(cat "$dir.load.log")"
+  [ "$(maria -N -e 'SELECT NEXTVAL(used), NEXTVAL(fresh), NEXTVAL(around), NEXTVAL(down)' quiver_seq | tr '\t' ' ')" \
+    = "1001 7 2 -11" ] || fail "sequences restored at other values"
+  if maria -e 'SELECT NEXTVAL(spent)' quiver_seq > /dev/null 2>&1; then fail "a spent sequence came back"; fi
+  [ "$(maria -N -e 'INSERT INTO counted (v) VALUES (4); SELECT MAX(id) FROM counted' quiver_seq)" = 1002 ] \
+    || fail "a default from a sequence"
+  maria -e "DROP DATABASE quiver_seq"
+  echo "$service: sequences dumped and loaded back go on where they were; MySQL refuses them"
+}
 # Faults in the middle of a dump through toxiproxy (downstream slowed to
 # 256 KB/s so the dump lasts): a reset connection, a silent one, sessions
 # killed by the server, and a full disk. Each must end in a reported error,
@@ -783,9 +911,24 @@ cross() {
       || fail "load: $(cat "$files.load.log")"
     same "load of $files"
   done
+  rm -rf "$dir-all"
+  "$quiver" dump --tls disabled -P "$source_port" -p quiver -B sakila -t 4 -o "$dir-all" > "$dir-all.log" 2>&1 \
+    || fail "dump with objects: $(cat "$dir-all.log")"
+  ti -e "DROP DATABASE sakila"
+  if "$quiver" load --tls disabled -P "$port" -u root -d "$dir-all" -t 4 $mapping > "$dir-all.refused.log" 2>&1; then
+    fail "triggers and routines were loaded into TiDB"
+  fi
+  grep -q Unsupported_objects "$dir-all.refused.log" || fail "objects loaded into TiDB: $(cat "$dir-all.refused.log")"
+  [ -z "$(ti -N -e "SHOW DATABASES LIKE 'sakila'")" ] || fail "a database was loaded for objects TiDB refused"
+  "$quiver" load --tls disabled -P "$port" -u root -d "$dir-all" -t 4 --objects views $mapping > "$dir-all.load.log" 2>&1 \
+    || fail "load --objects views: $(cat "$dir-all.load.log")"
+  [ "$(ti -N -e "SELECT COUNT(*) FROM information_schema.VIEWS WHERE TABLE_SCHEMA = 'sakila'")" = 7 ] \
+    || fail "the views were not loaded"
+  [ "$(ti -N -e "SELECT COUNT(*) FROM sakila.customer_list")" = 599 ] || fail "a loaded view does not read"
+  same "load of every object, views taken"
   ti -e "DROP DATABASE sakila"
   maria -e "DROP DATABASE sakila"
-  echo "$service: sakila from $source refused for its triggers and, with a hint, its collation; copied with its views and loaded with the collation mapped, rows equal"
+  echo "$service: sakila from $source refused for its triggers and, with a hint, its collation; copied with its views and loaded with the collation mapped, rows equal; a dump with every object loaded with its views only"
 }
 # qcheck tables of every type with edge values, random keys and dump flags:
 # insert, dump, restore with the server's client, compare rows and checksums.
@@ -821,6 +964,10 @@ objects mysql84 33084 mysql verified
 objects mariadb1011 33101 mariadb disabled
 objects mariadb114 33114 mariadb verified
 objects mariadb118 33118 mariadb verified
+masks mysql84 33084 mysql verified
+masks mariadb118 33118 mariadb verified
+sequences mariadb118 33118 verified mysql84 33084
+sequences mariadb1011 33101 disabled mysql84 33084
 random_tables mysql80 33080 mysql verified ftwrl,trx-only
 random_tables mysql84 33084 mysql verified ftwrl,trx-only
 random_tables mariadb1011 33101 mariadb disabled ftwrl,backup-stage,trx-only

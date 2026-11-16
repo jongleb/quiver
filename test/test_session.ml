@@ -1017,6 +1017,36 @@ let silent_after_finish =
        })
     property
 
+let refused_while_queued =
+  QCheck2.Test.make ~count:150
+    ~name:
+      "an agent whose collector refused it, its connections gone while parts \
+       wait for room among the frames to send, lets them go and shuts down"
+    ~print
+    (QCheck2.Gen.pure
+       {
+         tables =
+           [
+             [ ([ 0; 0; 3; 0; 0 ], Kept); ([ 12; 26; 0; 39 ], Abandoned_after 0); ([ 4 ], Abandoned_after 0); ([], Kept) ];
+             [ ([ 0; 0; 32; 27 ], Kept) ];
+             [ ([ 17; 20; 37 ], Kept) ];
+           ];
+         streams = 1;
+         chunks = 4;
+         readers = 3;
+         topology = Direct;
+         refusal = First Objects;
+         wire = Mutual_tls;
+         cuts = [];
+         control = None;
+         place = Into_first;
+         adjustments = [ Close 3; Close 3 ];
+         compression = Adaptive;
+         linger = 0.;
+         columns = (Stored_too, Written);
+       })
+    property
+
 let replaced_when_silent =
   QCheck2.Test.make ~count:8
     ~name:
@@ -1216,6 +1246,7 @@ let tests =
          resumed_through_relays;
          resumed_down_the_chain;
          silent_after_finish;
+         refused_while_queued;
          replaced_when_silent;
          replaced_before_attach;
          silent_before_attach;

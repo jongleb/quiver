@@ -221,6 +221,11 @@ let unexpected reply =
   Error
     (Unexpected_reply (Sexplib0.Sexp.to_string (Message.sexp_of_reply reply)))
 
+let give (t : t) { text; length = _; raw = _ } =
+  (* Acknowledged or dropped: nothing else holds the frame. *)
+  Quiver_core.Buffer_pool.give t.framing
+    { bs = Bytes.unsafe_of_string text; len = 0 }
+
 let fail t error =
   match
     ( Portable.Atomic.get t.phase,
@@ -238,12 +243,16 @@ let fail t error =
               Await.Await.Semaphore.release window;
               Await.Await.Ivar.fill_if_empty answer (Error error))
             requests;
-          Queue.clear requests)
-
-let give (t : t) { text; length = _; raw = _ } =
-  (* Acknowledged or dropped: nothing else holds the frame. *)
-  Quiver_core.Buffer_pool.give t.framing
-    { bs = Bytes.unsafe_of_string text; len = 0 }
+          Queue.clear requests);
+      let rec drain () =
+        match Await.Await.Mpmc_queue.pop_nonblocking t.frames with
+        | Null -> ()
+        | This outgoing ->
+            Await.Await.Semaphore.release t.room;
+            let () = match outgoing with Frame frame -> give t frame | Stop -> () in
+            drain ()
+      in
+      drain ()
 
 let hear steering messages =
   while steering.first < messages && not (Queue.is_empty steering.unheard) do
@@ -1031,15 +1040,25 @@ let create protection peer
      t)
 
 let queue_frame t outgoing =
-  (match Await.Await.Semaphore.try_acquire t.room with
-  | Acquired -> ()
-  | Would_block ->
-      let started = Quiver_core.Stopwatch.start () in
-      Await.Await.Semaphore.acquire Quiver_core.Blocking.await t.room;
-      ignore
-        (Portable.Atomic.fetch_and_add t.waited
-           (Core.Time_ns.Span.to_int_ns (Quiver_core.Stopwatch.elapsed started))));
-  Await.Await.Mpmc_queue.push t.frames outgoing
+  match (Portable.Atomic.get t.failure, outgoing) with
+  | Some (_ : error), Frame frame -> give t frame
+  | Some (_ : error), Stop -> Await.Await.Mpmc_queue.push t.frames Stop
+  | None, (Frame _ | Stop) -> (
+      let () =
+        match Await.Await.Semaphore.try_acquire t.room with
+        | Acquired -> ()
+        | Would_block ->
+            let started = Quiver_core.Stopwatch.start () in
+            Await.Await.Semaphore.acquire Quiver_core.Blocking.await t.room;
+            ignore
+              (Portable.Atomic.fetch_and_add t.waited
+                 (Core.Time_ns.Span.to_int_ns (Quiver_core.Stopwatch.elapsed started)))
+      in
+      match (Portable.Atomic.get t.failure, outgoing) with
+      | Some (_ : error), Frame frame ->
+          Await.Await.Semaphore.release t.room;
+          give t frame
+      | Some (_ : error), Stop | None, (Frame _ | Stop) -> Await.Await.Mpmc_queue.push t.frames outgoing)
 
 let shutdown t =
   Portable.Atomic.set t.phase Stopping;

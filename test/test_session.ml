@@ -309,7 +309,7 @@ let scenario =
         refusal;
         wire;
         cuts;
-        control = (match place with Into_first -> control | Into_last -> None);
+        control;
         place;
         adjustments;
         linger = 0.;
@@ -529,8 +529,7 @@ let property
   let collected recorder ~columns ?next ?(reconnect = Support.reconnect) socket =
     Support.start (fun () ->
           (let%bind session =
-             Quiver_net.Collector.accept socket protection ~reconnect
-               ~introduction:Support.introduction
+             Quiver_net.Collector.accept socket protection { Support.timeouts with reconnect }
            in
            let%bind forward =
              match next with
@@ -550,8 +549,7 @@ let property
     Support.spawn (fun () ->
         ignore
           (let%bind session =
-             Quiver_net.Collector.accept socket protection
-               ~reconnect:Support.reconnect ~introduction:Support.introduction
+             Quiver_net.Collector.accept socket protection Support.timeouts
            in
            let%bind downstream =
              Quiver_net.Collector.forward next session
@@ -578,10 +576,12 @@ let property
             address (List.init hops Fun.id) )
     | Chained ->
         let tail, tail_address = listen () in
-        let tail_result =
-          collected last ~columns:last_columns
-            ~reconnect:(Core.Time_ns.Span.of_sec 30.) tail
+        let reconnect =
+          match (control, place) with
+          | Some (_ : int * breaking), Into_last -> Support.reconnect
+          | None, (Into_first | Into_last) | Some _, Into_first -> Core.Time_ns.Span.of_sec 30.
         in
+        let tail_result = collected last ~columns:last_columns ~reconnect tail in
         let head, head_address = listen () in
         let head_result =
           collected first ~columns:first_columns ~next:(breaking_at Into_last tail_address) head
@@ -918,8 +918,7 @@ let unreachable_next =
       let head = Result.get_ok (Quiver_net.Channel.listen Support.loopback) in
       Support.spawn (fun () ->
           ignore
-            (Result.bind (Quiver_net.Collector.accept head plaintext ~reconnect:Support.reconnect
-                 ~introduction:Support.introduction)
+            (Result.bind (Quiver_net.Collector.accept head plaintext Support.timeouts)
                (Quiver_net.Collector.forward nowhere)));
       let refusal_seconds = 2. in
       let created =
@@ -956,6 +955,61 @@ let resumed_through_relays =
          cuts = [];
          control = Some (4, Truncated);
          place = Into_first;
+         adjustments = [];
+         compression = Fixed Plain;
+         linger = 0.;
+         columns = (Written, Written);
+       })
+    property
+
+let resumed_down_the_chain =
+  QCheck2.Test.make ~count:20
+    ~name:
+      "a control connection from the head of a chain to its next node that \
+       breaks is replaced by the head, and the session goes on"
+    ~print
+    QCheck2.Gen.(
+      map3
+        (fun after breaking linger ->
+          {
+            tables = [ [ ([ 3; 4 ], Kept); ([ 5 ], Kept) ]; [ ([ 2; 2; 2 ], Kept) ] ];
+            streams = 2;
+            chunks = 2;
+            readers = 2;
+            topology = Chained;
+            refusal = Nobody;
+            wire = Plain;
+            cuts = [];
+            control = Some (after, breaking);
+            place = Into_last;
+            adjustments = [];
+            compression = Fixed Plain;
+            linger;
+            columns = (Written, Written);
+          })
+        (int_range 2 9)
+        (oneof_list [ Truncated; Damaged; Reset ])
+        (oneof_list [ 0.; 1.3 ]))
+    property
+
+let silent_after_finish =
+  QCheck2.Test.make ~count:8
+    ~name:
+      "the head of a chain whose next node's answers stop arriving after the \
+       finish, on a connection that stays up, replaces it in time"
+    ~print
+    (QCheck2.Gen.pure
+       {
+         tables = [ [ ([], Kept); ([], Kept) ]; [ ([], Kept) ] ];
+         streams = 1;
+         chunks = 1;
+         readers = 1;
+         topology = Chained;
+         refusal = Nobody;
+         wire = Plain;
+         cuts = [];
+         control = Some (12, Truncated);
+         place = Into_last;
          adjustments = [];
          compression = Fixed Plain;
          linger = 0.;
@@ -1067,8 +1121,7 @@ let silent_first =
       let refusal_seconds = 3. in
       let accepted =
         Support.within refusal_seconds (fun () ->
-            Quiver_net.Collector.accept listener Quiver_net.Protection.plaintext
-              ~reconnect:Support.reconnect ~introduction:Support.introduction)
+            Quiver_net.Collector.accept listener Quiver_net.Protection.plaintext Support.timeouts)
       in
       Unix.close stray;
       Quiver_net.Channel.stop listener;
@@ -1161,6 +1214,8 @@ let tests =
          refused_downstream;
          failed_behind_finish;
          resumed_through_relays;
+         resumed_down_the_chain;
+         silent_after_finish;
          replaced_when_silent;
          replaced_before_attach;
          silent_before_attach;

@@ -264,7 +264,7 @@ let lose (t : t) error =
   | _ -> ()
 
 let attach (t : t) =
-  let%bind channel = failed (Channel.connect t.protection t.peer) in
+  let%bind channel = failed (Channel.connect t.protection t.peer Unlimited) in
   Option.iter (Channel.mark channel) t.traffic;
   match
     failed
@@ -534,7 +534,7 @@ let adjust (t : t) (decision : Quiver_core.Width.decision) =
 
 let create protection peer
     { streams; most_streams; chunks; compression; pace; traffic; reconnect; stall } =
-  let connect () = failed (Channel.connect protection peer) in
+  let connect () = failed (Channel.connect protection peer Unlimited) in
   Result.map_error
     (fun error -> `Sink error)
     (let session =
@@ -542,7 +542,7 @@ let create protection peer
          (Random.State.bits64 (Random.State.make_self_init ()))
      in
      let (attach @ portable) () =
-       let%bind channel = failed (Channel.connect protection peer) in
+       let%bind channel = failed (Channel.connect protection peer Unlimited) in
        Option.iter (Channel.mark channel) traffic;
        match
          failed (Channel.send channel (Message.sexp_of_attach (Data { session })))
@@ -784,7 +784,7 @@ let create protection peer
          Disconnected
        in
        let replaced () =
-         let%bind channel = failed (Channel.connect t.protection t.peer) in
+         let%bind channel = failed (Channel.connect t.protection t.peer Unlimited) in
          Option.iter (Channel.mark channel) t.traffic;
          Quiver_core.Guarded.hold t.steering (fun steering ->
              steering.trying <- Some (channel, Quiver_core.Stopwatch.start ()));

@@ -77,7 +77,7 @@ let of_flow flow =
          })
        flow)
 
-let connect protection { host; address } =
+let connect protection { host; address } patience =
   Base.Portable_lazy.force Quiver_core.Blocking.sockets;
   let%bind fd =
     unix (fun () ->
@@ -93,7 +93,7 @@ let connect protection { host; address } =
             Unix.close fd;
             raise failure)
   in
-  of_flow (Protection.connected protection ~host fd)
+  of_flow (Protection.connected protection ~host fd patience)
 
 let listen address =
   Base.Portable_lazy.force Quiver_core.Blocking.sockets;
@@ -414,6 +414,19 @@ let close t = Protection.close t.flow
 let accept listener protection =
   let%bind fd = arrive listener in
   of_flow (Protection.accepted protection fd Unlimited)
+
+let answered protection peer ~within message decode =
+  let%bind t = connect protection peer (Within within) in
+  match
+    let%bind () = send t message in
+    receive t decode
+  with
+  | Ok value ->
+      Protection.settle t.flow;
+      Ok (t, value)
+  | Error _ as error ->
+      close t;
+      error
 
 let introduced fd protection ~within decode =
   let%bind t = of_flow (Protection.accepted protection fd (Within within)) in

@@ -10,16 +10,22 @@ type error : value mod contended portable =
   | Abandoned
 [@@deriving sexp_of ~portable]
 
+type timeouts = {
+  reconnect : Core.Time_ns.Span.t;
+      (** For a broken control connection to be replaced. *)
+  introduction : Core.Time_ns.Span.t;
+      (** For a connection accepted to say what it is. *)
+  silence : Core.Time_ns.Span.t;
+      (** For the next hop to say anything on the control connection to it. *)
+}
+
 type session = {
   control : Channel.t;
   id : string;
   streams : int;
   chunks : int;
   protection : Protection.t;
-  reconnect : Core.Time_ns.Span.t;
-      (** How long the agent may take to replace a broken control connection. *)
-  introduction : Core.Time_ns.Span.t;
-      (** How long a connection accepted may take to say what it is. *)
+  timeouts : timeouts;
 }
 
 type downstream = {
@@ -42,11 +48,11 @@ let unexpected reply =
   out_of_place
     ("a reply " ^ Sexplib0.Sexp.to_string (Message.sexp_of_reply reply))
 
-let accept listening protection ~reconnect ~introduction =
+let accept listening protection timeouts =
   let%bind arrival = failed (Channel.arrive listening) in
   let%bind control, hello =
     failed
-      (Channel.introduced arrival protection ~within:introduction
+      (Channel.introduced arrival protection ~within:timeouts.introduction
          Message.control_of_sexp)
   in
   let greeted =
@@ -54,7 +60,7 @@ let accept listening protection ~reconnect ~introduction =
     | Hello { byte_order; _ } when byte_order <> Message.byte_order ->
         Error (`Collector (Foreign_byte_order byte_order))
     | Hello { session; streams; chunks; _ } ->
-        Ok { control; id = session; streams; chunks; protection; reconnect; introduction }
+        Ok { control; id = session; streams; chunks; protection; timeouts }
     | Database _ | Table _ | Grown _ | Accepts _ | Objects _ | Begin _ | End _ | Abort _ | Finish _
     | Heartbeat _ | Leave ->
         out_of_place "before hello"
@@ -66,7 +72,7 @@ let chunks (session : session) = session.chunks
 
 let forward peer (session : session) =
   let (forwarded : (downstream, [ `Collector of error ]) result) =
-  let%bind control = failed (Channel.connect session.protection peer) in
+  let%bind control = failed (Channel.connect session.protection peer Unlimited) in
   let greeted =
   let%bind () =
     failed
@@ -105,7 +111,7 @@ let forward peer (session : session) =
       Error (`Collector error)
 
 let reaching (session : session) (downstream : downstream) attach =
-  match Channel.connect session.protection downstream.peer with
+  match Channel.connect session.protection downstream.peer Unlimited with
   | Error (`Channel _) -> None
   | Ok next -> (
       match Channel.send next (Message.sexp_of_attach attach) with
@@ -117,7 +123,7 @@ let reaching (session : session) (downstream : downstream) attach =
 let accepting listening (session : session) take =
   let attaching arrival =
     match
-      Channel.introduced arrival session.protection ~within:session.introduction
+      Channel.introduced arrival session.protection ~within:session.timeouts.introduction
         Message.attach_of_sexp
     with
     | Ok (channel, ((Data { session = id } | Control { session = id; _ }) as attach))
@@ -289,7 +295,7 @@ let relay listening (session : session) (downstream : downstream) =
               | (_ : pair)
                 when Core.Time_ns.Span.( > )
                        (Quiver_core.Stopwatch.elapsed waited)
-                       session.reconnect ->
+                       session.timeouts.reconnect ->
                   Error error
               | (_ : pair) ->
                   Unix.sleepf 0.01;
@@ -390,6 +396,28 @@ module Make (S : Quiver_core.Sink_intf.S) = struct
   (** Whether the session still beats. *)
   type life = Live | Over
 
+  (** How a new control connection to the next hop took over. *)
+  type rejoining : value mod contended portable =
+    | Resumed
+    | Again  (** It broke too. *)
+    | Miscounted  (** The next hop heard messages never sent. *)
+
+  (** Whether the agent's [Leave] went on to the next hop. *)
+  type departure = Staying | Left
+
+  type relaying = {
+    peer : Channel.peer;
+    mutable link : Channel.t;  (** The control connection to the next hop now. *)
+    sent : Message.control Queue.t;
+        (** Counted messages sent and not known to have arrived, oldest first. *)
+    mutable oldest : int;  (** The number of the oldest of them. *)
+    mutable departure : departure;
+    mutable spoke : Quiver_core.Stopwatch.t;  (** When the next hop last said anything. *)
+    mutable dropped : Channel.t list;  (** Replaced or never taken, closed at the end. *)
+  }
+  (** This node's control connection to the next hop, which a new one replaces
+      when it breaks. *)
+
   let run ?forward listening (session : session) sink ~columns =
     let parts =
       Await.Capsule.Await.With_mutex.create (fun () -> Hashtbl.create 256)
@@ -426,7 +454,21 @@ module Make (S : Quiver_core.Sink_intf.S) = struct
     and messages = Portable.Atomic.make 0
     and downstream_replies = Portable.Atomic.make 0
     and life = Portable.Atomic.make Live
-    and passing = Await.Capsule.Await.With_mutex.create (fun () -> ()) in
+    and relaying =
+      Option.map
+        (fun (downstream : downstream) ->
+          Await.Capsule.Await.With_mutex.create (fun () ->
+              {
+                peer = downstream.peer;
+                link = downstream.control;
+                sent = Queue.create ();
+                oldest = 0;
+                departure = Staying;
+                spoke = Quiver_core.Stopwatch.start ();
+                dropped = [];
+              }))
+        forward
+    in
     let describe (error : failure) =
       match error with
       | `Sink error ->
@@ -490,14 +532,28 @@ module Make (S : Quiver_core.Sink_intf.S) = struct
                 refused (`Collector (Downstream reason)));
           answerer ()
     in
-    let pass message =
-      match forward with
-      | None -> Ok ()
-      | Some (downstream : downstream) ->
-          failed
-            (Quiver_core.Guarded.hold passing (fun () ->
-                 (Channel.send downstream.control (Message.sexp_of_control message)
-                   : (unit, [ `Channel of Channel.error ]) result)))
+    let pass (message : Message.control) =
+      Option.iter
+        (fun relaying ->
+          Quiver_core.Guarded.hold relaying (fun relaying ->
+              let () =
+                match message with
+                | Database _ | Table _ | Grown _ | Accepts _ | Objects _ | Begin _ | End _
+                | Abort _ | Finish _ ->
+                    Queue.push message relaying.sent
+                | Leave -> relaying.departure <- Left
+                | Hello _ | Heartbeat _ -> ()
+              in
+              match Channel.send relaying.link (Message.sexp_of_control message) with
+              | Ok () -> ()
+              | Error (`Channel (_ : Channel.error)) -> Channel.abort relaying.link))
+        relaying
+    in
+    let rec heard relaying messages =
+      if relaying.oldest < messages && not (Queue.is_empty relaying.sent) then (
+        ignore (Queue.pop relaying.sent : Message.control);
+        relaying.oldest <- relaying.oldest + 1;
+        heard relaying messages)
     in
     match
       failed
@@ -518,11 +574,6 @@ module Make (S : Quiver_core.Sink_intf.S) = struct
         Option.iter (fun (downstream : downstream) -> Channel.close downstream.control) forward;
         error
     | Ok () ->
-    let handles =
-      Option.fold ~none:[]
-        ~some:(fun (downstream : downstream) -> [ Channel.handle downstream.control ])
-        forward
-    in
     let attached =
       Await.Capsule.Await.With_mutex.create (fun () -> { handles = [] })
     in
@@ -535,7 +586,7 @@ module Make (S : Quiver_core.Sink_intf.S) = struct
               Portable.Atomic.set life Over;
               say (Failed (describe error));
               Await.Await.Mpmc_queue.push outbox Last;
-              ignore (pass Leave);
+              pass Leave;
               Channel.stop listening;
               List.iter Channel.sever
                 (Quiver_core.Guarded.hold attached (fun { handles } -> handles));
@@ -549,7 +600,13 @@ module Make (S : Quiver_core.Sink_intf.S) = struct
                     (fun _ { ending; _ } ->
                       Await.Await.Ivar.fill_if_empty ending Aborted)
                     owners);
-              List.iter Channel.sever handles)
+              Option.iter
+                (fun relaying ->
+                  Quiver_core.Guarded.hold relaying (fun relaying ->
+                      List.iter
+                        (fun channel -> Channel.sever (Channel.handle channel))
+                        (relaying.link :: relaying.dropped)))
+                relaying)
     in
     let own { id; name; index; lane; ending } =
       let opened = Part.create sink lane.table ~index in
@@ -640,29 +697,121 @@ module Make (S : Quiver_core.Sink_intf.S) = struct
                  Channel.send channel (Message.sexp_of_reply reply)));
           write current
     in
-    let rec listen_downstream (downstream : downstream) =
-      match failed (Channel.receive downstream.control Message.reply_of_sexp) with
-      | Error error ->
-          Registry.close passed;
-          ignore (Quiver_core.Mailbox.add answers (Error error))
-      | Ok (Failed reason) ->
-          Registry.close passed;
-          ignore
-            (Quiver_core.Mailbox.add answers
-               (Error (`Collector (Downstream reason))))
-      | Ok (Heard _) -> listen_downstream downstream
-      | Ok (Committed { chunk; _ }) ->
-          Portable.Atomic.incr downstream_replies;
-          Registry.publish passed chunk (Ok ());
-          listen_downstream downstream
-      | Ok (Rejected { chunk; reason }) ->
-          Portable.Atomic.incr downstream_replies;
-          Registry.publish passed chunk (Error reason);
-          listen_downstream downstream
-      | Ok ((Ready _ | Done | Refused _ | Skipped) as reply) ->
-          Portable.Atomic.incr downstream_replies;
-          ignore (Quiver_core.Mailbox.add answers (Ok reply));
-          listen_downstream downstream
+    let rejoined relaying error =
+      let replaced within =
+        match
+          failed
+            (Channel.answered session.protection
+               (Quiver_core.Guarded.hold relaying (fun relaying -> relaying.peer))
+               ~within
+               (Message.sexp_of_attach
+                  (Control { session = session.id; replies = Portable.Atomic.get downstream_replies }))
+               Message.reply_of_sexp)
+        with
+        | Error (_ : failure) -> Error `Again
+        | Ok (channel, reply) -> (
+            Quiver_core.Guarded.hold attached (fun attached ->
+                attached.handles <- Channel.handle channel :: attached.handles);
+            let resumed =
+              match reply with
+              | Failed reason -> `Over (`Collector (Downstream reason))
+              | Heard { messages } -> (
+                  match
+                    Quiver_core.Guarded.hold relaying (fun relaying ->
+                        if
+                          messages < relaying.oldest
+                          || messages > relaying.oldest + Queue.length relaying.sent
+                        then Miscounted
+                        else (
+                            heard relaying messages;
+                            match
+                              Base.List.fold_result
+                                (List.of_seq (Queue.to_seq relaying.sent)
+                                @
+                                match relaying.departure with
+                                | Left -> [ Message.Leave ]
+                                | Staying -> [])
+                                ~init:()
+                                ~f:(fun () message ->
+                                  Channel.send channel (Message.sexp_of_control message))
+                            with
+                            | Error (`Channel (_ : Channel.error)) -> Again
+                            | Ok () ->
+                                relaying.dropped <- relaying.link :: relaying.dropped;
+                                relaying.link <- channel;
+                                relaying.spoke <- Quiver_core.Stopwatch.start ();
+                                Resumed))
+                  with
+                  | Resumed -> `Resumed
+                  | Again -> `Again
+                  | Miscounted -> `Over (`Collector (Out_of_place "a count of messages never sent")))
+              | Ready _ | Done | Refused _ | Skipped | Committed _ | Rejected _ ->
+                  Result.fold (unexpected reply) ~ok:Fun.id ~error:(fun failure -> `Over failure)
+            in
+            match resumed with
+            | `Resumed -> Ok channel
+            | (`Again | `Over _) as failed ->
+                Channel.abort channel;
+                Quiver_core.Guarded.hold relaying (fun relaying ->
+                    relaying.dropped <- channel :: relaying.dropped);
+                Error failed)
+      in
+      let waited = Quiver_core.Stopwatch.start () in
+      let rec attempt pauses =
+        let left = Core.Time_ns.Span.( - ) session.timeouts.reconnect (Quiver_core.Stopwatch.elapsed waited) in
+        match
+          (Atomic.get first_failure, Quiver_core.Guarded.hold relaying (fun relaying -> relaying.departure))
+        with
+        | Some (_ : failure), _ | None, Left -> Error error
+        | None, Staying when Core.Time_ns.Span.( <= ) left Core.Time_ns.Span.zero -> Error error
+        | None, Staying -> (
+            match replaced (Core.Time_ns.Span.min session.timeouts.introduction left) with
+            | Ok channel -> Ok channel
+            | Error (`Over failure) -> Error failure
+            | Error `Again ->
+                let pause, rest = match pauses with [] -> (2., []) | pause :: rest -> (pause, rest) in
+                Unix.sleepf pause;
+                attempt rest)
+      in
+      attempt [ 0.05; 0.2; 0.5; 1. ]
+    in
+    let listen_downstream relaying =
+      let ended outcome =
+        Registry.close passed;
+        ignore (Quiver_core.Mailbox.add answers outcome)
+      in
+      let rec listen channel =
+        let received = failed (Channel.receive channel Message.reply_of_sexp) in
+        Result.iter
+          (fun (_ : Message.reply) ->
+            Quiver_core.Guarded.hold relaying (fun relaying ->
+                relaying.spoke <- Quiver_core.Stopwatch.start ()))
+          received;
+        match received with
+        | Error (`Collector (Lost (Malformed _))) as error -> ended error
+        | Error error -> (
+            match rejoined relaying error with
+            | Ok channel -> listen channel
+            | Error error -> ended (Error error))
+        | Ok (Failed reason) -> ended (Error (`Collector (Downstream reason)))
+        | Ok (Ready _ as reply) -> ended (unexpected reply)
+        | Ok (Heard { messages }) ->
+            Quiver_core.Guarded.hold relaying (fun relaying -> heard relaying messages);
+            listen channel
+        | Ok (Committed { chunk; _ }) ->
+            Portable.Atomic.incr downstream_replies;
+            Registry.publish passed chunk (Ok ());
+            listen channel
+        | Ok (Rejected { chunk; reason }) ->
+            Portable.Atomic.incr downstream_replies;
+            Registry.publish passed chunk (Error reason);
+            listen channel
+        | Ok ((Done | Refused _ | Skipped) as reply) ->
+            Portable.Atomic.incr downstream_replies;
+            ignore (Quiver_core.Mailbox.add answers (Ok reply));
+            listen channel
+      in
+      listen (Quiver_core.Guarded.hold relaying (fun relaying -> relaying.link))
     in
     let control () =
       let tables = Hashtbl.create 64 in
@@ -712,7 +861,7 @@ module Make (S : Quiver_core.Sink_intf.S) = struct
               | `Waiting
                 when Core.Time_ns.Span.( > )
                        (Quiver_core.Stopwatch.elapsed waited)
-                       session.reconnect ->
+                       session.timeouts.reconnect ->
                   Error (`Collector error)
               | `Waiting ->
                   Unix.sleepf 0.01;
@@ -740,7 +889,7 @@ module Make (S : Quiver_core.Sink_intf.S) = struct
           ->
             Portable.Atomic.incr messages);
         let answered local =
-          let%map () = pass message in
+          pass message;
           ignore
           @@ Quiver_core.Mailbox.add verdicts
                (match Atomic.get stance with
@@ -755,7 +904,7 @@ module Make (S : Quiver_core.Sink_intf.S) = struct
         match message with
         | Hello _ -> out_of_place "a second hello"
         | Database { name; ddl; sequences } ->
-            let%bind () = answered (fun () -> S.database sink name ~ddl ~sequences) in
+            answered (fun () -> S.database sink name ~ddl ~sequences);
             next stage channel
         | Table { table; ddl; parts; order; splits } -> (
             let checked =
@@ -770,28 +919,24 @@ module Make (S : Quiver_core.Sink_intf.S) = struct
             match checked with
             | Error () -> out_of_place "splits that are not of the table's primary key"
             | Ok splits ->
-                let%bind () =
-                  answered (fun () ->
-                      Hashtbl.replace tables table.name table;
-                      S.table sink table ~ddl ~parts ~order ~splits)
-                in
+                answered (fun () ->
+                    Hashtbl.replace tables table.name table;
+                    S.table sink table ~ddl ~parts ~order ~splits);
                 next stage channel)
         | Grown { table = name } -> (
             match Hashtbl.find_opt tables name with
             | None -> out_of_place "a part of a table never announced"
             | Some table ->
-                let%bind () = answered (fun () -> S.add_part sink table) in
+                answered (fun () -> S.add_part sink table);
                 next stage channel)
         | Accepts { database; entries } ->
-            let%bind () = answered (fun () -> S.accepts sink database entries) in
+            answered (fun () -> S.accepts sink database entries);
             next stage channel
         | Objects { database; definitions } ->
-            let%bind () =
-              answered (fun () -> S.objects sink database definitions)
-            in
+            answered (fun () -> S.objects sink database definitions);
             next stage channel
         | Begin { chunk = id; table = name; index } -> (
-            let%bind () = pass message in
+            pass message;
             match
               ( Hashtbl.find_opt tables name,
                 Quiver_core.Guarded.hold owners (fun owners -> Hashtbl.mem owners id) )
@@ -810,7 +955,7 @@ module Make (S : Quiver_core.Sink_intf.S) = struct
                 | Ok (_ : unit Quiver_core.Concurrent.task) -> next stage channel
                 | Error (`Concurrent _) -> out_of_place "no thread to own a chunk"))
         | End { chunk = id; frames } -> (
-            let%bind () = pass message in
+            pass message;
             match
               Quiver_core.Guarded.hold owners (fun owners -> Hashtbl.mem owners id)
             with
@@ -819,7 +964,7 @@ module Make (S : Quiver_core.Sink_intf.S) = struct
                 ended id (Ended frames);
                 next stage channel)
         | Abort { chunk = id } -> (
-            let%bind () = pass message in
+            pass message;
             match
               Quiver_core.Guarded.hold owners (fun owners -> Hashtbl.mem owners id)
             with
@@ -833,7 +978,7 @@ module Make (S : Quiver_core.Sink_intf.S) = struct
                 ignore (Quiver_core.Mailbox.add verdicts (`Say Message.Skipped));
                 next `Concluded channel
             | Accepting ->
-                let%bind () = pass message in
+                pass message;
                 let settled = Await.Await.Ivar.create () in
                 let passed =
                   match Quiver_core.Mailbox.add verdicts (`Settle settled) with
@@ -858,12 +1003,10 @@ module Make (S : Quiver_core.Sink_intf.S) = struct
         | Heartbeat { replies } ->
             Quiver_core.Guarded.hold steering (fun steering ->
                 hear steering replies);
-            let%bind () =
-              pass (Heartbeat { replies = Portable.Atomic.get downstream_replies })
-            in
+            pass (Heartbeat { replies = Portable.Atomic.get downstream_replies });
             next stage channel
         | Leave -> (
-            let%bind () = pass message in
+            pass message;
             match finished () with
             | `Finished -> Ok ()
             | `Unfinished -> Error (`Collector Abandoned))
@@ -1013,22 +1156,23 @@ module Make (S : Quiver_core.Sink_intf.S) = struct
             Quiver_core.Mailbox.close verdicts;
             Await.Await.Ivar.fill_if_empty finishing None;
             let answer = Await.Await.Ivar.read Quiver_core.Blocking.await answered in
-            Await.Await.Mpmc_queue.push outbox Last;
             let outcome = Result.bind controlled (fun () -> answer) in
             report outcome;
+            Await.Await.Mpmc_queue.push outbox Last;
             Result.iter
               (fun () ->
                 Option.iter
-                  (fun (downstream : downstream) -> Channel.finish downstream.control)
-                  forward)
+                  (fun relaying ->
+                    Quiver_core.Guarded.hold relaying (fun relaying -> Channel.finish relaying.link))
+                  relaying)
               outcome)
           ~unstarted:ignore;
         launch (fun () -> write 0) ~unstarted:ignore;
       ]
       @ Option.fold ~none:[]
-          ~some:(fun (downstream : downstream) ->
-            [ launch (fun () -> listen_downstream downstream) ~unstarted:ignore ])
-          forward
+          ~some:(fun (relaying : relaying Await.Capsule.Await.With_mutex.t) ->
+            [ launch (fun () -> listen_downstream relaying) ~unstarted:ignore ])
+          relaying
     in
     let arriving =
       launch
@@ -1075,6 +1219,20 @@ module Make (S : Quiver_core.Sink_intf.S) = struct
              | Over -> ()
              | Live ->
                  Await.Await.Mpmc_queue.push outbox Beat;
+                 Option.iter
+                   (fun relaying ->
+                     Quiver_core.Guarded.hold relaying (fun relaying ->
+                         match relaying.departure with
+                         | Left -> ()
+                         | Staying ->
+                             if
+                               Core.Time_ns.Span.( > )
+                                 (Quiver_core.Stopwatch.elapsed relaying.spoke)
+                                 session.timeouts.silence
+                             then (
+                               relaying.spoke <- Quiver_core.Stopwatch.start ();
+                               Channel.abort relaying.link)))
+                   relaying;
                  beat ()
            in
            beat ()));
@@ -1111,8 +1269,10 @@ module Make (S : Quiver_core.Sink_intf.S) = struct
           @ Option.fold ~none:[] ~some:(fun (pending, _) -> [ pending ])
               steering.replacement));
     Option.iter
-      (fun (downstream : downstream) -> Channel.close downstream.control)
-      forward;
+      (fun relaying ->
+        Quiver_core.Guarded.hold relaying (fun relaying ->
+            List.iter Channel.close (relaying.link :: relaying.dropped)))
+      relaying;
     match (Portable.Atomic.get sink_failure, outcome) with
     | Some error, _ -> Error (`Sink error)
     | None, Ok () -> Ok ()

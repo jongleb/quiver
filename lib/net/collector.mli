@@ -21,11 +21,19 @@ type error : value mod contended portable =
 type session
 (** An agent that said hello on its control connection. *)
 
+type timeouts = {
+  reconnect : Core.Time_ns.Span.t;
+      (** For a broken control connection to be replaced. *)
+  introduction : Core.Time_ns.Span.t;
+      (** For a connection accepted to say what it is. *)
+  silence : Core.Time_ns.Span.t;
+      (** For the next hop to say anything on the control connection to it. *)
+}
+
 val accept :
   Channel.listener ->
   Protection.t ->
-  reconnect:Core.Time_ns.Span.t ->
-  introduction:Core.Time_ns.Span.t ->
+  timeouts ->
   (session, [> `Collector of error ]) result
 (** Its data connections and the next hop are protected alike. A control
     connection that breaks may be replaced by the agent within [reconnect]: the
@@ -74,6 +82,8 @@ module Make (S : Quiver_core.Sink_intf.S) : sig
       failure of the sink, the protocol or the next hop, or [Ok] once the sink
       finished and the agent left. Data connections, and control connections
       that replace broken ones, are taken until then, when the listener stops;
-      no connection holds the session back; the next hop's control connection is
-      not replaced. *)
+      no connection holds the session back. A broken control connection to the
+      next hop, or one on which it said nothing for the session's [silence], is
+      replaced like the agent's, within the session's [reconnect]: the messages
+      it may not have heard are sent again. *)
 end

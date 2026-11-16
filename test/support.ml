@@ -134,6 +134,9 @@ let finished part =
 let reconnect = Core.Time_ns.Span.of_sec 0.5
 let introduction = Core.Time_ns.Span.of_sec 1.
 
+let timeouts : Quiver_net.Collector.timeouts =
+  { reconnect; introduction; silence = Core.Time_ns.Span.of_sec 1. }
+
 let settings ?(compression =
     Quiver_net.Remote.Fixed
       (Quiver_sink.Compression.Zstd

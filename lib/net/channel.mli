@@ -33,7 +33,8 @@ type t : value mod contended portable
 type listener : value mod contended portable
 (** A socket accepting connections until it is stopped. *)
 
-val connect : Protection.t -> peer -> (t, [> `Channel of error ]) result
+val connect :
+  Protection.t -> peer -> Protection.patience -> (t, [> `Channel of error ]) result
   @@ portable
 val listen : Unix.sockaddr -> (listener, [> `Channel of error ]) result
 val listening_address : listener -> Unix.sockaddr @@ portable
@@ -57,6 +58,17 @@ val introduced :
   @@ portable
 (** Its handshake and its first frame, a message decoding as given, both
     within so long; a connection that fails is closed. *)
+
+val answered :
+  Protection.t ->
+  peer ->
+  within:Core.Time_ns.Span.t ->
+  Sexplib0.Sexp.t ->
+  (Sexplib0.Sexp.t -> 'a) ->
+  (t * 'a, [> `Channel of error | `Frame of Frame.error ]) result
+  @@ portable
+(** Connects, sends the message and reads the first answer, a message decoding
+    as given, all within so long; a connection that fails is closed. *)
 
 val release : arrival -> unit @@ portable
 (** Closes it unread. *)

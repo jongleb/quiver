@@ -41,7 +41,7 @@ val settle : flow -> unit @@ portable
 (** Its reads and writes wait as long as the socket makes them, from now on. *)
 
 val connected :
-  t -> host:string -> Unix.file_descr -> (flow, [> `Protection of error ]) result
+  t -> host:string -> Unix.file_descr -> patience -> (flow, [> `Protection of error ]) result
   @@ portable
 (** The connecting side: the peer's certificate must be trusted and name [host].
 *)

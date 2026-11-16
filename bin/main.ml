@@ -28,7 +28,7 @@ type 'r consumer = {
 (** What runs with a sink of any kind. *)
 
 let () =
-  let introduction = Core.Time_ns.Span.of_sec 10. in
+  let introduction = Core.Time_ns.Span.of_sec 10. and silence = Core.Time_ns.Span.of_sec 15. in
   let options = Hashtbl.create 64 in
   let described ?docv ?doc ?env names =
     let long = List.fold_left (fun best name -> if String.length name > String.length best then name else best) "" names in
@@ -556,7 +556,7 @@ let () =
               let%bind listening = listening listen in
               let%bind session =
                 Quiver_net.Collector.accept listening protection
-                  ~reconnect:(Core.Time_ns.Span.of_sec reconnect) ~introduction
+                  { reconnect = Core.Time_ns.Span.of_sec reconnect; introduction; silence }
               in
               let%map downstream =
                 match forward with
@@ -1968,7 +1968,7 @@ let () =
               let%bind listening = listening listen in
               let%bind session =
                 Quiver_net.Collector.accept listening protection
-                  ~reconnect:(Core.Time_ns.Span.of_sec reconnect) ~introduction
+                  { reconnect = Core.Time_ns.Span.of_sec reconnect; introduction; silence }
               in
               let%bind downstream =
                 Quiver_net.Collector.forward next session

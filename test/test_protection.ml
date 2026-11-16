@@ -123,7 +123,7 @@ let exchange =
             Unix.connect socket (Unix.getsockname listening);
             match
               Quiver_net.Protection.connected (protection client)
-                ~host:"127.0.0.1" socket
+                ~host:"127.0.0.1" socket Unlimited
             with
             | Error (`Protection (Quiver_net.Protection.Untrusted _)) ->
                 `Untrusted
@@ -178,7 +178,7 @@ let mismatched =
     let outcome =
       Support.within mismatch_seconds @@ fun () ->
       Support.both
-        (fun () -> Result.is_ok (Quiver_net.Collector.accept listening collector ~reconnect:Support.reconnect ~introduction:Support.introduction))
+        (fun () -> Result.is_ok (Quiver_net.Collector.accept listening collector Support.timeouts))
         (fun () ->
           Result.is_ok
             (Quiver_net.Remote.create agent
@@ -245,7 +245,8 @@ let spliced =
              {
                host = "127.0.0.1";
                address = Quiver_net.Channel.listening_address listening;
-             })
+             }
+             Unlimited)
       and accept listening =
         Result.get_ok (Quiver_net.Channel.accept listening protection)
       in
@@ -338,7 +339,8 @@ let stopped =
                    {
                      host = "127.0.0.1";
                      address = Quiver_net.Channel.listening_address next;
-                   })
+                   }
+                   Unlimited)
             in
             let stale = Support.join waiting in
             let accept_seconds = 1. in
@@ -387,7 +389,7 @@ let introduced =
           let talking =
             Support.start (fun () ->
                 let channel =
-                  Result.get_ok (Quiver_net.Channel.connect protection peer)
+                  Result.get_ok (Quiver_net.Channel.connect protection peer Unlimited)
                 in
                 ignore (Quiver_net.Channel.send channel (Atom "first"));
                 Thread.delay 0.8;

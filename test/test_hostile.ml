@@ -211,8 +211,7 @@ let hostile_agent =
               (match
                  match
                    Quiver_net.Collector.accept listening
-                     Quiver_net.Protection.plaintext ~reconnect:Support.reconnect
-                     ~introduction:Support.introduction
+                     Quiver_net.Protection.plaintext Support.timeouts
                  with
                  | Error _ -> ()
                  | Ok session -> ignore (Collecting.run listening session () ~columns:Written)
@@ -483,8 +482,7 @@ let vanishing_hop =
                   List.iter Quiver_net.Channel.close (control :: data))
         and node =
           Support.start (fun () ->
-              match Quiver_net.Collector.accept collecting plaintext
-                      ~reconnect:Support.reconnect ~introduction:Support.introduction with
+              match Quiver_net.Collector.accept collecting plaintext Support.timeouts with
               | Error _ -> `Unaccepted
               | Ok session -> (
                   match Quiver_net.Collector.forward (peer next) session with
@@ -512,6 +510,51 @@ let vanishing_hop =
         "the agent and the node fail in time" true
         (match outcome with Ok (false, `Failed) -> true | _ -> false))
 
+let told_why =
+  Alcotest.test_case
+    "a collector that fails on its agent's control connection says why there, \
+     instead of only hanging up"
+    `Quick (fun () ->
+      let plaintext = Quiver_net.Protection.plaintext
+      and listening = Result.get_ok (Quiver_net.Channel.listen Support.loopback) in
+      let outcome =
+        Support.within 2. @@ fun () ->
+        let collected =
+          Support.start (fun () ->
+              Result.iter
+                (fun session -> ignore (Collecting.run listening session () ~columns:Written))
+                (Quiver_net.Collector.accept listening plaintext Support.timeouts))
+        in
+        let control =
+          Result.get_ok
+            (Quiver_net.Channel.connect plaintext
+               {
+                 host = "127.0.0.1";
+                 address = Quiver_net.Channel.listening_address listening;
+               }
+               Unlimited)
+        in
+        let send message =
+          ignore (Quiver_net.Channel.send control (Quiver_net.Message.sexp_of_control message))
+        in
+        send
+          (Hello { session = "s"; byte_order = Quiver_net.Message.byte_order; streams = 1; chunks = 1 });
+        send (Begin { chunk = 0; table = (table 0).name; index = 0 });
+        let rec reply () =
+          match Quiver_net.Channel.receive control Quiver_net.Message.reply_of_sexp with
+          | Ok (Failed _) -> `Told
+          | Ok (Ready _ | Heard _) -> reply ()
+          | Ok (Done | Refused _ | Skipped | Committed _ | Rejected _) -> `Other
+          | Error _ -> `Hung_up
+        in
+        let heard = reply () in
+        Quiver_net.Channel.close control;
+        Support.join collected;
+        heard
+      in
+      Quiver_net.Channel.stop listening;
+      Alcotest.(check bool) "the agent heard why" true (outcome = Ok `Told))
+
 let tests =
-  vanishing_hop
+  vanishing_hop :: told_why
   :: List.map QCheck_alcotest.to_alcotest [ hostile_agent; hostile_collector ]

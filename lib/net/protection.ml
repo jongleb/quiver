@@ -85,12 +85,13 @@ let secure fd session ~start limit =
                   | Failed reason -> reason
                   | Done () | Want_read | Want_write | Closed | Lost -> closed))))
 
+let limited patience =
+  match patience with
+  | Unlimited -> Unbounded
+  | Within within -> Until { since = Quiver_core.Stopwatch.start (); within }
+
 let accepted t fd patience =
-  let limit =
-    match patience with
-    | Unlimited -> Unbounded
-    | Within within -> Until { since = Quiver_core.Stopwatch.start (); within }
-  in
+  let limit = limited patience in
   match t with
   | Plaintext -> Ok (flowing fd Plain limit)
   | Mutual context -> (
@@ -98,9 +99,10 @@ let accepted t fd patience =
       | Error reason -> Error (`Protection (Handshake reason))
       | Ok session -> secure fd session ~start:Quiver_openssl.Tls.accept limit)
 
-let connected t ~host fd =
+let connected t ~host fd patience =
+  let limit = limited patience in
   match t with
-  | Plaintext -> Ok (flowing fd Plain Unbounded)
+  | Plaintext -> Ok (flowing fd Plain limit)
   | Mutual context -> (
       let expectation : Quiver_openssl.Tls.expectation =
         match Quiver_openssl.Tls.naming host with Ip_address -> Ip | Host_name -> Host
@@ -110,7 +112,7 @@ let connected t ~host fd =
             Result.map (fun () -> session) (Quiver_openssl.Tls.expect session expectation host))
       with
       | Error reason -> Error (`Protection (Handshake reason))
-      | Ok session -> secure fd session ~start:Quiver_openssl.Tls.connect Unbounded)
+      | Ok session -> secure fd session ~start:Quiver_openssl.Tls.connect limit)
 
 (** How a call into OpenSSL ended once the socket stopped making it wait. *)
 type 'a settled = Settled of 'a | Ended | Broken of string

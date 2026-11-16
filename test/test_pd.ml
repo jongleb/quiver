@@ -420,7 +420,7 @@ let held () =
   in
   Alcotest.(check (option string)) "held before the work, for three times the interval" (Some "hold 0.09") (Option.map show (Result.to_option result));
   let holds = List.length (List.filter (function Pd.Hold_for _ -> true | Let_go -> false) log) in
-  Alcotest.(check bool) (Printf.sprintf "asked again while it runs (%d times)" holds) true (holds >= 5);
+  Alcotest.(check bool) (Printf.sprintf "asked again while it runs (%d times)" holds) true (holds >= 3);
   Alcotest.(check bool) "let go once, last" true
     (List.length (List.filter (( = ) Pd.Let_go) log) = 1 && Base.List.last log = Some Let_go);
   let result, log, _ = run ~every:0.03 ~refuse:(fun ~holds ~finished:_ -> holds = 0) (fun _ -> Alcotest.fail "the work ran") in

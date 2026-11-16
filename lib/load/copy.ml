@@ -20,6 +20,7 @@ type error =
   | Lost_rows of { table : Quiver_core.Schema.Name.t; sent : int; built : int }
   | Mismatched_render
   | After_load of After_load.error
+  | Shards_need_tidb
 [@@deriving sexp_of ~portable]
 
 type tablespaces = {
@@ -187,6 +188,7 @@ type t = {
   builds : built list Portable.Atomic.t;  (** Every built table, to clean up after a failure. *)
   fallbacks : (Quiver_core.Schema.Name.t * Physical.unsuitable) list Portable.Atomic.t;
   increments : Load.increments;
+  shards : Load.shards;
   turns : (Quiver_core.Schema.Name.t, Await.Await.Semaphore.t) Portable_lockfree_htbl.t;
       (** Tables loaded one part at a time, each part waiting for its turn. *)
   finishing : finishing Portable.Atomic.t;
@@ -285,7 +287,7 @@ let declare t { table = { name; _ } as table; ddl; parts; order; splits; declare
           let%bind () = execute link (Use into.database) in
           let%bind () = retried link create in
           let%bind () =
-            match Load.split link into splits with
+            match Load.split link into splits t.shards with
             | Ok () -> Ok ()
             | Error (statement, cause) -> rejected statement (Error cause)
           in
@@ -401,10 +403,10 @@ let unknown_collation = function
   | Unreachable cause | Rejected { cause; _ } -> Load.unknown_collation cause
   | Several_databases _ | No_sequences _ | Renaming _ | Unsupported_object _ | Unrepresentable_date _
   | Unsplittable_definition _ | Tablespaces_need _ | Built _ | Lost_rows _ | Mismatched_render
-  | After_load _ ->
+  | After_load _ | Shards_need_tidb ->
       None
 
-let create config target ({ keys; after; binlog; collations } : Load.writing) ~ingest ~sessions =
+let create config target ({ keys; after; binlog; collations; shards } : Load.writing) ~ingest ~sessions =
   Result.map_error
     (fun error -> `Sink error)
     (let%bind control, loaders =
@@ -422,6 +424,12 @@ let create config target ({ keys; after; binlog; collations } : Load.writing) ~i
        let%bind increments =
          Quiver_core.Guarded.hold control (fun link ->
              rejected (Quiver_mysql.Query.sql Autoinc_lock_mode) (Load.increments link))
+       in
+       let%bind () =
+         match (shards, Quiver_core.Guarded.hold control (fun link -> Quiver_mysql.Link.server link)) with
+         | Unsharded, _ | Sharded _, Tidb_8_5 _ -> Ok ()
+         | Sharded _, (Mysql_8_0 _ | Mysql_8_4 _ | Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _) ->
+             Error Shards_need_tidb
        in
        let%map mode =
          match ingest with
@@ -522,6 +530,7 @@ let create config target ({ keys; after; binlog; collations } : Load.writing) ~i
              builds = Portable.Atomic.make [];
              fallbacks = Portable.Atomic.make [];
              increments;
+             shards;
              turns = Portable_lockfree_htbl.create (module Quiver_core.Schema.Name);
              finishing = Portable.Atomic.make Unfinished;
              declared = Portable_lockfree_htbl.create (module Quiver_core.Schema.Name);

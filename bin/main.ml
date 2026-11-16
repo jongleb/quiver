@@ -1618,9 +1618,26 @@ let () =
                      compares and sorts by $(i,TO), so a unique key may refuse values $(i,FROM) \
                      told apart."))
     in
+    let shards =
+      Term.term_result'
+        Term.(
+          const (fun bits ->
+              Option.to_result ~none:"--target-shards takes 0 to 15 bits" (Quiver_load.Load.shards bits))
+          $ Arg.(
+              value & opt int 0
+              & described [ "target-shards" ] ~docv:"BITS"
+                  ~doc:
+                    "On a TiDB target, number the rows of each table without a clustered key with a \
+                     shard of $(i,BITS) bits on top (SHARD_ROW_ID_BITS, 1 to 15) and cut the table \
+                     into a region per shard before its rows: writes spread over the stores instead \
+                     of all going to the table's last region. It changes the target's definition of \
+                     such tables; 0, the default, leaves them as the source has them; other targets \
+                     refuse it."))
+    in
     Term.(
-      const (fun keys after binlog collations -> { Quiver_load.Load.keys; after; binlog; collations })
-      $ keys $ after_load $ binlog $ collations)
+      const (fun keys after binlog collations shards ->
+          { Quiver_load.Load.keys; after; binlog; collations; shards })
+      $ keys $ after_load $ binlog $ collations $ shards)
   in
   let load_cmd =
     let open Cmdliner in

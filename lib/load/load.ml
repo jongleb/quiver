@@ -20,6 +20,7 @@ type error =
   | Rejected_after_load of { table : Quiver_core.Schema.Name.t; statement : string; cause : cause }
   | After_load of After_load.error
   | Unreadable_columns of Quiver_core.Schema.Name.t
+  | Shards_need_tidb
 [@@deriving sexp_of ~portable]
 
 type target = Same_names | Into of Quiver_core.Ident.t
@@ -107,28 +108,39 @@ let sharing link increments table =
         (function [] -> Together | _ :: _ -> One_at_a_time)
         (Quiver_mysql.Link.run_query link (Auto_increment table))
 
-let split link (table : Quiver_core.Schema.Name.t) keys =
+type shards = Unsharded | Sharded of int
+
+let shards bits =
+  if bits = 0 then Some Unsharded else Base.Option.some_if (bits >= 1 && bits <= 15) (Sharded bits)
+
+let split link (table : Quiver_core.Schema.Name.t) keys shards =
   let failed sql result = Result.map_error (fun (#cause as cause) -> (sql, cause)) result in
   let run statement =
     failed (Quiver_mysql.Statement.sql statement) (Quiver_mysql.Link.run_statement link statement)
   in
-  match (Quiver_mysql.Link.server link, keys) with
-  | Tidb_8_5 _, _ :: _ -> (
+  match (Quiver_mysql.Link.server link, keys, shards) with
+  | Tidb_8_5 _, [], Unsharded
+  | (Mysql_8_0 _ | Mysql_8_4 _ | Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _), _, _ ->
+      Ok ()
+  | Tidb_8_5 _, _ :: _, _ | Tidb_8_5 _, [], Sharded _ -> (
       let clustering : Quiver_mysql.Query.t = Clustering table in
       let%bind kept =
         failed (Quiver_mysql.Query.sql clustering) (Quiver_mysql.Link.run_query link clustering)
       in
-      match kept with
-      | [ [| Some "CLUSTERED" |] ] ->
+      match (kept, keys, shards) with
+      | [ [| Some "CLUSTERED" |] ], first :: rest, _ ->
           let%bind () = run Scatter_regions in
           Base.List.fold_result
-            (Base.List.chunks_of keys ~length:1000)
+            (Base.List.chunks_of (first :: rest) ~length:1000)
             ~init:()
             ~f:(fun () -> function
               | first :: rest -> run (Split_table { table = table.table; at = (first, rest) })
               | [] -> Ok ())
-      | _ -> Ok ())
-  | (Mysql_8_0 _ | Mysql_8_4 _ | Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _ | Tidb_8_5 _), _ -> Ok ()
+      | [ [| Some "NONCLUSTERED" |] ], _, Sharded bits ->
+          let%bind () = run Scatter_regions in
+          let%bind () = run (Shard_row_ids { table = table.table; bits }) in
+          run (Split_evenly { table = table.table; regions = 1 lsl bits })
+      | _, _, (Unsharded | Sharded _) -> Ok ())
 
 (** Whether the loading threads still work, or only answer after a failure. *)
 type course = Going | Stopping
@@ -230,7 +242,13 @@ let create_database target database statement =
 
 let tidb_transaction_bytes = 16 * 1024 * 1024
 
-type writing = { keys : keys; after : After_load.rule list; binlog : binlog; collations : Collations.t }
+type writing = {
+  keys : keys;
+  after : After_load.rule list;
+  binlog : binlog;
+  collations : Collations.t;
+  shards : shards;
+}
 
 let object_kind statement =
   Option.bind (Sql_text.created statement) (fun ({ made; _ } : Sql_text.named) : Quiver_core.Filter.kind option ->
@@ -286,7 +304,7 @@ let object_files objects ~entries database =
         ];
   }
 
-let run config ~dir target { keys; after; binlog; collations } ~objects:wanted ~threads =
+let run config ~dir target { keys; after; binlog; collations; shards } ~objects:wanted ~threads =
   let read file consume =
     match
       In_channel.open_bin
@@ -499,6 +517,12 @@ let run config ~dir target { keys; after; binlog; collations } ~objects:wanted ~
   let%bind () =
     match
       let%bind () =
+        let%bind () =
+          match (shards, Quiver_mysql.Link.server control) with
+          | Unsharded, _ | Sharded _, Tidb_8_5 _ -> Ok ()
+          | Sharded _, (Mysql_8_0 _ | Mysql_8_4 _ | Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _) ->
+              Error (`Load Shards_need_tidb)
+        in
         match (Quiver_mysql.Link.server control, List.concat_map sequences databases) with
         | (Mysql_8_0 _ | Mysql_8_4 _), file :: _ -> Error (`Load (No_sequences file))
         | (Mysql_8_0 _ | Mysql_8_4 _), [] | (Mariadb_10_11 _ | Mariadb_11_4 _ | Mariadb_11_8 _), _ -> Ok ()
@@ -586,6 +610,7 @@ let run config ~dir target { keys; after; binlog; collations } ~objects:wanted ~
         split link
           { database = renamed target database; table }
           (Option.value ~default:[] (Base.List.Assoc.find splits ~equal:Quiver_core.Schema.Name.equal name))
+          shards
       with
       | Ok () -> Ok ()
       | Error (statement, cause) -> rejected file statement (Error cause)

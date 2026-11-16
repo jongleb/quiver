@@ -480,6 +480,28 @@ let tests =
                     ( key [ Signed (-5L); Text "é"; Instant instant ],
                       [ key [ Signed 7L; Text ""; Instant (Option.get (Moment.of_micros 0)) ] ] );
                 })));
+    Alcotest.test_case "a table without a clustered key sharded and cut a region per shard" `Quick (fun () ->
+        Alcotest.(check (list string))
+          "statements"
+          [
+            "ALTER TABLE `t``x` SHARD_ROW_ID_BITS = 4";
+            "SPLIT TABLE `t``x` BETWEEN (0) AND (9223372036854775807) REGIONS 16";
+          ]
+          (List.map Quiver_mysql.Statement.sql
+             [
+               Shard_row_ids { table = Support.ident "t`x"; bits = 4 };
+               Split_evenly { table = Support.ident "t`x"; regions = 16 };
+             ]);
+        Alcotest.(check (list string))
+          "bits taken"
+          [ "none"; "unsharded"; "1"; "15"; "none" ]
+          (List.map
+             (fun bits ->
+               Option.fold ~none:"none"
+                 ~some:(function
+                   | Quiver_load.Load.Unsharded -> "unsharded" | Sharded bits -> string_of_int bits)
+                 (Quiver_load.Load.shards bits))
+             [ -1; 0; 1; 15; 16 ]));
     QCheck_alcotest.to_alcotest
       (exact_cover
          {

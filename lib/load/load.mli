@@ -32,6 +32,7 @@ type error =
   | After_load of After_load.error
   | Unreadable_columns of Quiver_core.Schema.Name.t
       (** The server's description of a loaded table's columns. *)
+  | Shards_need_tidb  (** Row numbers are sharded on a TiDB target only. *)
 [@@deriving sexp_of ~portable]
 
 val unknown_collation : cause -> string option @@ portable
@@ -100,15 +101,28 @@ val sharing :
   @@ portable
 (** For a table in the target. *)
 
+(** How a TiDB target numbers the rows of a table without a clustered key, which it stores in
+    the order of their hidden numbers. *)
+type shards = private
+  | Unsharded  (** One after another: every write goes to the last region. *)
+  | Sharded of int
+      (** With a shard of so many bits, 1 to 15, on top ([SHARD_ROW_ID_BITS]), the table cut into
+          a region per shard before rows. *)
+
+val shards : int -> shards option @@ portable
+(** [Unsharded] for 0, [Sharded] for 1 to 15. *)
+
 val split :
   Quiver_mysql.Link.t ->
   Quiver_core.Schema.Name.t ->
   Quiver_core.Key.t list ->
+  shards ->
   (unit, string * cause) result
   @@ portable
-(** On a TiDB target, cuts a table clustered by its primary key into regions starting at these
-    keys, scattered over its stores, once the table is made and the session uses its database;
-    elsewhere nothing. A failure names the statement it ran. *)
+(** On a TiDB target, once the table is made and the session uses its database, cuts it into
+    regions scattered over the stores: a table clustered by its primary key at these keys, one
+    without a clustered key at each shard of its row numbers; elsewhere nothing. A failure names
+    the statement it ran. *)
 
 val advice : Quiver_mysql.Link.t -> binlog -> Quiver_core.Advice.t list @@ portable
 (** What the target's durability settings cost a load; none when it does not
@@ -143,6 +157,7 @@ type writing = {
   after : After_load.rule list;
   binlog : binlog;
   collations : Collations.t;  (** Rewritten in every definition. *)
+  shards : shards;  (** Only a TiDB target takes them. *)
 }
 
 val object_kind : string -> Quiver_core.Filter.kind option @@ portable

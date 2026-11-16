@@ -60,6 +60,12 @@ type t =
   | Split_table of { table : Quiver_core.Ident.t; at : Quiver_core.Key.t * Quiver_core.Key.t list }
       (** TiDB: [table] of the current database cut into regions at each key, of its clustered
           primary key. *)
+  | Shard_row_ids of { table : Quiver_core.Ident.t; bits : int }
+      (** TiDB: rows of [table] of the current database, which has no clustered key, numbered with
+          a shard of so many bits on top, so writes spread instead of running at one end. *)
+  | Split_evenly of { table : Quiver_core.Ident.t; regions : int }
+      (** TiDB: [table] of the current database cut into so many regions of its row numbers from 0 up,
+          one per shard when [regions] is two to the power of its shard bits. *)
   | Load_local of {
       table : Quiver_core.Ident.t;
       dialect : Quiver_core.Output_format.dialect;

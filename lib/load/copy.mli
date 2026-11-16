@@ -61,6 +61,7 @@ type error =
       (** The imported tablespace holds another number of rows than were read. *)
   | Mismatched_render  (** A batch rendered for the other kind of part. *)
   | After_load of After_load.error
+  | Shards_need_tidb  (** Row numbers are sharded on a TiDB target only. *)
 [@@deriving sexp_of ~portable]
 
 val unknown_collation : error -> string option @@ portable

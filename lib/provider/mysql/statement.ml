@@ -35,6 +35,8 @@ type t =
   | Drop_indexes of { table : Quiver_core.Schema.Name.t; indexes : Quiver_core.Ident.t list }
   | Scatter_regions
   | Split_table of { table : Quiver_core.Ident.t; at : Quiver_core.Key.t * Quiver_core.Key.t list }
+  | Shard_row_ids of { table : Quiver_core.Ident.t; bits : int }
+  | Split_evenly of { table : Quiver_core.Ident.t; regions : int }
   | Load_local of {
       table : Quiver_core.Ident.t;
       dialect : Quiver_core.Output_format.dialect;
@@ -123,6 +125,11 @@ let sql = function
         [%string {|(%{String.concat ", " (List.map Query.literal (first :: rest))})|}]
       in
       [%string {|SPLIT TABLE %{Quiver_core.Ident.backquoted table} BY %{String.concat ", " (List.map tuple (first :: rest))}|}]
+  | Shard_row_ids { table; bits } ->
+      [%string "ALTER TABLE %{Quiver_core.Ident.backquoted table} SHARD_ROW_ID_BITS = %{bits#Int}"]
+  | Split_evenly { table; regions } ->
+      [%string
+        "SPLIT TABLE %{Quiver_core.Ident.backquoted table} BETWEEN (0) AND (9223372036854775807) REGIONS %{regions#Int}"]
   | Commit -> "COMMIT"
   | Rollback -> "ROLLBACK"
   | Load_local { table; dialect; columns } ->

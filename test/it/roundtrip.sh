@@ -833,6 +833,27 @@ into_tidb() {
     same "load of $files"
     [ "$(regions)" -gt 1 ] || fail "load of $files: keyed was left in one region"
   done
+  sharded() {
+    same "$1"
+    ti -N -e "SHOW CREATE TABLE into_tidb.keyless" | grep -q 'SHARD_ROW_ID_BITS=4' \
+      || fail "$1: keyless was not sharded: $(ti -N -e "SHOW CREATE TABLE into_tidb.keyless")"
+    [ "$(ti -N -e "SHOW TABLE into_tidb.keyless REGIONS" | wc -l)" -ge 16 ] || fail "$1: keyless was not cut per shard"
+    ! ti -N -e "SHOW CREATE TABLE into_tidb.keyed" | grep -q SHARD_ROW_ID_BITS || fail "$1: a clustered table was sharded"
+  }
+  ti -e "DROP DATABASE into_tidb"
+  "$quiver" load --tls disabled -P "$port" -u root -d "$dir" -t 2 --target-shards 4 > "$dir.sharded.log" 2>&1 \
+    || fail "load --target-shards: $(cat "$dir.sharded.log")"
+  sharded "a load sharding tables without a clustered key"
+  ti -e "DROP DATABASE into_tidb"
+  "$quiver" copy --tls disabled -P "$source_port" -p quiver -B into_tidb -t 4 --to-tls disabled --to-port "$port" \
+    --target-shards 4 > "$dir.copy-sharded.log" 2>&1 || fail "copy --target-shards: $(cat "$dir.copy-sharded.log")"
+  sharded "a copy sharding tables without a clustered key"
+  if "$quiver" copy --tls disabled -P "$source_port" -p quiver -B into_tidb -t 4 --to-tls disabled \
+    --to-port "$source_port" --to-password quiver --to-database into_tidb_sh --target-shards 4 > "$dir.mysql-sharded.log" 2>&1; then
+    fail "MySQL took --target-shards"
+  fi
+  grep -q Shards_need_tidb "$dir.mysql-sharded.log" || fail "--target-shards into MySQL: $(cat "$dir.mysql-sharded.log")"
+  [ -z "$(my -N -e "SHOW DATABASES LIKE 'into_tidb_sh'")" ] || fail "a database was made for shards MySQL refused"
   ti -e "DROP DATABASE into_tidb"
   "$quiver" load --tls disabled -P "$port" -u root -d "$dir" -t 2 > "$dir.killed.log" 2>&1 &
   killed=$!
@@ -859,7 +880,7 @@ into_tidb() {
   fi
   ti -e "DROP DATABASE into_tidb"
   my -e "DROP DATABASE into_tidb"
-  echo "$service: MySQL copied and loaded into TiDB in pieces, split at the parts' first keys, a killed load resumed, rows equal; sequences under another name"
+  echo "$service: MySQL copied and loaded into TiDB in pieces, split at the parts' first keys, keyless tables sharded on request (MySQL refuses), a killed load resumed, rows equal; sequences under another name"
 }
 # MariaDB into TiDB: sakila, whose triggers and routines TiDB lacks, is refused before
 # anything is made; without objects and with MariaDB's utf8mb4_uca1400_ai_ci created as

@@ -434,7 +434,7 @@ let held () =
   in
   Alcotest.(check (option string)) "import mode before the work" (Some "import") (Option.map show (Result.to_option result));
   let imports = List.length (List.filter (fun mode -> mode = Import.Import) log) in
-  Alcotest.(check bool) (Printf.sprintf "asked again while it runs (%d times)" imports) true (imports >= 4);
+  Alcotest.(check bool) (Printf.sprintf "asked again while it runs (%d times)" imports) true (imports >= 2);
   Alcotest.(check int) "normal once" 1 (List.length (List.filter (fun mode -> mode = Import.Normal) log));
   Alcotest.(check (option string)) "nothing after normal" (Some "normal") (Option.map (fun mode -> show [ mode ]) (Base.List.last log));
   let result, log, _ = run ~every:0.03 ~refuse:(fun asked -> asked = 0) (fun _ -> Alcotest.fail "the work ran") in

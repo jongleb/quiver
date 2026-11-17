@@ -610,8 +610,11 @@ quiver copy -h mariadb.example -B shop --to-host tidb.example --to-port 4000 \
   too; the TSO goes to the manifest as the `--start-ts` of a TiCDC changefeed. Tables split at
   their regions, and a table without a clustered key by `_tidb_rowid`.
 - **Into TiDB.** A new table is split at the source's part boundaries and scattered before rows
-  arrive, so writes reach every TiKV from the start. A part goes in transactions of 16 MiB and
-  borrows idle loaders; `quiver load` commits in pieces and resumes from the last one.
+  arrive, so writes reach every TiKV from the start; `quiver load` splits it at the parts of the
+  dump's manifest. A part goes in transactions of 16 MiB and borrows idle loaders; `quiver load`
+  commits in pieces and resumes from the last one. `--target-shards BITS` shards the row numbers of
+  tables without a clustered key (`SHARD_ROW_ID_BITS`) and cuts a region per shard; it changes the
+  target's schema, is off by default, and on one machine running every TiKV it was slower.
 - **What the target lacks.** `--collation FROM=TO` renames collations TiDB does not know.
   Triggers, routines and events are refused before anything is made (`--objects views` leaves
   them out). Sequences of TiDB and MariaDB are carried and go on from where they were.
@@ -790,6 +793,7 @@ quiver is young and moving fast.
 | `quiver mirror`: TiDB to TiDB as TiKV keys, within a cluster or into another | new in 1.6 |
 | `quiver mirror`: a database at one TSO, global indexes, locks read through, GC and scheduling held, TLS to PD and TiKV | new in 1.7 |
 | `quiver mirror`: TiFlash replicas, written as TiKV's are | new in 1.7.1 |
+| `quiver load` into TiDB split at the dump's parts; `--target-shards` for tables without a clustered key | new in 1.8 |
 | Resuming a network transfer from the same snapshot | next |
 | Postgres and other providers | after MySQL is done |
 

@@ -228,6 +228,17 @@ let unknown_collation (cause : cause) =
       | [] | [ _ ] -> None)
   | `Link _ | `Wire _ | `Transport _ -> None
 
+let duplicate_key (cause : cause) =
+  match cause with
+  | `Link (Quiver_mysql.Link.Refused { code = 1062; message; _ }) ->
+      let marker = " for key '" in
+      Option.bind
+        (Base.List.last (Base.String.substr_index_all message ~may_overlap:false ~pattern:marker))
+        (fun at ->
+          let start = at + String.length marker in
+          Base.String.chop_suffix (String.sub message start (String.length message - start)) ~suffix:"'")
+  | `Link _ | `Wire _ | `Transport _ -> None
+
 let renamed target database =
   match target with Same_names -> database | Into renamed -> renamed
 

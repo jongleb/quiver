@@ -673,7 +673,14 @@ let () =
         | Error error ->
             let () =
               match error with
-              | `Load (Quiver_load.Load.Rejected { cause; _ }) -> hinted (Quiver_load.Load.unknown_collation cause)
+              | `Load (Quiver_load.Load.Rejected { cause; _ }) ->
+                  hinted (Quiver_load.Load.unknown_collation cause);
+                  Option.iter
+                    (Format.eprintf
+                       "hint: the target already holds that value of key %s; if a run of this load was stopped \
+                        moments ago, its session on the server may still be committing a file: once the server's \
+                        process list shows none of its statements, run the load again and it resumes@.")
+                    (Quiver_load.Load.duplicate_key cause)
               | _ -> ()
             in
             failed

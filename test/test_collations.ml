@@ -134,10 +134,28 @@ let unknown =
       let expected = if code = 1273 then Some name else None in
       Option.equal String.equal (Load.unknown_collation cause) expected)
 
+let duplicate =
+  QCheck2.Test.make ~count:500
+    ~name:"the key a server found a duplicate in is named for the hint, whatever the entry holds"
+    ~print:(fun (code, entry, key) -> Printf.sprintf "%d %S %S" code entry key)
+    QCheck2.Gen.(
+      triple (oneof_list [ 1062; 1061; 1273 ])
+        (map (String.concat "") (list_size (int_range 0 4) (oneof_list [ "a"; "'"; " for key '"; "5"; "-" ])))
+        (string_size ~gen:(oneof_list [ 'k'; '.'; '_'; 'P' ]) (int_range 1 20)))
+    (fun (code, entry, key) ->
+      let cause =
+        `Link
+          (Quiver_mysql.Link.Refused
+             { code; sqlstate = "23000"; message = "Duplicate entry '" ^ entry ^ "' for key '" ^ key ^ "'" })
+      in
+      let expected = if code = 1062 then Some key else None in
+      Option.equal String.equal (Load.duplicate_key cause) expected)
+
 let tests =
   [
     QCheck_alcotest.to_alcotest rewritten;
     QCheck_alcotest.to_alcotest unknown;
+    QCheck_alcotest.to_alcotest duplicate;
     Alcotest.test_case "rules: two names of one character set, each once" `Quick (fun () ->
         let refused rules =
           match Collations.of_rules rules with

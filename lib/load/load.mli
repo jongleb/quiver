@@ -38,6 +38,9 @@ type error =
 val unknown_collation : cause -> string option @@ portable
 (** The collation a server named unknown (error 1273). *)
 
+val duplicate_key : cause -> string option @@ portable
+(** The key a server found a row's value already in (error 1062). *)
+
 (** Where the dumped databases go. *)
 type target =
   | Same_names

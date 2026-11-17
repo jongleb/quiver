@@ -479,6 +479,7 @@ let () =
                         rate;
                     traffic;
                     reconnect = Core.Time_ns.Span.of_sec reconnect;
+                    silence = Core.Time_ns.Span.of_sec 15.;
                     stall = Core.Time_ns.Span.of_sec stall;
                   }
               in

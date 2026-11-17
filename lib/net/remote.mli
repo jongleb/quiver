@@ -52,6 +52,8 @@ type settings = {
   reconnect : Core.Time_ns.Span.t;
       (** How long replacing a broken control connection may take before the
           session fails. *)
+  silence : Core.Time_ns.Span.t;
+      (** A control connection that brings nothing this long is replaced. *)
   stall : Core.Time_ns.Span.t;
       (** A data connection whose oldest frame waits this long for its ack,
           while another connection waits for none or eight times less, is
@@ -67,7 +69,7 @@ val create :
     connections. A data connection that breaks gives its unacknowledged frames
     to the others and is replaced, after a few pauses if need be; the session
     fails once none is left. A control connection that breaks, or brings
-    nothing for 15 seconds, is replaced within [reconnect]: the collector
+    nothing for [silence], is replaced within [reconnect]: the collector
     answers again what did not arrive, and is sent again what it did not
     hear. While the network holds the dump back, the
     session opens more data connections, up to [most_streams], and keeps them

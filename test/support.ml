@@ -150,5 +150,6 @@ let settings ?(compression =
     pace = None;
     traffic = None;
     reconnect;
+    silence = Core.Time_ns.Span.of_sec 1.;
     stall = Core.Time_ns.Span.of_sec 0.3;
   }

@@ -23,6 +23,7 @@ type settings = {
   pace : int option;
   traffic : Quiver_core.Tcp.Class.t option;
   reconnect : Core.Time_ns.Span.t;
+  silence : Core.Time_ns.Span.t;
   stall : Core.Time_ns.Span.t;
 }
 
@@ -159,8 +160,10 @@ type t = {
   began : Quiver_core.Stopwatch.t;
   outbox : outbound Await.Await.Mpmc_queue.t;  (** To the control writer. *)
   replies : int Portable.Atomic.t;  (** Counted replies that arrived. *)
-  silent : int Portable.Atomic.t;
-      (** Seconds the control connection brought nothing. *)
+  spoke : Quiver_core.Stopwatch.t Portable.Atomic.t;
+      (** When the control connection last brought anything. *)
+  silence : Core.Time_ns.Span.t;
+      (** How long a control connection may bring nothing before it is replaced. *)
   window : Await.Await.Semaphore.t;  (** Requests that may be sent unanswered. *)
   frames : outgoing Await.Await.Mpmc_queue.t;
   room : Await.Await.Semaphore.t;  (** Frames that may still be queued. *)
@@ -545,7 +548,7 @@ let adjust (t : t) (decision : Quiver_core.Width.decision) =
         (List.init count Fun.id)
 
 let create protection peer
-    { streams; most_streams; chunks; compression; pace; traffic; reconnect; stall } =
+    ({ streams; most_streams; chunks; compression; pace; traffic; reconnect; silence; stall } : settings) =
   let connect () = failed (Channel.connect protection peer Unlimited) in
   Result.map_error
     (fun error -> `Sink error)
@@ -643,7 +646,8 @@ let create protection peer
          began = Quiver_core.Stopwatch.start ();
          outbox = Await.Await.Mpmc_queue.create ();
          replies = Portable.Atomic.make 0;
-         silent = Portable.Atomic.make 0;
+         spoke = Portable.Atomic.make (Quiver_core.Stopwatch.start ());
+         silence;
          window =
            (let requests_ahead = 1024 in
             Await.Await.Semaphore.create requests_ahead);
@@ -702,12 +706,12 @@ let create protection peer
            Await.Await.Mpmc_queue.push t.outbox (Broke { generation; error })
        | Ok (Failed reason) -> fail t (Refused { request = "the session"; reason })
        | Ok (Heard { messages }) ->
-           Portable.Atomic.set t.silent 0;
+           Portable.Atomic.set t.spoke (Quiver_core.Stopwatch.start ());
            Quiver_core.Guarded.hold t.steering (fun steering ->
                hear steering messages);
            read channel generation
        | Ok reply ->
-           Portable.Atomic.set t.silent 0;
+           Portable.Atomic.set t.spoke (Quiver_core.Stopwatch.start ());
            Portable.Atomic.incr t.replies;
            (match reply with
            | Committed { chunk; part } ->
@@ -842,7 +846,7 @@ let create protection peer
                  (match steering.held with Open old -> Channel.close old | Gone -> ());
                  steering.trying <- None;
                  steering.held <- Open channel);
-             Portable.Atomic.set t.silent 0;
+             Portable.Atomic.set t.spoke (Quiver_core.Stopwatch.start ());
              Ok (reading channel (generation + 1))
          | Ok (`Refused refusal) ->
              Quiver_core.Guarded.hold t.steering (fun steering ->
@@ -944,14 +948,13 @@ let create protection peer
            match (Portable.Atomic.get t.phase, Portable.Atomic.get t.failure) with
            | Stopping, _ | Running, Some _ -> ()
            | Running, None ->
-               (match Portable.Atomic.fetch_and_add t.silent 1 with
-               | silent when silent >= 15 ->
-                   Portable.Atomic.set t.silent 0;
-                   Quiver_core.Guarded.hold t.steering (fun steering ->
-                       match (steering.held, Portable.Atomic.get t.phase) with
-                       | Open channel, Running -> Channel.abort channel
-                       | Open _, Stopping | Gone, (Running | Stopping) -> ())
-               | (_ : int) -> ());
+               let silence = t.silence in
+               if Core.Time_ns.Span.( > ) (Quiver_core.Stopwatch.elapsed (Portable.Atomic.get t.spoke)) silence then (
+                 Portable.Atomic.set t.spoke (Quiver_core.Stopwatch.start ());
+                 Quiver_core.Guarded.hold t.steering (fun steering ->
+                     match (steering.held, Portable.Atomic.get t.phase) with
+                     | Open channel, Running -> Channel.abort channel
+                     | Open _, Stopping | Gone, (Running | Stopping) -> ()));
                (let reconnect = t.reconnect in
                 Quiver_core.Guarded.hold t.steering (fun steering ->
                     Option.iter

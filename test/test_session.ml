@@ -992,6 +992,35 @@ let resumed_down_the_chain =
         (oneof_list [ 0.; 1.3 ]))
     property
 
+let deaf_control =
+  QCheck2.Test.make ~count:12
+    ~name:
+      "an agent whose control connection stays up and brings nothing replaces \
+       it in time, and the session goes on"
+    ~print
+    QCheck2.Gen.(
+      map2
+        (fun after topology ->
+          {
+            tables = [ [ ([ 3; 4 ], Kept); ([ 5 ], Kept) ]; [ ([ 2; 2; 2 ], Kept) ] ];
+            streams = 2;
+            chunks = 2;
+            readers = 2;
+            topology;
+            refusal = Nobody;
+            wire = Plain;
+            cuts = [];
+            control = Some (after, Silent);
+            place = Into_first;
+            adjustments = [];
+            compression = Fixed Plain;
+            linger = 0.;
+            columns = (Written, Written);
+          })
+        (int_range 2 9)
+        (oneof_list [ Direct; Relayed 1; Chained ]))
+    property
+
 let silent_after_finish =
   QCheck2.Test.make ~count:8
     ~name:
@@ -1246,6 +1275,7 @@ let tests =
          resumed_through_relays;
          resumed_down_the_chain;
          silent_after_finish;
+         deaf_control;
          refused_while_queued;
          replaced_when_silent;
          replaced_before_attach;

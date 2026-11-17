@@ -803,7 +803,8 @@ into_tidb() {
     INSERT INTO keyless SELECT a, b FROM keyed; INSERT INTO keyless SELECT a, b FROM keyed;
     CREATE TABLE tricky (a INT, s VARCHAR(200));
     INSERT INTO tricky WITH RECURSIVE n (i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 300000)
-      SELECT i, CONCAT('line\r\nnext \"q\", ', REPEAT('\\\\', i % 3), 'end', i) FROM n;"
+      SELECT i, CONCAT('line\r\nnext \"q\", ', REPEAT('\\\\', i % 3), 'end', i) FROM n;
+    ANALYZE TABLE keyed;"
   same() {
     for table in keyed keyless tricky; do
       query="SELECT a, HEX(b) FROM into_tidb.$table"
@@ -814,12 +815,13 @@ into_tidb() {
   ti -e "DROP DATABASE IF EXISTS into_tidb; DROP DATABASE IF EXISTS quiver_load"
   dir="$out/$service-into"
   rm -rf "$dir" "$dir-rfc4180" "$dir-mysql-load-data"
-  "$quiver" copy --tls disabled -P "$source_port" -p quiver -B into_tidb -t 4 --to-tls disabled --to-port "$port" \
-    > "$dir.copy.log" 2>&1 || fail "copy: $(cat "$dir.copy.log")"
+  "$quiver" copy --tls disabled -P "$source_port" -p quiver -B into_tidb -t 4 --chunk-bytes 4000000 \
+    --to-tls disabled --to-port "$port" > "$dir.copy.log" 2>&1 || fail "copy: $(cat "$dir.copy.log")"
   same "copy"
   regions() { ti -N -e "SHOW TABLE into_tidb.keyed REGIONS" | wc -l; }
   [ "$(regions)" -gt 1 ] || fail "copy: keyed was left in one region"
-  "$quiver" dump --tls disabled -P "$source_port" -p quiver -B into_tidb -t 4 -o "$dir" > "$dir.log" 2>&1 \
+  "$quiver" dump --tls disabled -P "$source_port" -p quiver -B into_tidb -t 4 --chunk-bytes 4000000 -o "$dir" \
+    > "$dir.log" 2>&1 \
     || fail "dump: $(cat "$dir.log")"
   [ "$(ls "$dir"/into_tidb.keyed.*.sql | wc -l)" -gt 1 ] || fail "keyed was dumped in one part"
   for dialect in rfc4180 mysql-load-data; do
